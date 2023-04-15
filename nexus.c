@@ -466,9 +466,10 @@ void nexus_set_port_owner(struct nexus_port* port,
 			if (*p == NULL) {
 				rb_link_node(&port->node, parent, p);
 				rb_insert_color(&port->node, &dest_team->ports);
+				port->team = dest_team;
+				*return_code = B_OK;
+				return;
 			}
-			*return_code = B_OK;
-			return;
 		}
 	}
 
