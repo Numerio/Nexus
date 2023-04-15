@@ -21,9 +21,10 @@ static struct class *nexus_class = NULL;
 
 static DEFINE_MUTEX(nexus_main_lock);
 static HLIST_HEAD(nexus_teams);
-static struct nexus_port* nexus_ports[MAX_PORTS];
 
-// TODO we want to improve logging with debug logging and warnings
+//struct rb_root areas;
+
+static struct nexus_port* nexus_ports[MAX_PORTS];
 
 struct nexus_team* nexus_team_init()
 {
@@ -55,7 +56,7 @@ void nexus_team_destroy(struct nexus_team* team)
 		nexus_port_destroy(port, &return_code);
 	}
 
-	// TODO: threads
+	// TODO: threads should be all dead at this point.
 
 	nexus_thread_destroy(team->main_thread);
 	team->main_thread = NULL;
@@ -69,7 +70,8 @@ struct nexus_thread* nexus_thread_init(struct nexus_team *team, pid_t id, const 
 
 	if (thread != NULL) {
 		thread->id = id;
-		//if (copy_from_user(thread->name, name, B_OS_NAME_LENGTH)) {
+
+		//if (copy_from_user(thread->name, name, min(strlen(name), B_OS_NAME_LENGTH))) {
 		//	kfree(thread);
 		//	return NULL;
 		//}
@@ -97,6 +99,9 @@ long nexus_thread_destroy(struct nexus_thread *thread)
 }
 
 struct nexus_thread* find_thread(struct nexus_team *team, const char *name) {
+	//if (name == NULL)
+	//	return NULL;
+
 	struct nexus_thread *thread = NULL;
 	struct rb_node *parent = NULL;
 	struct rb_node **p = &team->threads.rb_node;
@@ -123,9 +128,9 @@ struct nexus_thread* find_thread(struct nexus_team *team, const char *name) {
 	return thread;
 }
 
-static long nexus_thread_spawn(struct nexus_team *team, unsigned long arg)
+static long nexus_thread_spawn(struct nexus_team *team, const char* name)
 {
-	find_thread(team, (const char*)1);
+	find_thread(team, name);
 	return 0;
 }
 
@@ -142,9 +147,7 @@ long nexus_thread_op(struct nexus_thread *thread, unsigned long arg)
 		if (thread->id != current->pid)
 			return -1;
 
-		// TODO performance opportunity avoid unlock
 		mutex_unlock(&nexus_main_lock);
-		//printk(KERN_INFO "going to wait %d\n", current->pid);
 		down(&thread->sem_read);
 		wait_event_interruptible(thread->buffer_read, thread->buffer_ready != 0);
 		mutex_lock(&nexus_main_lock);
@@ -164,14 +167,10 @@ long nexus_thread_op(struct nexus_thread *thread, unsigned long arg)
 		thread->sender = -1;
 		thread->return_code = -1;
 
-		//printk(KERN_INFO "read release %d\n", current->pid);
-
 		if (wq_has_sleeper(&thread->buffer_write))
 			wake_up_interruptible(&thread->buffer_write);
 
 		up(&thread->sem_write);
-
-		//printk(KERN_INFO "read exit %d\n", current->pid);
 	} else if (user_data.op == NEXUS_THREAD_WRITE) {
 		printk(KERN_INFO "write %d %d\n", current->pid, user_data.return_code);
 		struct nexus_team *team;
@@ -289,7 +288,6 @@ long nexus_port_find(unsigned long arg)
 
 	in_data.id = B_ERROR;
 
-	// TODO binary search
 	for (int i = 0; i < MAX_PORTS; i++) {
 		if (nexus_ports[i] != NULL) {
 			printk(KERN_INFO "find_port %s %s\n", name, nexus_ports[i]->name);
@@ -371,6 +369,7 @@ long nexus_port_init(struct nexus_team* team, unsigned long arg)
 	//	return NULL;
 	//}
 
+	// TODO utility functions for adding ports
 	p = &team->ports.rb_node;
 	while (*p) {
 		parent = *p;
@@ -438,10 +437,42 @@ void nexus_port_destroy(struct nexus_port* port, int32_t* return_code)
 	*return_code = B_OK;
 }
 
-void nexus_set_port_owner(struct nexus_team* team, struct nexus_port* port,
+//TODO team is unneded here as we already have the port
+void nexus_set_port_owner(struct nexus_port* port,
 	pid_t target_team, int32_t* return_code)
 {
-	
+	struct nexus_team* dest_team = NULL;
+	struct nexus_port *next_port = NULL;
+	struct rb_node *parent = NULL;
+	struct rb_node **p = NULL;
+
+	// TODO just like the port init we want to reduce code duplication here
+	hlist_for_each_entry(dest_team, &nexus_teams, node) {
+		if (dest_team->id == target_team) {
+			rb_erase(&port->node, &port->team->ports);
+			
+			p = &dest_team->ports.rb_node;
+			while (*p) {
+				parent = *p;
+				next_port = rb_entry(parent, struct nexus_port, node);
+
+				if (port->id > next_port->id)
+					p = &(*p)->rb_right;
+				else if (port->id < next_port->id)
+					p = &(*p)->rb_left;
+				else
+					break;
+			}
+			if (*p == NULL) {
+				rb_link_node(&port->node, parent, p);
+				rb_insert_color(&port->node, &dest_team->ports);
+			}
+			*return_code = B_OK;
+			return;
+		}
+	}
+
+	*return_code = B_ERROR;
 }
 
 void nexus_port_read(struct nexus_port* port, int32_t* code, void* buffer,
@@ -452,7 +483,7 @@ void nexus_port_read(struct nexus_port* port, int32_t* code, void* buffer,
 
 	//printk(KERN_INFO "port_read enter %d\n", port->id);
 
-	// TODO test passing code with null buffer
+	// TODO maybe test passing code with null buffer
 	if ((buffer == NULL && *size > 0)
 			|| *size > PORT_MAX_MESSAGE_SIZE || timeout < 0) {
 		*return_code = B_BAD_VALUE;
@@ -463,8 +494,6 @@ void nexus_port_read(struct nexus_port* port, int32_t* code, void* buffer,
 		*return_code = B_BAD_PORT_ID;
 		return;
 	}
-
-	//printk(KERN_INFO "port_read %d start: now write count is %d and read count is %d\n", port->id, port->write_count, port->read_count);
 
 	// TODO we are not really supporting absolute timeout
 	// even if not documented it is probably required
@@ -478,7 +507,6 @@ void nexus_port_read(struct nexus_port* port, int32_t* code, void* buffer,
 
 		int32_t port_id = port->id;
 		mutex_unlock(&nexus_main_lock);
-		//read_lock(&port->rw_lock);
 		if (flags & B_TIMEOUT && timeout != B_INFINITE_TIMEOUT) {
 			ret = wait_event_interruptible_hrtimeout(port->buffer_read,
 				port->read_count > 0 || port->is_open == false,
@@ -487,7 +515,6 @@ void nexus_port_read(struct nexus_port* port, int32_t* code, void* buffer,
 			ret = wait_event_interruptible(port->buffer_read,
 				port->read_count > 0 || port->is_open == false);
 		}
-		//read_unlock(&port->rw_lock);
 		mutex_lock(&nexus_main_lock);
 
 		if (nexus_ports[port_id] == NULL
@@ -527,17 +554,19 @@ void nexus_port_read(struct nexus_port* port, int32_t* code, void* buffer,
 		}
 	}
 
-	list_del(&buf->node);
-	kfree(buf->buffer);
-	kfree(buf);
-
 	port->read_count--;
 	port->write_count++;
 	port->total_count++;
 
-	printk(KERN_INFO "port_read %d: finish now write count is %d and read count is %d\n", port->id, port->write_count, port->read_count);
-
 	wake_up_interruptible(&port->buffer_write);
+
+	list_del(&buf->node);
+	kfree(buf->buffer);
+	kfree(buf);
+
+	printk(KERN_INFO "port_read %d: finish now write count is %d and "
+		"read count is %d\n", port->id, port->write_count,
+			port->read_count);
 
 	*return_code = B_OK;
 }
@@ -549,8 +578,6 @@ void nexus_port_write(struct nexus_port* port, int32_t* msg_code,
 	struct nexus_buffer* buf = 0;
 	int32_t in_code;
 	int ret = 0;
-
-	//printk(KERN_INFO "port_write %d %d %d %p enter\n", port->id, port->write_count, port->capacity, buffer);
 
 	if ((buffer == NULL && size != 0) || size > PORT_MAX_MESSAGE_SIZE
 			|| timeout < 0) {
@@ -565,8 +592,6 @@ void nexus_port_write(struct nexus_port* port, int32_t* msg_code,
 		return;
 	}
 
-	//printk(KERN_INFO "port_write %d start: now write count is %d and read count is %d\n", port->id, port->write_count, port->read_count);
-
 	port->write_count--;
 	
 	if (port->write_count >= 0)
@@ -579,14 +604,10 @@ void nexus_port_write(struct nexus_port* port, int32_t* msg_code,
 			return;
 		}
 
-		//printk(KERN_INFO "port_write unlock port %d\n", port->id);
-
 		int32_t port_id = port->id;
+
 		mutex_unlock(&nexus_main_lock);
-		//printk(KERN_INFO "port_write rw_lockport %d\n", port_id);
-		//write_lock(&port->rw_lock);
 		if (flags & B_TIMEOUT && timeout != B_INFINITE_TIMEOUT) {
-			//printk(KERN_INFO "port_write wait with timeout%d\n", port->write_count);
 			ret = wait_event_interruptible_hrtimeout(port->buffer_write,
 				port->write_count >= 0 || port->is_open == false,
 					timeout*1000);
@@ -594,13 +615,14 @@ void nexus_port_write(struct nexus_port* port, int32_t* msg_code,
 			ret = wait_event_interruptible(port->buffer_write,
 				port->write_count >= 0 || port->is_open == false);
 		}
-		//write_unlock(&port->rw_lock);
 		mutex_lock(&nexus_main_lock);
 
-		//printk(KERN_INFO "port_write %d lock port ret %d\n", port->id, ret);
+		if (nexus_ports[port_id] == NULL) {
+			*return_code = B_BAD_PORT_ID;
+			return;
+		}
 
-		if (nexus_ports[port_id] == NULL || !port->is_open
-				|| ret == -ERESTARTSYS) {
+		if (!port->is_open || ret == -ERESTARTSYS) {
 			port->write_count++;
 			*return_code = B_BAD_PORT_ID;
 			return;
@@ -617,7 +639,6 @@ void nexus_port_write(struct nexus_port* port, int32_t* msg_code,
 	}
 
 goahead:
-
 	buf = kzalloc(sizeof(struct nexus_buffer), GFP_KERNEL);
 
 	if (buffer != NULL) {
@@ -646,9 +667,11 @@ goahead:
 	list_add_tail(&buf->node, &port->queue);
 	port->read_count++;
 
-	printk(KERN_INFO "port_write %d finish now write count is %d and read count is %d\n", port->id, port->write_count, port->read_count);
-
 	wake_up_interruptible(&port->buffer_read);
+
+	printk(KERN_INFO "port_write %d finish now write count is %d and "
+		"read count is %d\n", port->id, port->write_count,
+			port->read_count);
 
 	*return_code = B_OK;
 }
@@ -661,9 +684,6 @@ void nexus_port_info(struct nexus_port* port,
 	int ret = 0;
 
 	memset(&message_info, 0, sizeof(message_info));
-
-	//printk(KERN_INFO "Info port %d %p\n", port->id, info);
-
 
 	if (return_code == NULL || info == NULL) {
 		*return_code = B_BAD_VALUE;
@@ -702,8 +722,6 @@ void nexus_port_message_info(struct nexus_port* port,
 
 	memset(&message_info, 0, sizeof(message_info));
 
-	//printk(KERN_INFO "port_message_info %d start: now write count is %d and read count is %d\n", port->id, port->write_count, port->read_count);
-
 	if (return_code == NULL || info == NULL || timeout < 0) {
 		*return_code = B_BAD_VALUE;
 		return;
@@ -721,9 +739,9 @@ void nexus_port_message_info(struct nexus_port* port,
 			*return_code = B_WOULD_BLOCK;
 			return;
 		}
+
 		int32_t port_id = port->id;
 		mutex_unlock(&nexus_main_lock);
-		//read_lock(&port->rw_lock);
 		if ((flags & B_TIMEOUT) != 0 && timeout != B_INFINITE_TIMEOUT) {
 			ret = wait_event_interruptible_hrtimeout(port->buffer_read,
 				port->read_count > 0 || port->is_open == false,
@@ -732,7 +750,6 @@ void nexus_port_message_info(struct nexus_port* port,
 			ret = wait_event_interruptible(port->buffer_read,
 				port->read_count > 0 || port->is_open == false);
 		}
-		//read_unlock(&port->rw_lock);
 		mutex_lock(&nexus_main_lock);
 
 		if (nexus_ports[port_id] == NULL
@@ -750,7 +767,6 @@ void nexus_port_message_info(struct nexus_port* port,
 			break;
 		}
 	}
-	//printk(KERN_INFO "Info port go %d %p\n", port->id, info);
 
 	buf = list_first_entry_or_null(&port->queue, struct nexus_buffer, node);
 	if (buf == NULL) {
@@ -828,7 +844,7 @@ long nexus_port_op(struct nexus_team *team, unsigned long arg)
 
 		case NEXUS_SET_PORT_OWNER:
 			// TODO check current team owns the port
-			nexus_set_port_owner(team, port, in_data.cookie,
+			nexus_set_port_owner(port, in_data.cookie,
 				&in_data.return_code);
 			break;
 	}

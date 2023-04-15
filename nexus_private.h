@@ -23,7 +23,7 @@ struct nexus_team {
 	//struct task_struct	*tsk;
 	//struct files_struct	*files;
 
-	// TODO: probably not needed unless we have a good reason
+	// TODO: do we really need this?
 	struct nexus_thread*	main_thread;
 };
 
