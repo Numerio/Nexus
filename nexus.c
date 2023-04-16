@@ -31,13 +31,17 @@ struct nexus_team* nexus_team_init()
 	struct nexus_team* team = kzalloc(sizeof(struct nexus_team), GFP_KERNEL);
 	if (team != NULL) {
 		team->id = current->group_leader->pid;
-		team->main_thread = nexus_thread_init(team, team->id, "main"); 
-		team->ports = RB_ROOT;
-		team->threads = RB_ROOT;
+		team->main_thread = nexus_thread_init(team, team->id, NULL);
+
 		if (team->main_thread == NULL) {
 			kfree(team);
 			return NULL;
 		}
+
+		strncpy(team->main_thread->name, "main", 4);
+		team->ports = RB_ROOT;
+		team->threads = RB_ROOT;
+
 		hlist_add_head(&team->node, &nexus_teams);	
 	}
 	return team;
@@ -71,10 +75,20 @@ struct nexus_thread* nexus_thread_init(struct nexus_team *team, pid_t id, const 
 	if (thread != NULL) {
 		thread->id = id;
 
-		//if (copy_from_user(thread->name, name, min(strlen(name), B_OS_NAME_LENGTH))) {
-		//	kfree(thread);
-		//	return NULL;
-		//}
+		if (name != NULL) {
+			// TODO: I'm not entirely happy of the fact that it's unclear whether
+			// string is from user land or kernel land I believe this
+			// apply to other stuff around we might want to sanitize this.
+			// An idea would be to just enforce a layer after which everything
+			// is kernel land so there's no possibility of obscure bugs.
+			if (strncpy_from_user(
+					thread->name, name, B_OS_NAME_LENGTH) < 0) {
+				printk(KERN_INFO "thread_error from %d", thread->id);
+
+				kfree(thread);
+				return NULL;
+			}
+		}
 
 		sema_init(&thread->sem_read, 1);
 		sema_init(&thread->sem_write, 1);
@@ -254,6 +268,13 @@ long nexus_thread_op(struct nexus_thread *thread, unsigned long arg)
 		if (dest_thread->buffer_ready == 1)
 			printk(KERN_INFO "has data found %d %d\n", current->pid, user_data.return_code);
 
+	} else if (user_data.op == NEXUS_THREAD_SET_NAME) {
+		if (strncpy_from_user(thread->name, user_data.buffer,
+				min(B_OS_NAME_LENGTH, user_data.size)) < 0) {
+			printk(KERN_INFO "set name thread_error from %d", thread->id);
+			return -1;
+		}
+		printk(KERN_INFO "set name thread from %d set to %s", thread->id, thread->name);
 	}
 
 	if (copy_to_user((struct __user nexus_thread_exchange*)arg, &user_data,
@@ -391,7 +412,7 @@ long nexus_port_init(struct nexus_team* team, unsigned long arg)
 
 	nexus_ports[id] = port;
 
-	printk(KERN_INFO "port %d id %d\n", port, id);
+	printk(KERN_INFO "initialized port id %d\n", id);
 
 	out_data.id = id;
 	out_data.return_code = -1;
@@ -422,7 +443,7 @@ void nexus_port_close(struct nexus_port* port, int32_t* return_code)
 
 void nexus_port_destroy(struct nexus_port* port, int32_t* return_code)
 {
-	printk(KERN_INFO "Port destroy enter %d\n", port->id);
+	printk(KERN_INFO "Port destroy enter %d owned by %d\n", port->id, port->team->id);
 
 	nexus_ports[port->id] = NULL;
 
@@ -437,10 +458,11 @@ void nexus_port_destroy(struct nexus_port* port, int32_t* return_code)
 	*return_code = B_OK;
 }
 
-//TODO team is unneded here as we already have the port
 void nexus_set_port_owner(struct nexus_port* port,
 	pid_t target_team, int32_t* return_code)
 {
+	printk(KERN_INFO "Set port owner %d\n", port->id);
+
 	struct nexus_team* dest_team = NULL;
 	struct nexus_port *next_port = NULL;
 	struct rb_node *parent = NULL;
