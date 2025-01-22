@@ -37,7 +37,6 @@ struct nexus_thread {
 	struct semaphore		sem_write;
 
 	wait_queue_head_t		buffer_read;
-	wait_queue_head_t		buffer_write;
 	int						buffer_ready;
 
 	void*					buffer;
@@ -79,6 +78,7 @@ struct nexus_port {
 	int32_t					read_count;
 	int32_t					total_count;
 
+	// TODO remove
 	rwlock_t				rw_lock;
 
 	struct nexus_team*		team;

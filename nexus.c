@@ -70,6 +70,7 @@ void nexus_team_destroy(struct nexus_team* team)
 
 struct nexus_thread* nexus_thread_init(struct nexus_team *team, pid_t id, const char *name)
 {
+	printk("thread init %d", id);
 	struct nexus_thread* thread = kzalloc(sizeof(struct nexus_thread), GFP_KERNEL);
 
 	if (thread != NULL) {
@@ -94,7 +95,7 @@ struct nexus_thread* nexus_thread_init(struct nexus_team *team, pid_t id, const 
 		sema_init(&thread->sem_write, 1);
 
 		init_waitqueue_head(&thread->buffer_read);
-		init_waitqueue_head(&thread->buffer_write);
+
 		thread->buffer_ready = 0;
 		thread->buffer = NULL;
 		thread->team = team;
@@ -104,6 +105,8 @@ struct nexus_thread* nexus_thread_init(struct nexus_team *team, pid_t id, const 
 
 long nexus_thread_destroy(struct nexus_thread *thread)
 {
+	printk(KERN_INFO "thread_destroy %d", thread->id);
+
 	struct nexus_team* team = thread->team;
 	if (thread->id != team->id)
 		rb_erase(&thread->node, &team->threads);
@@ -113,9 +116,6 @@ long nexus_thread_destroy(struct nexus_thread *thread)
 }
 
 struct nexus_thread* find_thread(struct nexus_team *team, const char *name) {
-	//if (name == NULL)
-	//	return NULL;
-
 	struct nexus_thread *thread = NULL;
 	struct rb_node *parent = NULL;
 	struct rb_node **p = &team->threads.rb_node;
@@ -142,6 +142,26 @@ struct nexus_thread* find_thread(struct nexus_team *team, const char *name) {
 	return thread;
 }
 
+struct nexus_thread* find_thread_by_id(struct nexus_team *team, int32_t pid) {
+	struct nexus_thread *thread = NULL;
+	struct rb_node *parent = NULL;
+	struct rb_node **p = &team->threads.rb_node;
+
+	while (*p) {
+		parent = *p;
+		thread = rb_entry(parent, struct nexus_thread, node);
+
+		if (pid > thread->id)
+			p = &(*p)->rb_right;
+		else if (pid < thread->id)
+			p = &(*p)->rb_left;
+		else
+			return thread;
+	}
+
+	return NULL;
+}
+
 static long nexus_thread_spawn(struct nexus_team *team, const char* name)
 {
 	find_thread(team, name);
@@ -158,11 +178,14 @@ long nexus_thread_op(struct nexus_thread *thread, unsigned long arg)
 
 	if (user_data.op == NEXUS_THREAD_READ) {
 
+		printk(KERN_INFO "thread_read %d %d", current->pid, thread->id);
+
 		if (thread->id != current->pid)
 			return -1;
 
+		down_interruptible(&thread->sem_read);
+
 		mutex_unlock(&nexus_main_lock);
-		down(&thread->sem_read);
 		wait_event_interruptible(thread->buffer_read, thread->buffer_ready != 0);
 		mutex_lock(&nexus_main_lock);
 
@@ -181,12 +204,12 @@ long nexus_thread_op(struct nexus_thread *thread, unsigned long arg)
 		thread->sender = -1;
 		thread->return_code = -1;
 
-		if (wq_has_sleeper(&thread->buffer_write))
-			wake_up_interruptible(&thread->buffer_write);
-
 		up(&thread->sem_write);
+
+		printk(KERN_INFO "thread_read finish");
 	} else if (user_data.op == NEXUS_THREAD_WRITE) {
-		printk(KERN_INFO "write %d %d\n", current->pid, user_data.return_code);
+		printk(KERN_INFO "thread_write from %d to %d", thread->id, user_data.receiver);
+
 		struct nexus_team *team;
 		struct nexus_thread *dest_thread;
 
@@ -199,25 +222,24 @@ long nexus_thread_op(struct nexus_thread *thread, unsigned long arg)
 			if (task->pid == team->id) {
 				dest_thread = team->main_thread;
 			} else if (task->tgid == team->id) {
-				dest_thread = find_thread(team, NULL);
+				dest_thread = find_thread_by_id(team, user_data.receiver);
+				if (dest_thread == NULL)
+					return -1;
 				break;
 			}
 		}
 
-		printk(KERN_INFO "write %d %d\n", current->pid, user_data.return_code);
+		// if -1 release the process then -ERESTARTSYS
+		down_interruptible(&dest_thread->sem_write);
+
+		printk(KERN_INFO "thread_written from %d to %d", thread->id, dest_thread->id);
 
 		// TODO define exact policy for retaining task structs
-		put_task_struct(task);
+		// TODO we also need to implement reference counting for all
+		// objects (ports, threads, areas)
 
 		if (dest_thread == NULL)
 			return -1;
-
-		// TODO performance opportunity avoid unlock
-		mutex_unlock(&nexus_main_lock);
-		down(&dest_thread->sem_write);
-		printk(KERN_INFO "going to wait %d\n", dest_thread->id);
-		wait_event_interruptible(thread->buffer_write, thread->buffer_ready != 1);
-		mutex_lock(&nexus_main_lock);
 
 		dest_thread->buffer = kzalloc(user_data.size, GFP_KERNEL);
 		if (dest_thread->buffer == NULL)
@@ -225,7 +247,6 @@ long nexus_thread_op(struct nexus_thread *thread, unsigned long arg)
 
 		if (copy_from_user(dest_thread->buffer, user_data.buffer,
 				user_data.size)) {
-			kfree(dest_thread->buffer);
 			return -1;
 		}
 
@@ -235,10 +256,11 @@ long nexus_thread_op(struct nexus_thread *thread, unsigned long arg)
 		dest_thread->buffer_ready = 1;
 		dest_thread->return_code = user_data.return_code;
 
-		if (wq_has_sleeper(&dest_thread->buffer_read))
-			wake_up_interruptible(&dest_thread->buffer_read);
-
+		wake_up_interruptible(&dest_thread->buffer_read);
 		up(&dest_thread->sem_read);
+
+		put_task_struct(task);
+
 	} else if (user_data.op == NEXUS_THREAD_HAS_DATA) {
 		struct nexus_team *team;
 		struct nexus_thread *dest_thread;
@@ -253,20 +275,23 @@ long nexus_thread_op(struct nexus_thread *thread, unsigned long arg)
 			if (task->pid == team->id) {
 				dest_thread = team->main_thread;
 			} else if (task->tgid == team->id) {
-				dest_thread = find_thread(team, NULL);
+				dest_thread = find_thread_by_id(team, user_data.receiver);
+				if (dest_thread == NULL)
+					return -1;
 				break;
 			}
 		}
 
-		// TODO
-		put_task_struct(task);
-
+		// goto err put_task_struct
 		if (dest_thread == NULL)
 			return -1;
 
 		user_data.return_code = (dest_thread->buffer_ready == 1) ? B_OK : B_ERROR;
 		if (dest_thread->buffer_ready == 1)
 			printk(KERN_INFO "has data found %d %d\n", current->pid, user_data.return_code);
+
+		// TODO
+		put_task_struct(task);
 
 	} else if (user_data.op == NEXUS_THREAD_SET_NAME) {
 		if (strncpy_from_user(thread->name, user_data.buffer,
@@ -423,8 +448,6 @@ long nexus_port_init(struct nexus_team* team, unsigned long arg)
 		return -1;
 	}
 
-	//printk(KERN_INFO "create port exit\n");
-
 	out_data.return_code = B_OK;
 	return 0;
 }
@@ -496,6 +519,8 @@ void nexus_set_port_owner(struct nexus_port* port,
 	}
 
 	*return_code = B_ERROR;
+
+	printk(KERN_INFO "Set port owner %d exit\n", port->id);
 }
 
 void nexus_port_read(struct nexus_port* port, int32_t* code, void* buffer,
@@ -583,6 +608,7 @@ void nexus_port_read(struct nexus_port* port, int32_t* code, void* buffer,
 
 	wake_up_interruptible(&port->buffer_write);
 
+	// TODO do this earlier
 	list_del(&buf->node);
 	kfree(buf->buffer);
 	kfree(buf);
