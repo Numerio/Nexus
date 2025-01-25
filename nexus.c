@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Copyright (C) 2022-2025 Dario Casalinuovo
+ */
+
 #include "nexus.h"
 
 #include <linux/cdev.h>

@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Copyright (C) 2022-2025 Dario Casalinuovo
+ */
+
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>

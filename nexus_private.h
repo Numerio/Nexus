@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Copyright (C) 2022-2025 Dario Casalinuovo
+ */
+
 #ifndef __VOS_NEXUS_PRIVATE
 #define __VOS_NEXUS_PRIVATE
 
