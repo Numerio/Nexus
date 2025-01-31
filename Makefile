@@ -1,11 +1,12 @@
 obj-m := nexus.o 
 
-KDIR  := /lib/modules/$(shell uname -r)/build
+KDIR  ?= /lib/modules/$(shell uname -r)/build
 
 PWD   := $(shell pwd)
 
-export EXTRA_CFLAGS := -std=gnu99
+BUILD_DIR ?= $(PWD)/build
 
+export EXTRA_CFLAGS := -std=gnu11
 
-default:
-	$(MAKE) -C $(KDIR) M=$(PWD) modules
+default: $(PWD)/Makefile
+	$(MAKE) -C $(KDIR) M=$(BUILD_DIR) src=$(PWD) modules
