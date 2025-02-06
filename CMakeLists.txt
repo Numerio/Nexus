@@ -16,4 +16,4 @@ add_custom_target(
 
 INCLUDE(CPack)
 
-install(FILES ./nexus.ko DESTINATION /lib/modules/${KERNEL_RELEASE}/kernel/drivers/nexus)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/nexus.ko DESTINATION /lib/modules/${KERNEL_RELEASE}/kernel/drivers/nexus)
