@@ -1,0 +1,2 @@
+nexus/ usr/src/nexus-1
+nexus.conf /etc/modules-load.d/

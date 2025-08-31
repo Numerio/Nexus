@@ -1,0 +1,10 @@
+Source: nexus-dkms
+Maintainer: Dario Casalinuovo <b.vitruvio@gmail.com>
+Section: kernel
+Priority: optional
+Build-Depends: debhelper (>= 13), dkms
+
+Package: nexus-dkms
+Architecture: all
+Depends: ${misc:Depends}
+Description: DKMS version for the nexus IPC for V\OS
