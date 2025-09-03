@@ -10,7 +10,7 @@ message(STATUS "Host kernel release: ${KERNEL_RELEASE}")
 #TODO add opt to skip local kernel build
 add_custom_target(
    nexus
-   COMMAND make KDIR=/usr/lib/modules/${KERNEL_RELEASE}/build WORKING_DIR=${CMAKE_CURRENT_BINARY_DIR}
+   COMMAND make KDIR=/usr/lib/modules/${KERNEL_RELEASE}/build
    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
 )
 

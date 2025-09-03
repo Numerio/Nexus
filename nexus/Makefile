@@ -4,12 +4,12 @@ KERNEL_SRC  ?= /lib/modules/$(shell uname -r)/build
 
 PWD   := $(shell pwd)
 
-WORKING_DIR ?= $$PWD/build
+WORKING_DIR ?= $$PWD
 
 export EXTRA_CFLAGS := -std=gnu11
 
 default: $(PWD)/Makefile
-	$(MAKE) -C $(KERNEL_SRC) M=$(WORKING_DIR) src=$(PWD) modules
+	$(MAKE) -C $(KERNEL_SRC) M=$(WORKING_DIR) MO=$(WORKING_DIR)/build/ src=$(PWD) modules
 
 install:
 	cp build/nexus.ko $(DESTDIR)/

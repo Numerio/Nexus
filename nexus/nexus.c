@@ -13,6 +13,7 @@
 #include <linux/rbtree.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
+#include <linux/version.h>
 #include <linux/wait.h>
 
 #include "errors.h"
@@ -929,7 +930,7 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		// TODO: second condition
 		if (thread == NULL || thread->id != current->pid) {
 			if (cmd == NEXUS_THREAD_SPAWN) {
-				long ret = nexus_thread_spawn(team, arg);
+				long ret = nexus_thread_spawn(team, (const char*)arg);
 				mutex_unlock(&nexus_main_lock);
 				return ret;
 			}
@@ -1021,7 +1022,12 @@ static int nexus_init(void)
 	if (alloc_chrdev_region(&major, 0, 1, DEV_NAME "_proc") < 0)
 		goto error;
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 4, 0)
 	nexus_class = class_create(THIS_MODULE, DEV_NAME "_sys");
+#else
+	nexus_class = class_create(DEV_NAME "_sys");
+#endif
+
 	if (nexus_class == NULL)
 		goto error;
 

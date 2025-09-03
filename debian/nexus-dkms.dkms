@@ -3,5 +3,5 @@ PACKAGE_VERSION="1"
 BUILT_MODULE_NAME[0]="$PACKAGE_NAME"
 DEST_MODULE_LOCATION[0]="/updates/dkms"
 AUTOINSTALL="YES"
-MAKE[0]="'make' -j$parallel_jobs -C nexus KERNEL_SRC=$kernel_source_dir && cp nexus/build/nexus.ko ./"
+MAKE[0]="'make' -j$parallel_jobs -C nexus KERNEL_SRC=$kernel_source_dir && cp nexus/nexus.ko ./"
 
