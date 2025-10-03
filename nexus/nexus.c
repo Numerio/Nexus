@@ -369,12 +369,15 @@ long nexus_thread_op(struct nexus_thread *thread, unsigned long arg)
 		}
 
 		printk(KERN_INFO "thread %d unblock %d", thread->id, dest_thread->id);
-		dest_thread->is_thread_blocked = 0;
-		kref_get(&dest_thread->ref_count);
-		mutex_unlock(&nexus_main_lock);
-		wake_up_interruptible(&dest_thread->thread_block);
-		mutex_lock(&nexus_main_lock);
-		kref_put(&dest_thread->ref_count, nexus_thread_destroy);
+
+		if (dest_thread->is_thread_blocked) {
+			dest_thread->is_thread_blocked = 0;
+			kref_get(&dest_thread->ref_count);
+			mutex_unlock(&nexus_main_lock);
+			wake_up_interruptible(&dest_thread->thread_block);
+			mutex_lock(&nexus_main_lock);
+			kref_put(&dest_thread->ref_count, nexus_thread_destroy);
+		}
 
 		put_task_struct(task);
 		user_data.return_code = B_OK;
