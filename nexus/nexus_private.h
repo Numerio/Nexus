@@ -38,6 +38,13 @@ struct nexus_thread {
 
 	char					name[B_OS_NAME_LENGTH];
 
+	bool					is_thread_blocked;
+	bool					has_thread_exited;
+	// TODO merge?
+	wait_queue_head_t		thread_block;
+	wait_queue_head_t		thread_exit;
+
+	// TODO we could replace the following with a port
 	struct semaphore		sem_read;
 	struct semaphore		sem_write;
 
@@ -68,7 +75,6 @@ struct nexus_buffer {
 
 struct nexus_port {
 	struct rb_node			node;
-
 	int32_t					id;
 
 	char					name[B_OS_NAME_LENGTH];
@@ -105,6 +111,15 @@ struct nexus_area {
 
 	bool					transfer_done;
 
+	pid_t					team;
+};
+
+struct nexus_sem {
+	struct rb_node			node;
+	int32_t					id;
+
+	char					name[B_OS_NAME_LENGTH];
+
 	struct nexus_team*		team;
 };
 
@@ -112,7 +127,7 @@ struct nexus_team*		nexus_team_init(void);
 void					nexus_team_destroy(struct nexus_team *team);
 
 struct nexus_thread*	nexus_thread_init(struct nexus_team *team, pid_t thread, const char *name);
-long					nexus_thread_destroy(struct nexus_thread *thread);
+long 					nexus_thread_destroy(struct nexus_thread *thread);
 long					nexus_thread_op(struct nexus_thread *thread, unsigned long cmd);
 
 long					nexus_port_init(struct nexus_team* team, unsigned long arg);
