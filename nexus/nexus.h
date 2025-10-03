@@ -93,7 +93,7 @@ struct nexus_port_info {
 };
 
 struct nexus_sem_exchange {
-	int32_t		sem;
+	int32_t		id;
 
 	int32_t		count;
 	char		name[NAME_LENGTH];
@@ -102,7 +102,7 @@ struct nexus_sem_exchange {
 };
 
 struct nexus_area_exchange {
-	int32_t		area;
+	int32_t		id;
 
 	char		name[NAME_LENGTH];
 	int64_t		fd;

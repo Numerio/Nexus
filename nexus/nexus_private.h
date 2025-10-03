@@ -23,12 +23,10 @@ struct nexus_team {
 
 	struct rb_root			threads;
 	struct rb_root			ports;
-	//struct rb_root		areas;
 
 	//struct task_struct	*tsk;
 	//struct files_struct	*files;
 
-	// TODO: do we really need this?
 	struct nexus_thread*	main_thread;
 };
 
@@ -89,6 +87,7 @@ struct nexus_port {
 	int32_t					read_count;
 	int32_t					total_count;
 
+	struct kref				ref_count;
 	// TODO remove
 	rwlock_t				rw_lock;
 
@@ -131,7 +130,7 @@ long 					nexus_thread_destroy(struct nexus_thread *thread);
 long					nexus_thread_op(struct nexus_thread *thread, unsigned long cmd);
 
 long					nexus_port_init(struct nexus_team* team, unsigned long arg);
-void					nexus_port_destroy(struct nexus_port* port, int32_t* return_code);
+void					nexus_port_destroy(struct kref* ref);
 long					nexus_port_op(struct nexus_team *team, unsigned long cmd);
 
 /*

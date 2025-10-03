@@ -7,6 +7,7 @@
 
 #include <linux/cdev.h>
 #include <linux/fs.h>
+#include <linux/kref.h>
 #include <linux/list.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -55,6 +56,7 @@ struct nexus_team* nexus_team_init()
 void nexus_team_destroy(struct nexus_team* team)
 {
 	printk( KERN_INFO "team destroy");
+
 	struct rb_node *node;
 	struct nexus_port *port;
 	int32_t return_code;
@@ -63,7 +65,7 @@ void nexus_team_destroy(struct nexus_team* team)
 	while (node) {
 		port = rb_entry(node, struct nexus_port, node);
 		node = rb_next(node);
-		nexus_port_destroy(port, &return_code);
+		nexus_port_destroy(&port->ref_count);
 	}
 
 	// TODO: threads should be all dead at this point.
@@ -83,11 +85,6 @@ struct nexus_thread* nexus_thread_init(struct nexus_team *team, pid_t id, const 
 		thread->id = id;
 
 		if (name != NULL) {
-			// TODO: I'm not entirely happy of the fact that it's unclear whether
-			// string is from user land or kernel land I believe this
-			// apply to other stuff around we might want to sanitize this.
-			// An idea would be to just enforce a layer after which everything
-			// is kernel land so there's no possibility of obscure bugs.
 			if (strncpy_from_user(
 					thread->name, name, B_OS_NAME_LENGTH) < 0) {
 				printk(KERN_INFO "thread_error from %d", thread->id);
@@ -241,8 +238,11 @@ long nexus_thread_op(struct nexus_thread *thread, unsigned long arg)
 			}
 		}
 
+
+		mutex_unlock(&nexus_main_lock);
 		// if -1 release the process then -ERESTARTSYS
 		down_interruptible(&dest_thread->sem_write);
+		mutex_lock(&nexus_main_lock);
 
 		printk(KERN_INFO "thread_written from %d to %d", thread->id, dest_thread->id);
 
@@ -484,6 +484,9 @@ long nexus_port_init(struct nexus_team* team, unsigned long arg)
 
 	port = kzalloc(sizeof(struct nexus_port), GFP_KERNEL);
 
+	kref_init(&port->ref_count);
+	kref_get(&port->ref_count);
+
 	init_waitqueue_head(&port->buffer_read);
 	init_waitqueue_head(&port->buffer_write);
 
@@ -557,21 +560,22 @@ void nexus_port_close(struct nexus_port* port, int32_t* return_code)
 	*return_code = B_OK;
 }
 
-void nexus_port_destroy(struct nexus_port* port, int32_t* return_code)
+void nexus_port_destroy(struct kref* ref)
 {
-	printk(KERN_INFO "Port destroy enter %d owned by %d\n", port->id, port->team->id);
+	struct nexus_port* port = container_of(ref, struct nexus_port, ref_count);
 
+	printk(KERN_INFO "Port destroy enter %d owned by %d\n", port->id, port->team->id);
 	nexus_ports[port->id] = NULL;
 
+	uint32_t status;
 	if (port->is_open)
-		nexus_port_close(port, return_code);
+		nexus_port_close(port, &status);
 
 	write_lock(&port->rw_lock);
 	rb_erase(&port->node, &port->team->ports);
 	write_unlock(&port->rw_lock);
-	kfree(port);
 
-	*return_code = B_OK;
+	kfree(port);
 }
 
 void nexus_set_port_owner(struct nexus_port* port,
@@ -646,6 +650,7 @@ void nexus_port_read(struct nexus_port* port, int32_t* code, void* buffer,
 			return;
 		}
 
+		kref_get(&port->ref_count);
 		int32_t port_id = port->id;
 		mutex_unlock(&nexus_main_lock);
 		if (flags & B_TIMEOUT && timeout != B_INFINITE_TIMEOUT) {
@@ -657,6 +662,7 @@ void nexus_port_read(struct nexus_port* port, int32_t* code, void* buffer,
 				port->read_count > 0 || port->is_open == false);
 		}
 		mutex_lock(&nexus_main_lock);
+		kref_put(&port->ref_count, nexus_port_destroy);
 
 		if (nexus_ports[port_id] == NULL
 				|| (!port->is_open && port->read_count == 0)
@@ -747,7 +753,7 @@ void nexus_port_write(struct nexus_port* port, int32_t* msg_code,
 		}
 
 		int32_t port_id = port->id;
-
+		kref_get(&port->ref_count);
 		mutex_unlock(&nexus_main_lock);
 		if (flags & B_TIMEOUT && timeout != B_INFINITE_TIMEOUT) {
 			ret = wait_event_interruptible_hrtimeout(port->buffer_write,
@@ -758,6 +764,7 @@ void nexus_port_write(struct nexus_port* port, int32_t* msg_code,
 				port->write_count >= 0 || port->is_open == false);
 		}
 		mutex_lock(&nexus_main_lock);
+		kref_put(&port->ref_count, nexus_port_destroy);
 
 		if (nexus_ports[port_id] == NULL) {
 			*return_code = B_BAD_PORT_ID;
@@ -882,6 +889,7 @@ void nexus_port_message_info(struct nexus_port* port,
 			return;
 		}
 
+		kref_get(&port->ref_count);
 		int32_t port_id = port->id;
 		mutex_unlock(&nexus_main_lock);
 		if ((flags & B_TIMEOUT) != 0 && timeout != B_INFINITE_TIMEOUT) {
@@ -893,6 +901,7 @@ void nexus_port_message_info(struct nexus_port* port,
 				port->read_count > 0 || port->is_open == false);
 		}
 		mutex_lock(&nexus_main_lock);
+		kref_put(&port->ref_count, nexus_port_destroy);
 
 		if (nexus_ports[port_id] == NULL
 				|| (!port->is_open && port->read_count == 0)
@@ -939,7 +948,7 @@ long nexus_port_op(struct nexus_team *team, unsigned long arg)
 		goto exit;
 	}
 
-	if (in_data.id < 0 /*|| in_data.id > MAX_PORTS*/) {
+	if (in_data.id < 0) {
 		in_data.return_code = B_BAD_PORT_ID;
 		goto exit;
 	}
@@ -952,7 +961,14 @@ long nexus_port_op(struct nexus_team *team, unsigned long arg)
 
 	switch (in_data.op) {
 		case NEXUS_PORT_DELETE:
-			nexus_port_destroy(port, &in_data.return_code);
+			printk(KERN_INFO "port delete %d", port->id);
+			uint32_t status;
+			nexus_ports[port->id] = NULL;
+			if (port->is_open)
+				nexus_port_close(port, &status);
+
+			kref_put(&port->ref_count, nexus_port_destroy);
+			in_data.return_code = B_OK;
 			break;
 
 		case NEXUS_PORT_CLOSE:
