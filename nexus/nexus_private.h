@@ -32,6 +32,8 @@ struct nexus_team {
 
 struct nexus_thread {
 	struct rb_node			node;
+	struct kref				ref_count;
+
 	pid_t					id;
 
 	char					name[B_OS_NAME_LENGTH];
@@ -73,8 +75,9 @@ struct nexus_buffer {
 
 struct nexus_port {
 	struct rb_node			node;
-	int32_t					id;
+	struct kref				ref_count;
 
+	int32_t					id;
 	char					name[B_OS_NAME_LENGTH];
 	uint32_t				capacity;
 
@@ -87,7 +90,6 @@ struct nexus_port {
 	int32_t					read_count;
 	int32_t					total_count;
 
-	struct kref				ref_count;
 	// TODO remove
 	rwlock_t				rw_lock;
 
@@ -126,7 +128,7 @@ struct nexus_team*		nexus_team_init(void);
 void					nexus_team_destroy(struct nexus_team *team);
 
 struct nexus_thread*	nexus_thread_init(struct nexus_team *team, pid_t thread, const char *name);
-long 					nexus_thread_destroy(struct nexus_thread *thread);
+void 					nexus_thread_destroy(struct kref* ref);
 long					nexus_thread_op(struct nexus_thread *thread, unsigned long cmd);
 
 long					nexus_port_init(struct nexus_team* team, unsigned long arg);

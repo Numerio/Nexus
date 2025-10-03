@@ -53,12 +53,13 @@ struct nexus_team* nexus_team_init()
 	return team;
 }
 
-void nexus_team_destroy(struct nexus_team* team)
+void nexus_team_destroy(struct nexus_team *team)
 {
 	printk( KERN_INFO "team destroy");
 
 	struct rb_node *node;
 	struct nexus_port *port;
+	struct nexus_thread *thread;
 	int32_t return_code;
 
 	node = rb_first(&team->ports);
@@ -68,9 +69,14 @@ void nexus_team_destroy(struct nexus_team* team)
 		nexus_port_destroy(&port->ref_count);
 	}
 
-	// TODO: threads should be all dead at this point.
+	node = rb_first(&team->threads);
+	while (node) {
+		thread = rb_entry(node, struct nexus_thread, node);
+		node = rb_next(node);
+		nexus_thread_destroy(&thread->ref_count);
+	}
 
-	nexus_thread_destroy(team->main_thread);
+	nexus_thread_destroy(&team->main_thread->ref_count);
 	team->main_thread = NULL;
 	hlist_del(&team->node);
 	kfree(team);
@@ -94,6 +100,9 @@ struct nexus_thread* nexus_thread_init(struct nexus_team *team, pid_t id, const 
 			}
 		}
 
+		kref_init(&thread->ref_count);
+		kref_get(&thread->ref_count);
+
 		sema_init(&thread->sem_read, 1);
 		sema_init(&thread->sem_write, 1);
 
@@ -108,20 +117,23 @@ struct nexus_thread* nexus_thread_init(struct nexus_team *team, pid_t id, const 
 	return thread;
 }
 
-long nexus_thread_destroy(struct nexus_thread* thread)
+void nexus_thread_destroy(struct kref* ref)
 {
+	struct nexus_thread* thread = container_of(ref, struct nexus_thread, ref_count);
+
 	printk(KERN_INFO "thread_destroy %d", thread->id);
 
-	thread->has_thread_exited = 1;
-	mutex_unlock(&nexus_main_lock);
-	wake_up_interruptible(&thread->thread_exit);
-	mutex_lock(&nexus_main_lock);
+	if (!thread->has_thread_exited) {
+		thread->has_thread_exited = 1;
+		mutex_unlock(&nexus_main_lock);
+		wake_up_interruptible(&thread->thread_exit);
+		mutex_lock(&nexus_main_lock);
+	}
+
 	struct nexus_team* team = thread->team;
 	if (thread->id != team->id)
 		rb_erase(&thread->node, &team->threads);
 	kfree(thread);
-
-	return 0;
 }
 
 struct nexus_thread* find_thread(struct nexus_team *team, const char *name) {
@@ -239,10 +251,12 @@ long nexus_thread_op(struct nexus_thread *thread, unsigned long arg)
 		}
 
 
+		kref_get(&dest_thread->ref_count);
 		mutex_unlock(&nexus_main_lock);
 		// if -1 release the process then -ERESTARTSYS
 		down_interruptible(&dest_thread->sem_write);
 		mutex_lock(&nexus_main_lock);
+		kref_put(&dest_thread->ref_count, nexus_thread_destroy);
 
 		printk(KERN_INFO "thread_written from %d to %d", thread->id, dest_thread->id);
 
@@ -356,9 +370,11 @@ long nexus_thread_op(struct nexus_thread *thread, unsigned long arg)
 
 		printk(KERN_INFO "thread %d unblock %d", thread->id, dest_thread->id);
 		dest_thread->is_thread_blocked = 0;
+		kref_get(&dest_thread->ref_count);
 		mutex_unlock(&nexus_main_lock);
 		wake_up_interruptible(&dest_thread->thread_block);
 		mutex_lock(&nexus_main_lock);
+		kref_put(&dest_thread->ref_count, nexus_thread_destroy);
 
 		put_task_struct(task);
 		user_data.return_code = B_OK;
@@ -385,10 +401,12 @@ long nexus_thread_op(struct nexus_thread *thread, unsigned long arg)
 		printk(KERN_INFO "thread %d waitfor %d", thread->id, dest_thread->id);
 
 		if (!dest_thread->has_thread_exited) {
+			kref_get(&dest_thread->ref_count);
 			mutex_unlock(&nexus_main_lock);
 			wait_event_interruptible(dest_thread->thread_exit,
 				dest_thread->has_thread_exited);
 			mutex_lock(&nexus_main_lock);
+			kref_put(&dest_thread->ref_count, nexus_thread_destroy);
 		}
 		put_task_struct(task);
 		user_data.return_code = B_OK;
@@ -856,8 +874,6 @@ void nexus_port_info(struct nexus_port* port,
 	}
 
 	*return_code = B_OK;
-
-	//printk(KERN_INFO "Info port %d exit %d\n", port->id, port->read_count);
 }
 
 
@@ -1050,7 +1066,14 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 
 		case NEXUS_THREAD_EXIT:
 			printk(KERN_INFO "nexus_thread_exit");
-			ret = nexus_thread_destroy(thread);
+
+			thread->has_thread_exited = 1;
+			mutex_unlock(&nexus_main_lock);
+			wake_up_interruptible(&thread->thread_exit);
+			mutex_lock(&nexus_main_lock);
+
+			kref_put(&thread->ref_count, nexus_thread_destroy);
+			ret = B_OK;
 			break;
 
 		case NEXUS_PORT_CREATE:
