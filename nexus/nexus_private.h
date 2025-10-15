@@ -126,13 +126,20 @@ struct nexus_area {
 	pid_t					team;
 };
 
-struct nexus_sem {
-	struct rb_node			node;
-	int32_t					id;
+struct nexus_vref {
+	struct hlist_node node;
+	struct kref ref_count;
 
-	char					name[B_OS_NAME_LENGTH];
+	int32_t id;
+	struct file* file;
 
-	struct nexus_team*		team;
+	//
+	dev_t dev;
+	ino_t ino;
+
+	struct list_head fd_list;
+
+	pid_t team;
 };
 
 struct nexus_team*		nexus_team_init(void);
