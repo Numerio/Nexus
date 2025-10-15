@@ -261,8 +261,6 @@ long nexus_thread_op(struct nexus_thread *thread, unsigned long arg)
 		printk(KERN_INFO "thread_written from %d to %d", thread->id, dest_thread->id);
 
 		// TODO define exact policy for retaining task structs
-		// TODO we also need to implement reference counting for all
-		// objects (ports, threads, areas)
 
 		if (dest_thread == NULL)
 			return -1;
@@ -388,6 +386,7 @@ long nexus_thread_op(struct nexus_thread *thread, unsigned long arg)
 		struct task_struct* task = get_pid_task(find_get_pid(
 		(pid_t)user_data.receiver),PIDTYPE_PID);
 		if (task == NULL)
+			// TODO B_BAD_THREAD_ID
 			return -1;
 
 		hlist_for_each_entry(team, &nexus_teams, node) {
@@ -408,6 +407,7 @@ long nexus_thread_op(struct nexus_thread *thread, unsigned long arg)
 			mutex_unlock(&nexus_main_lock);
 			wait_event_interruptible(dest_thread->thread_exit,
 				dest_thread->has_thread_exited);
+			// TODO B_INTERRUPTED
 			mutex_lock(&nexus_main_lock);
 			kref_put(&dest_thread->ref_count, nexus_thread_destroy);
 		}
@@ -1024,6 +1024,9 @@ long nexus_port_op(struct nexus_team *team, unsigned long arg)
 			nexus_set_port_owner(port, in_data.cookie,
 				&in_data.return_code);
 			break;
+
+		default:
+			return B_ERROR;
 	}
 
 exit:
@@ -1172,7 +1175,7 @@ static int nexus_init(void)
 
 	memset(nexus_ports, 0, MAX_PORTS*sizeof(struct nexus_port*));
 
-	printk(KERN_INFO "Nexus module loaded\n");
+	printk(KERN_INFO "nexus loaded\n");
 	return 0;
 
 error:
@@ -1183,7 +1186,7 @@ error:
 static void nexus_exit(void)
 {
 	nexus_cleanup_dev(1);
-	printk(KERN_INFO "Nexus module unloaded\n");
+	printk(KERN_INFO "nexus unloaded\n");
 }
 
 module_init(nexus_init);
@@ -1191,5 +1194,5 @@ module_exit(nexus_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Dario Casalinuovo");
-MODULE_DESCRIPTION("Nexus IPC Module");
+MODULE_DESCRIPTION("Nexus IPC");
 MODULE_VERSION("0.3");

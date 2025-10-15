@@ -40,18 +40,17 @@ struct nexus_thread {
 
 	bool					is_thread_blocked;
 	bool					has_thread_exited;
-	// TODO merge?
+
 	wait_queue_head_t		thread_block;
 	wait_queue_head_t		thread_exit;
 
-	// TODO we could replace the following with a port
 	struct semaphore		sem_read;
 	struct semaphore		sem_write;
 
 	wait_queue_head_t		buffer_read;
 	int						buffer_ready;
 
-	void*					buffer;
+	const void*				buffer;
 	ssize_t					buffer_size;
 
 	pid_t					sender;
@@ -65,7 +64,7 @@ struct nexus_buffer {
 	struct list_head		node;
 
 	int32_t					code;
-	void*					buffer;
+	const void*				buffer;
 	size_t					size;
 
 	uid_t					sender;

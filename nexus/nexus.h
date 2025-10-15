@@ -50,7 +50,7 @@ struct nexus_thread_exchange {
 	int32_t					sender;
 	int32_t					receiver;
 
-	void*					buffer;
+	const void*				buffer;
 	ssize_t					size;
 
 	uint32_t				flags;
@@ -67,7 +67,7 @@ struct nexus_port_exchange {
 
 	//
 	int32_t*				code;
-	void*					buffer;
+	const void*				buffer;
 	size_t					size;
 	uint32_t				flags;
 	int64_t					timeout;
