@@ -96,19 +96,31 @@ struct nexus_port {
 	struct nexus_team*		team;
 };
 
-struct nexus_area {
+struct nexus_sem {
 	struct rb_node			node;
-	int32_t					id;
+	struct kref				ref_count;
 
+	int32_t					id;
 	char					name[B_OS_NAME_LENGTH];
 
-	int						fd;
+	struct semaphore		sem;
+	bool					deleted;
+
+	pid_t					team;
+};
+
+struct nexus_area {
+	struct rb_node			node;
+	struct kref				ref_count;
+
+	int32_t					id;
+	char					name[B_OS_NAME_LENGTH];
 
 	bool					is_clone;
 	struct nexus_area*		source_area;
+	struct nexus_area*		clones;
 
-	struct rb_root			clones;
-	atomic_t				clones_refs;
+	struct file*			file;
 
 	bool					transfer_done;
 
@@ -135,6 +147,7 @@ long					nexus_port_init(struct nexus_team* team, unsigned long arg);
 void					nexus_port_destroy(struct kref* ref);
 long					nexus_port_op(struct nexus_team *team, unsigned long cmd);
 
+void					nexus_sem_delete(struct kref* ref);
 /*
 struct nexus_area*		nexus_area_init(struct nexus_team *team, int user_fd);
 void					nexus_area_destroy(struct nexus_area *area);

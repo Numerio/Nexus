@@ -36,7 +36,8 @@
 #define NEXUS_SEM_ACQUIRE			_IO(IOCTL_BASE, 2)
 #define NEXUS_SEM_RELEASE			_IO(IOCTL_BASE, 3)
 #define NEXUS_SEM_DELETE			_IO(IOCTL_BASE, 4)
-#define NEXUS_SEM_SET_OWNER			_IO(IOCTL_BASE, 5)
+#define NEXUS_SEM_COUNT				_IO(IOCTL_BASE, 5)
+//#define NEXUS_SEM_SET_OWNER		_IO(IOCTL_BASE, 6)
 
 #define NEXUS_FDREF_CREATE			_IO(IOCTL_BASE, 1)
 #define NEXUS_FDREF_ACQUIRE			_IO(IOCTL_BASE, 2)
@@ -96,7 +97,7 @@ struct nexus_sem_exchange {
 	int32_t		id;
 
 	int32_t		count;
-	char		name[NAME_LENGTH];
+	char*		name;
 	int32_t		flags;
 	int64_t		timeout;
 };
