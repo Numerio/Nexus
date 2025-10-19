@@ -101,11 +101,15 @@ struct nexus_sem {
 
 	int32_t					id;
 	char					name[B_OS_NAME_LENGTH];
-
-	struct semaphore		sem;
+	//uint32_t				status;
 	bool					deleted;
 
-	pid_t					team;
+	atomic_t				count;
+	atomic_t				acquire_count;
+
+    struct wait_queue_head	wait_queue;
+
+	struct task_struct*		team;
 };
 
 struct nexus_area {
