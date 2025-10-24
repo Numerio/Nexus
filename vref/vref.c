@@ -29,9 +29,7 @@ struct fd_entry {
 	struct list_head list;
 };
 
-
 static void fd_entry_release(struct kref *kref) {
-	printk(KERN_INFO "fd_entry_release");
 	struct nexus_vref *entry = container_of(kref, struct nexus_vref, ref_count);
 	struct fd_entry *entry_fd, *tmp;
 
@@ -44,58 +42,25 @@ static void fd_entry_release(struct kref *kref) {
 	kfree(entry);
 }
 
-static struct nexus_vref *find_or_create_entry(int fd) {
-	printk(KERN_INFO "find_or_create_entry");
+int32_t nexus_vref_create(int fd) {
 	struct file *f = fget(fd);
 	if (!f) {
-		return ERR_PTR(-EBADF);
+		return -EBADF;
 	}
 
-	dev_t dev = f->f_inode->i_sb->s_dev;
-	ino_t ino = f->f_inode->i_ino;
-	struct nexus_vref *entry = NULL;
-	int32_t id;
-
-	mutex_lock(&fd_map_lock);
-
-	hash_for_each(fd_hashmap, id, entry, node) {
-		if (entry->dev == dev && entry->ino == ino) {
-			kref_get(&entry->ref_count);
-			mutex_unlock(&fd_map_lock);
-			fput(f);
-			return entry;
-		}
-	}
-
-	entry = kmalloc(sizeof(struct nexus_vref), GFP_KERNEL);
+	struct nexus_vref *entry = kzalloc(sizeof(struct nexus_vref), GFP_KERNEL);
 	if (!entry) {
-		mutex_unlock(&fd_map_lock);
 		fput(f);
-		return ERR_PTR(-ENOMEM);
+		return -ENOMEM;
 	}
 
 	kref_init(&entry->ref_count);
-	//kref_get
+	kref_get(&entry->ref_count);
 	INIT_LIST_HEAD(&entry->fd_list);
 	entry->id = id_counter++;
-
 	entry->file = f;
-	entry->dev = dev;
-	entry->ino = ino;
 
 	hash_add(fd_hashmap, &entry->node, entry->id);
-
-	mutex_unlock(&fd_map_lock);
-	printk(KERN_INFO "entry added %d", entry->id);
-	return entry;
-}
-
-int32_t nexus_vref_create(int fd) {
-	printk(KERN_INFO "nexus_vref_create");
-	struct nexus_vref *entry = find_or_create_entry(fd);
-	if (IS_ERR(entry)) {
-		return PTR_ERR(entry);
-	}
 
 	struct fd_entry *entry_fd = kmalloc(sizeof(struct fd_entry), GFP_KERNEL);
 	if (!entry_fd) {
@@ -103,39 +68,22 @@ int32_t nexus_vref_create(int fd) {
 		kref_put(&entry->ref_count, fd_entry_release);
 		return -ENOMEM;
 	}
-	
+
 	entry_fd->pid = current->pid;
 	entry_fd->fd = fd;
 	list_add(&entry_fd->list, &entry->fd_list);
-	printk(KERN_INFO "nexus_vref_create add %d %d", fd, entry->id);
 	return entry->id;
 }
 
 int nexus_vref_acquire(int32_t id) {
-	printk(KERN_INFO "nexus_vref_acquire %d", id);
 	struct nexus_vref *entry = NULL;
+	struct hlist_node *tmp;
 
 	mutex_lock(&fd_map_lock);
-
-	int32_t _id;
-	hash_for_each(fd_hashmap, _id, entry, node) {
-		printk(KERN_INFO "a %d %d", id, entry->id);
-
+	hash_for_each_possible_safe(fd_hashmap, entry, tmp, node, id) {
 		if (entry->id == id) {
-			printk(KERN_INFO "---------------found");
-
-			struct fd_entry *entry_fd;
-			list_for_each_entry(entry_fd, &entry->fd_list, list) {
-				if (entry_fd->pid == current->pid) {
-					kref_get(&entry->ref_count);
-					mutex_unlock(&fd_map_lock);
-					return entry_fd->fd;
-				}
-			}
-
 			int fd = get_unused_fd_flags(O_RDONLY);
 			if (fd < 0) {
-				printk(KERN_INFO "failed to get fd");
 				mutex_unlock(&fd_map_lock);
 				return -1;
 			}
@@ -156,29 +104,22 @@ int nexus_vref_acquire(int32_t id) {
 			return fd;
 		}
 	}
-
-	printk(KERN_INFO "******************* einval2\n");
 	mutex_unlock(&fd_map_lock);
 	return -EINVAL;
 }
 
 long nexus_vref_release(int32_t id) {
-	printk(KERN_INFO "nexus_vref_release");
 	struct nexus_vref *entry = NULL;
+	struct hlist_node *tmp;
 
 	mutex_lock(&fd_map_lock);
-
-	int32_t _id;
-	hash_for_each(fd_hashmap, _id, entry, node) {
+	hash_for_each_possible_safe(fd_hashmap, entry, tmp, node, id) {
 		if (entry->id == id) {
-			printk(KERN_INFO "nexus_vref_release id %d", id);
 			kref_put(&entry->ref_count, fd_entry_release);
 			mutex_unlock(&fd_map_lock);
 			return 0;
 		}
 	}
-
-	printk(KERN_INFO "einval\n");
 	mutex_unlock(&fd_map_lock);
 	return -EINVAL;
 }
@@ -191,19 +132,16 @@ static long vref_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
 		case NEXUS_VREF_CREATE:
 			if (copy_from_user(&fd, (int __user *)arg, sizeof(fd)))
 				return -EFAULT;
-
 			return nexus_vref_create(fd);
 		
 		case NEXUS_VREF_ACQUIRE:
 			if (copy_from_user(&id, (int __user *)arg, sizeof(id)))
 				return -EFAULT;
-
 			return nexus_vref_acquire(id);
 		
 		case NEXUS_VREF_RELEASE:
 			if (copy_from_user(&id, (int __user *)arg, sizeof(id)))
 				return -EFAULT;
-
 			return nexus_vref_release(id);
 
 		default:

@@ -136,20 +136,19 @@ struct nexus_area {
 };
 
 struct nexus_vref {
-	struct hlist_node node;
-	struct kref ref_count;
+	struct hlist_node		node;
+	struct kref				ref_count;
 
-	int32_t id;
-	struct file* file;
+	int32_t					id;
+	struct file*			file;
 
-	//
-	dev_t dev;
-	ino_t ino;
+	struct list_head		fd_list;
 
-	struct list_head fd_list;
-
-	pid_t team;
+	//int					fd;
+	// struct task
+	pid_t					team;
 };
+
 
 struct nexus_team*		nexus_team_init(void);
 void					nexus_team_destroy(struct nexus_team *team);
