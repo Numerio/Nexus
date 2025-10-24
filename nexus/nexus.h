@@ -134,4 +134,18 @@ enum port_ops {
 	NEXUS_SET_PORT_OWNER, // TODO deprecate
 };
 
+#ifndef __KERNEL__
+
+inline int32_t nexus_io(int nexus, unsigned long request, void* msg)
+{
+	int ret = ioctl(nexus, request, msg);
+	if (ret == -1)
+		return -errno;
+
+	return ret;
+};
+
+
+#endif
+
 #endif
