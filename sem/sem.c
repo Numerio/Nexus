@@ -22,11 +22,10 @@ typedef int32_t sem_id;
 static struct nexus_sem *nexus_sems[1000];
 static DEFINE_MUTEX(nexus_sem_lock);
 
-int last_sem_id = 1;
+int32_t last_sem_id = 1;
 
 
 long nexus_sem_create(struct nexus_sem_exchange *exchange) {
-
 	// TODO B_NO_MORE_SEMS
 	if (exchange->count < 0)
 		return B_BAD_VALUE;
@@ -37,15 +36,25 @@ long nexus_sem_create(struct nexus_sem_exchange *exchange) {
 	if (sem == NULL)
 		return -ENOMEM;
 
+	size_t size = strnlen_user(exchange->name, B_OS_NAME_LENGTH);
+	sem->name = kzalloc(size, GFP_KERNEL);
+	if (copy_from_user(sem->name, exchange->name, size)) {
+		kfree(sem);
+		mutex_unlock(&nexus_sem_lock);
+		return -ENOMEM;
+	}
+
 	mutex_lock(&nexus_sem_lock);
+
+	// Now the sem is ready to be added
 	last_sem_id++;
+	nexus_sems[last_sem_id] = sem;
 
 	printk(KERN_INFO "create sem id %d\n", last_sem_id);
 
-	nexus_sems[last_sem_id] = sem;
-
 	init_waitqueue_head(&sem->wait_queue);
 	atomic_set(&sem->count, exchange->count);
+	atomic_set(&sem->acquire_count, exchange->count);
 
 	kref_init(&sem->ref_count);
 	kref_get(&sem->ref_count);
@@ -84,70 +93,64 @@ long nexus_sem_acquire(struct nexus_sem_exchange *exchange) {
 
 	kref_get(&sem->ref_count);
 
-	uint32_t flags = exchange->flags;
+	int32_t flags = exchange->flags;
 	int64_t timeout = exchange->timeout;
-	uint64_t count = exchange->count;
+	int32_t count = exchange->count;
 
-	int ret = B_ERROR;
+	int32_t ret = B_OK;
+	if (timeout > 0 && flags & B_ABSOLUTE_TIMEOUT) {
+		// TODO: us_to_ktime is a new addition
+		ktime_t now = ktime_get();
+		timeout -= ktime_to_us(now);
+	}
 
-	int current_count = atomic_read(&sem->count);
-	if (current_count - exchange->count < 0) {
+	if (atomic_read(&sem->count) - exchange->count < 0) {
 		if ((flags & B_RELATIVE_TIMEOUT) != 0 && timeout <= 0) {
-			printk(KERN_INFO "would block 1");
 			ret = B_WOULD_BLOCK;
 			goto exit;
 		} else if ((flags & B_ABSOLUTE_TIMEOUT) != 0 && timeout < 0) {
-			printk(KERN_INFO "timeout 1");
 			ret = B_TIMED_OUT;
 			goto exit;
 		}
 	}
 
-	if (timeout > 0 && flags & B_ABSOLUTE_TIMEOUT) {
-		ktime_t now = ktime_get();
-		timeout -= ktime_to_us(now);
-		if (timeout <= 0) {
-			printk(KERN_INFO "absoluted timeout");
-			ret = B_TIMED_OUT;
-			goto exit;
+	int32_t current_count = atomic_sub_return(count, &sem->count);
+	if (current_count < 0) {
+		// TODO B_DO_NOT_RESCHEDULE
+
+		printk(KERN_INFO "going to wait %d %d %d", count, atomic_read(&sem->acquire_count), atomic_read(&sem->count));
+
+		mutex_unlock(&nexus_sem_lock);
+		if (timeout >= 0 && exchange->timeout != B_INFINITE_TIMEOUT) {
+			ret = wait_event_interruptible_hrtimeout(sem->wait_queue,
+				atomic_read(&sem->acquire_count) > count+current_count
+					|| sem->deleted,
+				// TODO
+				ns_to_ktime(timeout*1000));
+
+			if (ret == -ETIME) {
+				if (timeout == 0)
+					ret = B_WOULD_BLOCK;
+				else
+					ret = B_TIMED_OUT;
+			}
+
+		} else {
+			ret = wait_event_interruptible(sem->wait_queue,
+				atomic_read(&sem->acquire_count) > count+current_count
+					|| sem->deleted);
 		}
-	}
+		mutex_lock(&nexus_sem_lock);
 
-	current_count = atomic_sub_return(count, &sem->count);
-	if (current_count >= 0)	{
-		printk(KERN_INFO "current count %d", current_count);
-		ret = B_OK;
-		goto exit;
-	}
-
-	mutex_unlock(&nexus_sem_lock);
-	printk(KERN_INFO "going to wait");
-	// TODO B_DO_NOT_RESCHEDULE
-	if (timeout >= 0 && exchange->timeout != B_INFINITE_TIMEOUT) {
-		ret = wait_event_interruptible_hrtimeout(sem->wait_queue,
-			atomic_read(&sem->count) >= 0
-				|| sem->deleted,
-			ns_to_ktime(timeout*1000));
-
-		if (ret == -ETIME) {
-			if (timeout == 0)
-				ret = B_WOULD_BLOCK;
-			else
-				ret = B_TIMED_OUT;
+		if (sem->deleted)
+			ret = B_BAD_SEM_ID;
+		else if (ret == -ERESTARTSYS) {
+			current_count = atomic_add_return(count, &sem->count);
+			ret = B_INTERRUPTED;
 		}
-
 	} else {
-		ret = wait_event_interruptible(sem->wait_queue,
-			atomic_read(&sem->count) >= 0
-				|| sem->deleted);
-	}
-	mutex_lock(&nexus_sem_lock);
-
-	if (sem->deleted)
-		ret = B_BAD_SEM_ID;
-	else if (ret == -ERESTARTSYS) {
-		current_count = atomic_add_return(count, &sem->count);
-		ret = B_INTERRUPTED;
+		atomic_sub(count, &sem->acquire_count);
+		// TODO sem->acquirer = us
 	}
 
 exit:
@@ -164,7 +167,15 @@ long nexus_sem_release(struct nexus_sem_exchange *exchange) {
 
 	mutex_lock(&nexus_sem_lock);
 	struct nexus_sem* sem = nexus_sems[exchange->id];
+	// TODO support count < 0
 	if (exchange->id < 0 || !sem || exchange->count < 0) {
+		mutex_unlock(&nexus_sem_lock);
+		return B_BAD_VALUE;
+	}
+
+	int32_t	count = exchange->count;
+
+	if (count <= 0 && (exchange->flags & B_RELEASE_ALL) == 0) {
 		mutex_unlock(&nexus_sem_lock);
 		return B_BAD_VALUE;
 	}
@@ -174,8 +185,31 @@ long nexus_sem_release(struct nexus_sem_exchange *exchange) {
 		return B_BAD_SEM_ID;
 	}
 
-	atomic_add_return(exchange->count, &sem->count);
-	wake_up_all(&sem->wait_queue);
+	int32_t status = 0;
+	if ((exchange->flags & B_RELEASE_ALL) != 0) {
+		if (count < 0)
+			status = count;
+
+		count = atomic_read(&sem->acquire_count) - atomic_read(&sem->count);
+		if (count <= 0) {
+			mutex_unlock(&nexus_sem_lock);
+			return 0;
+		}
+	}
+
+	if (count > 0) {
+		printk(KERN_INFO "going to release %d %d %d", count, atomic_read(&sem->acquire_count), atomic_read(&sem->count));
+		atomic_add(exchange->count, &sem->count);
+		if (waitqueue_active(&sem->wait_queue)) {
+			//atomic_set(status, &sem->acquire_status);
+			atomic_add(exchange->count, &sem->acquire_count);
+			//if (count == 1)
+			//	wake_up(&sem->wait_queue);			
+			//else
+				wake_up_all(&sem->wait_queue);
+		}
+	}
+
 	mutex_unlock(&nexus_sem_lock);
 	return 0;
 }
@@ -187,6 +221,7 @@ void nexus_sem_delete(struct kref* ref) {
 
 	nexus_sems[sem->id] = NULL;
 	put_task_struct(sem->team);
+	kfree(sem->name);
 	kfree(sem);
 }
 

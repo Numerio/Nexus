@@ -15,6 +15,10 @@ enum {
 	B_ABSOLUTE_TIMEOUT				= 0x10,
 };
 
+enum {
+	B_RELEASE_ALL				= 0x08
+};
+
 struct nexus_thread;
 
 struct nexus_team {
@@ -100,12 +104,13 @@ struct nexus_sem {
 	struct kref				ref_count;
 
 	int32_t					id;
-	char					name[B_OS_NAME_LENGTH];
+	char*					name;
 	//uint32_t				status;
 	bool					deleted;
 
 	atomic_t				count;
 	atomic_t				acquire_count;
+	pid_t					last_holder;
 
     struct wait_queue_head	wait_queue;
 
