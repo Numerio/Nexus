@@ -23,55 +23,33 @@ static DEFINE_HASHTABLE(fd_hashmap, 10);
 static DEFINE_MUTEX(fd_map_lock);
 static int32_t id_counter = 0;
 
-struct fd_entry {
-	pid_t pid;
-	int fd;
-	struct list_head list;
-};
-
-static void fd_entry_release(struct kref *kref) {
+static void nexus_vref_destroy(struct kref *kref) {
+	printk("nexus_vref_destroy");
 	struct nexus_vref *entry = container_of(kref, struct nexus_vref, ref_count);
-	struct fd_entry *entry_fd, *tmp;
 
-	list_for_each_entry_safe(entry_fd, tmp, &entry->fd_list, list) {
-		list_del(&entry_fd->list);
-		kfree(entry_fd);
-	}
-
+	fput(entry->file);
 	hash_del(&entry->node);
 	kfree(entry);
 }
 
 int32_t nexus_vref_create(int fd) {
-	struct file *f = fget(fd);
-	if (!f) {
+	struct file *file = fget(fd);
+	if (!file) {
 		return -EBADF;
 	}
 
 	struct nexus_vref *entry = kzalloc(sizeof(struct nexus_vref), GFP_KERNEL);
 	if (!entry) {
-		fput(f);
+		fput(file);
 		return -ENOMEM;
 	}
 
 	kref_init(&entry->ref_count);
-	kref_get(&entry->ref_count);
-	INIT_LIST_HEAD(&entry->fd_list);
+	printk( KERN_INFO "create vref %d", kref_read(&entry->ref_count));
 	entry->id = id_counter++;
-	entry->file = f;
-
+	entry->file = get_file(file);
 	hash_add(fd_hashmap, &entry->node, entry->id);
-
-	struct fd_entry *entry_fd = kmalloc(sizeof(struct fd_entry), GFP_KERNEL);
-	if (!entry_fd) {
-		fput(entry->file);
-		kref_put(&entry->ref_count, fd_entry_release);
-		return -ENOMEM;
-	}
-
-	entry_fd->pid = current->pid;
-	entry_fd->fd = fd;
-	list_add(&entry_fd->list, &entry->fd_list);
+	fput(file);
 	return entry->id;
 }
 
@@ -82,24 +60,16 @@ int nexus_vref_acquire(int32_t id) {
 	mutex_lock(&fd_map_lock);
 	hash_for_each_possible_safe(fd_hashmap, entry, tmp, node, id) {
 		if (entry->id == id) {
-			int fd = get_unused_fd_flags(O_RDONLY);
+			int fd = get_unused_fd_flags(O_RDWR);
 			if (fd < 0) {
 				mutex_unlock(&fd_map_lock);
 				return -1;
 			}
 
+			get_file(entry->file);
 			fd_install(fd, entry->file);
-
-			struct fd_entry *ret = kmalloc(sizeof(struct fd_entry), GFP_KERNEL);
-			if (!ret) {
-				fput(entry->file);
-				mutex_unlock(&fd_map_lock);
-				return -ENOMEM;
-			}
-
-			ret->pid = current->pid;
-			ret->fd = fd;
-			list_add(&ret->list, &entry->fd_list);
+			printk( KERN_INFO "acquire kref %d", kref_read(&entry->ref_count));
+			kref_get(&entry->ref_count);
 			mutex_unlock(&fd_map_lock);
 			return fd;
 		}
@@ -109,13 +79,16 @@ int nexus_vref_acquire(int32_t id) {
 }
 
 long nexus_vref_release(int32_t id) {
+	printk(KERN_INFO "release called %d", current->pid);
+
 	struct nexus_vref *entry = NULL;
-	struct hlist_node *tmp;
+	struct hlist_node *tmp = NULL;
 
 	mutex_lock(&fd_map_lock);
 	hash_for_each_possible_safe(fd_hashmap, entry, tmp, node, id) {
 		if (entry->id == id) {
-			kref_put(&entry->ref_count, fd_entry_release);
+			printk( KERN_INFO "release %d count %d", id, kref_read(&entry->ref_count));
+			kref_put(&entry->ref_count, nexus_vref_destroy);
 			mutex_unlock(&fd_map_lock);
 			return 0;
 		}

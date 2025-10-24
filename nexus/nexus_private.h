@@ -142,9 +142,6 @@ struct nexus_vref {
 	int32_t					id;
 	struct file*			file;
 
-	struct list_head		fd_list;
-
-	//int					fd;
 	// struct task
 	pid_t					team;
 };

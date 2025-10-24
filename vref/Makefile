@@ -12,7 +12,7 @@ default: $(PWD)/Makefile
 	$(MAKE) -C $(KERNEL_SRC) M=$(WORKING_DIR) MO=$(WORKING_DIR)/build/ src=$(PWD) modules
 
 install:
-	cp build/fdref.ko $(DESTDIR)/
+	cp build/vref.ko $(DESTDIR)/
 
 clean:
 	rm -rf deps.h *.o *.ko *.mod.c *.symvers *.order .*.cmd .tmp_versions
