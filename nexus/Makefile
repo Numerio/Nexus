@@ -1,4 +1,4 @@
-obj-m := nexus.o 
+obj-m := nexus.o sem.o vref.o
 
 KERNEL_SRC  ?= /lib/modules/$(shell uname -r)/build
 

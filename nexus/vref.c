@@ -9,9 +9,9 @@
 #include <linux/hashtable.h>
 #include <linux/kref.h>
 
-#include "../nexus/errors.h"
-#include "../nexus/nexus.h"
-#include "../nexus/nexus_private.h"
+#include "errors.h"
+#include "nexus.h"
+#include "nexus_private.h"
 
 #define DEV_NAME "nexus_vref"
 
