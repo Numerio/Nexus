@@ -41,7 +41,9 @@
 
 #define NEXUS_VREF_CREATE			_IO(IOCTL_BASE, 1)
 #define NEXUS_VREF_ACQUIRE			_IO(IOCTL_BASE, 2)
-#define NEXUS_VREF_RELEASE			_IO(IOCTL_BASE, 3)
+#define NEXUS_VREF_ACQUIRE_FD		_IO(IOCTL_BASE, 3)
+#define NEXUS_VREF_OPEN				_IO(IOCTL_BASE, 4)
+#define NEXUS_VREF_RELEASE			_IO(IOCTL_BASE, 5)
 
 
 struct nexus_thread_exchange {
