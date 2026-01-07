@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Copyright (C) 2022-2025 Dario Casalinuovo
+ * Copyright (C) 2022-2026 Dario Casalinuovo
  */
 
 #ifndef __VOS_NEXUS_PRIVATE
 #define __VOS_NEXUS_PRIVATE
 
-#define B_OS_NAME_LENGTH	32
 #define B_INFINITE_TIMEOUT	(9223372036854775807LL)
+#define MAX_SEMS 65536
+// NOTE: not sure if we want that stuff to be configurable
+// just in case better to leave a note here.
+#define MAX_PORTS 4096
 
 enum {
 	B_TIMEOUT						= 0x8,
@@ -25,9 +28,12 @@ struct nexus_team {
 	struct hlist_node		node;
 	pid_t					id;
 
+	//uint32_t				status;
+
 	struct rb_root			threads;
 	struct rb_root			ports;
 
+	// that will be in the main_thread
 	//struct task_struct	*tsk;
 	//struct files_struct	*files;
 
@@ -60,6 +66,10 @@ struct nexus_thread {
 	pid_t					sender;
 
 	int32_t					return_code;
+	int32_t					unblock_code;
+	int32_t					exit_status;
+
+	//struct task_struct	*tsk;
 
 	struct nexus_team*		team;
 };
@@ -84,6 +94,7 @@ struct nexus_port {
 	char					name[B_OS_NAME_LENGTH];
 	uint32_t				capacity;
 
+	//uint32_t				status;
 	bool					is_open;
 
 	struct list_head		queue;

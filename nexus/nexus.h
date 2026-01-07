@@ -75,7 +75,6 @@ struct nexus_port_exchange {
 	int64_t					timeout;
 
 	int32_t					cookie;
-	int32_t					return_code;
 };
 
 struct nexus_port_message_info {
@@ -133,7 +132,7 @@ enum port_ops {
 	NEXUS_PORT_WRITE,
 	NEXUS_PORT_INFO,
 	NEXUS_PORT_MESSAGE_INFO,
-	NEXUS_SET_PORT_OWNER, // TODO deprecate
+	NEXUS_SET_PORT_OWNER,
 };
 
 #ifndef __KERNEL__
