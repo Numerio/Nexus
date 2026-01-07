@@ -1,6 +1,6 @@
-// SPDX-License-Identifier: GPL-2.0
+/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
 /*
- * Copyright (C) 2022-2025 Dario Casalinuovo
+ * Copyright (C) 2022-2026 Dario Casalinuovo
  */
 
 #ifndef __VOS_NEXUS
