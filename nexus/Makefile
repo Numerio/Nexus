@@ -15,4 +15,4 @@ install:
 	cp build/nexus.ko $(DESTDIR)/
 
 clean:
-	rm -rf deps.h *.o *.ko *.mod.c *.symvers *.order .*.cmd .tmp_versions
+	rm -rf deps.h *.o *.ko *.mod.c *.symvers *.order .*.cmd .tmp_versions *.mod *.o .*.o
