@@ -8,12 +8,20 @@
 
 #include <linux/types.h>
 
-// NOTE: not sure if we want that stuff to be configurable
-// just in case better to leave a note here.
-#define MAX_PORTS 4096
 #define PORT_MAX_QUEUE 4096
 #define PORT_MAX_MESSAGE_SIZE (1024 *  256)
-#define NAME_LENGTH 32
+
+#ifdef __KERNEL__
+
+#define B_OS_NAME_LENGTH 32
+
+typedef s32   status_t;
+typedef s32   sem_id;
+typedef s32   team_id;
+typedef s32   thread_id;
+typedef s64   bigtime_t;
+
+#endif
 
 #define IOCTL_BASE	'n'
 
