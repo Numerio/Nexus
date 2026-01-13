@@ -221,7 +221,7 @@ static int __init vref_init(void) {
 	if (cdev_add(&nexus_cdev, major, 1) == -1)
 		goto error;
 
-	printk(KERN_INFO "nexus_vref loaded\n");
+	printk(KERN_INFO "nexus_vref: module loaded\n");
 	return 0;
 
 error:
@@ -231,7 +231,7 @@ error:
 
 static void __exit vref_exit(void) {
 	nexus_cleanup_dev(1);
-	printk(KERN_INFO "nexus_vref module unloaded\n");
+	printk(KERN_INFO "nexus_vref: module unloaded\n");
 }
 
 module_init(vref_init);
@@ -239,4 +239,4 @@ module_exit(vref_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Dario Casalinuovo");
-MODULE_DESCRIPTION("Nexus IPC reference counted file descriptors handles.");
+MODULE_DESCRIPTION("Nexus reference counted file descriptor handles.");

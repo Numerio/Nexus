@@ -6,10 +6,11 @@
 #ifndef __VOS_NEXUS_PRIVATE
 #define __VOS_NEXUS_PRIVATE
 
+
 #define B_INFINITE_TIMEOUT	(9223372036854775807LL)
-#define MAX_SEMS 65536
 // NOTE: not sure if we want that stuff to be configurable
 // just in case better to leave a note here.
+#define MAX_SEMS 65536
 #define MAX_PORTS 4096
 
 enum {
@@ -19,8 +20,17 @@ enum {
 };
 
 enum {
-	B_RELEASE_ALL				= 0x08
+	B_RELEASE_IF_WAITING_ONLY		= 0x06,
+	B_RELEASE_ALL					= 0x08
 };
+
+#define B_CAN_INTERRUPT        0x01
+#define B_CHECK_PERMISSION     0x04
+#define B_KILL_CAN_INTERRUPT   0x20
+#define B_DO_NOT_RESCHEDULE    0x02
+
+#define B_NAME_NOT_FOUND -2147454966
+
 
 struct nexus_thread;
 
@@ -60,7 +70,7 @@ struct nexus_thread {
 	wait_queue_head_t		buffer_read;
 	int						buffer_ready;
 
-	const void*				buffer;
+	void*					buffer;
 	ssize_t					buffer_size;
 
 	pid_t					sender;
@@ -78,7 +88,7 @@ struct nexus_buffer {
 	struct list_head		node;
 
 	int32_t					code;
-	const void*				buffer;
+	void*					buffer;
 	size_t					size;
 
 	uid_t					sender;
@@ -104,47 +114,74 @@ struct nexus_port {
 	int32_t					read_count;
 	int32_t					total_count;
 
-	// TODO remove
 	rwlock_t				rw_lock;
 
 	struct nexus_team*		team;
 };
 
+struct nexus_sem_waiter {
+	struct list_head    	list;
+
+	struct task_struct  	*task;
+	int32_t             	count;
+	status_t            	status;
+	bool                	woken;
+};
+
 struct nexus_sem {
-	struct rb_node			node;
-	struct kref				ref_count;
+	sem_id              	id;
 
-	int32_t					id;
-	char*					name;
-	//uint32_t				status;
-	bool					deleted;
+	char                	name[B_OS_NAME_LENGTH];
+	int32_t             	count;
+	thread_id           	latest_holder;
+	bool                	deleted;
 
-	atomic_t				count;
-	atomic_t				acquire_count;
-	pid_t					last_holder;
+	spinlock_t          	lock;
+	struct list_head    	waiters;
+	atomic_t            	ref_count;
 
-    struct wait_queue_head	wait_queue;
+	team_id             	owner;
+	struct hlist_node   	team_node;
+};
 
-	struct task_struct*		team;
+// nexus_team_sem_list
+struct team_sem_list {
+	team_id             	team;
+
+	struct hlist_head   	sems;
+	spinlock_t          	lock;
+
+	struct hlist_node		hash_node;
 };
 
 struct nexus_area {
-	struct rb_node			node;
-	struct kref				ref_count;
 
-	int32_t					id;
+	area_id					id;
+
 	char					name[B_OS_NAME_LENGTH];
-
-	bool					is_clone;
-	struct nexus_area*		source_area;
-	struct nexus_area*		clones;
-
-	struct file*			file;
-
-	bool					transfer_done;
-
+	struct file				*file;
+	size_t					size;
+	s32						lock;
+	s32		              	protection;
 	pid_t					team;
+
+	struct kref				ref_count;
+	struct hlist_node		node;
 };
+
+typedef struct area_info {
+	int32_t					area;
+	char					name[B_OS_NAME_LENGTH];
+	size_t					size;
+	int32_t					lock;
+	int32_t					protection;
+	pid_t					team;
+	size_t					ram_size;
+	int32_t					copy_count;
+	int32_t					in_count;
+	int32_t					out_count;
+	void*					address;
+} area_info;
 
 struct nexus_vref {
 	struct hlist_node		node;

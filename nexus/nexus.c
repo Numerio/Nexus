@@ -31,6 +31,7 @@ static HLIST_HEAD(nexus_teams);
 
 static struct nexus_port* nexus_ports[MAX_PORTS];
 
+// TODO make non-exported functions static
 
 struct nexus_team* nexus_team_init()
 {
@@ -881,7 +882,8 @@ long nexus_port_info(struct nexus_port* port, struct nexus_port_info* info)
 		return B_BAD_VALUE;
 	}
 
-	if (nexus_ports[port->id] == NULL || (!port->is_open && port->read_count == 0)) {
+	if (nexus_ports[port->id] == NULL
+			|| (!port->is_open && port->read_count == 0)) {
 		return B_BAD_PORT_ID;
 	}
 
@@ -913,7 +915,8 @@ long nexus_port_message_info(struct nexus_port* port,
 		return B_BAD_VALUE;
 	}
 
-	if (nexus_ports[port->id] == NULL || (!port->is_open && port->read_count == 0)) {
+	if (nexus_ports[port->id] == NULL
+			|| (!port->is_open && port->read_count == 0)) {
 		return B_BAD_PORT_ID;
 	}
 
@@ -1185,7 +1188,7 @@ static int nexus_init(void)
 
 	memset(nexus_ports, 0, MAX_PORTS*sizeof(struct nexus_port*));
 
-	printk(KERN_INFO "nexus loaded\n");
+	printk(KERN_INFO "nexus: loaded\n");
 	return 0;
 
 error:
@@ -1196,7 +1199,7 @@ error:
 static void nexus_exit(void)
 {
 	nexus_cleanup_dev(1);
-	printk(KERN_INFO "nexus unloaded\n");
+	printk(KERN_INFO "nexus: unloaded\n");
 }
 
 module_init(nexus_init);
@@ -1205,4 +1208,4 @@ module_exit(nexus_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Dario Casalinuovo");
 MODULE_DESCRIPTION("Nexus IPC");
-MODULE_VERSION("0.3");
+MODULE_VERSION("0.7");
