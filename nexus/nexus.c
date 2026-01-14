@@ -429,8 +429,8 @@ long nexus_thread_op(struct nexus_thread *thread, unsigned long arg)
 		struct nexus_thread *dest_thread = NULL;
 		struct task_struct* task = get_pid_task(find_get_pid(
 			(pid_t)user_data.receiver), PIDTYPE_PID);
-		
-		if (task == NULL)
+
+		if (task == NULL || (task->mm != current->mm))
 			return B_BAD_THREAD_ID;
 
 		hlist_for_each_entry(team, &nexus_teams, node) {
