@@ -16,6 +16,7 @@
 #define B_OS_NAME_LENGTH 32
 
 typedef s32 status_t;
+typedef s32 port_id;
 typedef s32 area_id;
 typedef s32 sem_id;
 typedef s32 vref_id;
