@@ -32,6 +32,8 @@ static HLIST_HEAD(nexus_teams);
 static struct nexus_port* nexus_ports[MAX_PORTS];
 
 // TODO make non-exported functions static
+// TODO use IDRs
+// TODO fine-grained locking through spinlocks
 
 struct nexus_team* nexus_team_init()
 {
@@ -318,21 +320,19 @@ long nexus_thread_op(struct nexus_thread *thread, unsigned long arg)
 			}
 		}
 
-		// goto err put_task_struct
-		if (dest_thread == NULL)
+		if (dest_thread == NULL) {
+			put_task_struct(task);
 			return B_BAD_THREAD_ID;
+		}
 
 		if (dest_thread->buffer_ready != 1) {
 			put_task_struct(task);
-			printk(KERN_INFO "has data exit");
 			return B_WOULD_BLOCK;
 		}
-		printk(KERN_INFO "has data found %d\n", current->pid);
 
-		// TODO
+		printk(KERN_INFO "has data found %d\n", current->pid);
 		put_task_struct(task);
 		printk(KERN_INFO "has data exit");
-
 	} else if (user_data.op == NEXUS_THREAD_SET_NAME) {
 		if (strncpy_from_user(thread->name, user_data.buffer,
 				min(B_OS_NAME_LENGTH, user_data.size)) < 0) {
@@ -871,6 +871,23 @@ goahead:
 
 	return B_OK;
 }
+
+status_t nexus_write_port(uint32_t id, int32_t code, const void *buffer,
+	size_t buffer_size)
+{
+	mutex_lock(&nexus_main_lock);
+
+	struct nexus_port* port = nexus_ports[id];	
+	if (port == NULL) {
+		return B_BAD_PORT_ID;
+	}
+
+	long ret = nexus_port_write(port, &code, buffer, buffer_size, 0, B_INFINITE_TIMEOUT);
+	mutex_unlock(&nexus_main_lock);
+	return ret;
+}
+
+EXPORT_SYMBOL(nexus_write_port);
 
 long nexus_port_info(struct nexus_port* port, struct nexus_port_info* info)
 {
