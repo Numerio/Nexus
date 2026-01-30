@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Copyright (C) 2025 Dario Casalinuovo
+ * Copyright (C) 2025-2026. Dario Casalinuovo
  */
 
 #include <linux/cdev.h>
@@ -19,6 +19,7 @@ static int major = -1;
 static struct cdev nexus_cdev;
 static struct class *nexus_class = NULL;
 
+// TODO maybe IDR fits better here
 static DEFINE_HASHTABLE(fd_hashmap, 10);
 static DEFINE_MUTEX(fd_map_lock);
 static int32_t id_counter = 1;
@@ -109,7 +110,7 @@ int nexus_vref_open(int32_t id) {
 			if (fd < 0) {
 				fput(file);
 				mutex_unlock(&fd_map_lock);
-				return -1;
+				return B_ENTRY_NOT_FOUND;
 			}
 			fd_install(fd, file);
 			printk( KERN_INFO "acquire kref %d", kref_read(&entry->ref_count));
@@ -118,7 +119,7 @@ int nexus_vref_open(int32_t id) {
 		}
 	}
 	mutex_unlock(&fd_map_lock);
-	return -EINVAL;
+	return B_ENTRY_NOT_FOUND;
 }
 
 long nexus_vref_release(int32_t id) {
