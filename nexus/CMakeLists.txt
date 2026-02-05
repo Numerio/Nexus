@@ -5,8 +5,8 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 
 add_definitions(-D__KERNEL__ -DMODULE)
 
-message(STATUS "Host kernel release: ${KERNEL_RELEASE}")
-
+#TODO print a resume of variables for debug purposes
+#TODO native builds should build nexus natively
 option(BUILD_LOCAL_NEXUS "Build Nexus in the host environment" OFF)
 
 set(NEXUS_CLEAN_FILES
