@@ -973,6 +973,13 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	long ret = -1;
 
 	mutex_lock(&nexus_main_lock);
+
+	// Someone forked let's reinit the team
+	if (team->id != current->tgid) {
+		team = nexus_team_init();
+		filp->private_data = (void*)team;
+	}
+
 	if (team->id == current->pid) {
 		thread = team->main_thread;
 	} else {
