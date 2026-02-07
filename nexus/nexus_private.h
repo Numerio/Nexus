@@ -36,7 +36,7 @@ struct nexus_thread;
 
 struct nexus_team {
 	struct hlist_node		node;
-	pid_t					id;
+	team_id					id;
 
 	//uint32_t				status;
 
@@ -54,14 +54,19 @@ struct nexus_thread {
 	struct rb_node			node;
 	struct kref				ref_count;
 
-	pid_t					id;
+	thread_id				id;
 
 	char					name[B_OS_NAME_LENGTH];
 
-	bool					is_thread_blocked;
+	//uint32_t				status;
+	bool					thread_resumed;
+	bool					thread_wait_newborn;
 	bool					has_thread_exited;
 
-	wait_queue_head_t		thread_block;
+	thread_id				child_thread;
+
+	wait_queue_head_t		thread_suspended;
+	wait_queue_head_t		thread_has_newborn;
 	wait_queue_head_t		thread_exit;
 
 	struct semaphore		sem_read;
@@ -73,7 +78,7 @@ struct nexus_thread {
 	void*					buffer;
 	ssize_t					buffer_size;
 
-	pid_t					sender;
+	thread_id				sender;
 
 	int32_t					return_code;
 	int32_t					unblock_code;
@@ -93,14 +98,14 @@ struct nexus_buffer {
 
 	uid_t					sender;
 	gid_t					sender_group;
-	pid_t					sender_team;
+	team_id					sender_team;
 };
 
 struct nexus_port {
 	struct rb_node			node;
 	struct kref				ref_count;
 
-	int32_t					id;
+	port_id					id;
 	char					name[B_OS_NAME_LENGTH];
 	uint32_t				capacity;
 
@@ -155,7 +160,6 @@ struct team_sem_list {
 };
 
 struct nexus_area {
-
 	area_id					id;
 
 	char					name[B_OS_NAME_LENGTH];

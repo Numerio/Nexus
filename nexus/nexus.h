@@ -32,6 +32,8 @@ typedef s64 bigtime_t;
 #define NEXUS_THREAD_EXIT			_IO(NEXUS_MAGIC, 2)
 #define NEXUS_THREAD_SET_PRIORITY	_IO(NEXUS_MAGIC, 2)
 #define NEXUS_THREAD_OP				_IO(NEXUS_MAGIC, 3)
+#define NEXUS_THREAD_WAIT_NEWBORN	_IO(NEXUS_MAGIC, 4)
+#define NEXUS_THREAD_RESUME			_IO(NEXUS_MAGIC, 5)
 
 #define NEXUS_PORT_CREATE			_IO(NEXUS_MAGIC, 10)
 #define NEXUS_PORT_OP				_IO(NEXUS_MAGIC, 11)
@@ -44,6 +46,8 @@ typedef s64 bigtime_t;
 #define NEXUS_SEM_COUNT				_IO(NEXUS_MAGIC, 5)
 #define NEXUS_SEM_INFO				_IO(NEXUS_MAGIC, 6)
 #define NEXUS_SEM_NEXT_INFO			_IO(NEXUS_MAGIC, 7)
+
+//#define NEXUS_VREF_MAGIC	'V'
 
 #define NEXUS_VREF_CREATE			_IO(NEXUS_MAGIC, 1)
 #define NEXUS_VREF_ACQUIRE			_IO(NEXUS_MAGIC, 2)
@@ -72,9 +76,12 @@ enum thread_ops {
 	NEXUS_THREAD_READ,
 	NEXUS_THREAD_WRITE,
 	NEXUS_THREAD_HAS_DATA,
-	NEXUS_THREAD_BLOCK,
-	NEXUS_THREAD_UNBLOCK,
 	NEXUS_THREAD_WAITFOR
+};
+
+struct nexus_thread_spawn {
+	const char*				name;
+	thread_id				father;
 };
 
 struct nexus_thread_exchange {
@@ -264,4 +271,4 @@ inline int32_t nexus_io(int nexus, unsigned long request, void* msg)
 #endif
 
 
-#endif // _VOS_NEXUS
+#endif // __VOS_NEXUS
