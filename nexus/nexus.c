@@ -750,9 +750,8 @@ goahead:
 	if (buffer != NULL) {
 		buf->buffer = kzalloc(size, GFP_KERNEL);
 		if (copy_from_user(buf->buffer, buffer, size)) {
-			kfree(buf);
 			kfree(buf->buffer);
-			
+			kfree(buf);
 			port->write_count++;
 			return B_BAD_VALUE;
 		}
