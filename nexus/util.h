@@ -26,10 +26,15 @@ static long calculate_timeout(bigtime_t timeout, uint32_t flags)
 	} else {
 		if (timeout == 0)
 			return 0;
+		if (timeout == B_INFINITE_TIMEOUT)
+			return MAX_SCHEDULE_TIMEOUT;
 		us = timeout;
 	}
 
-	return usecs_to_jiffies(us) + 1;
+	unsigned long j = (unsigned long)(us / (1000000 / HZ));
+	if (j >= (unsigned long)MAX_SCHEDULE_TIMEOUT)
+		return MAX_SCHEDULE_TIMEOUT;
+	return j + 1;
 }
 
 #endif // __VOS_NEXUS_PRIVATE
