@@ -18,10 +18,15 @@ set(NEXUS_CLEAN_FILES
 )
 
 if(BUILD_LOCAL_NEXUS)
+    if(VITRUVIAN_KERNEL_HEADERS)
+        set(NEXUS_KDIR "${VITRUVIAN_KERNEL_HEADERS}")
+    else()
+        set(NEXUS_KDIR "/lib/modules/${KERNEL_RELEASE}/build")
+    endif()
     add_custom_target(nexus
-        COMMAND ${CMAKE_COMMAND} -E echo "Nexus...building locally"
-        COMMAND make KDIR=/usr/lib/modules/${KERNEL_RELEASE}/build
-		WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        COMMAND ${CMAKE_COMMAND} -E echo "Nexus...building locally (KDIR=${NEXUS_KDIR})"
+        COMMAND make KDIR=${NEXUS_KDIR}
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     )
 else()
     add_custom_target(nexus
