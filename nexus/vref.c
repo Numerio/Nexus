@@ -50,6 +50,7 @@ int32_t nexus_vref_create(int fd) {
 	kref_init(&entry->ref_count);
 	entry->id = id_counter++;
 	entry->file = get_file(file);
+	entry->team = current->tgid;
 	printk( KERN_INFO "create vref %d %d", entry->id, kref_read(&entry->ref_count));
 	hash_add(fd_hashmap, &entry->node, entry->id);
 	fput(file);
@@ -177,10 +178,28 @@ static long vref_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
 }
 
 static int vref_open(struct inode *inode, struct file *file) {
+	file->private_data = (void *)(uintptr_t)current->tgid;
 	return 0;
 }
 
 static int vref_release(struct inode *inode, struct file *file) {
+	pid_t team = (pid_t)(uintptr_t)file->private_data;
+	struct nexus_vref *entry;
+	struct hlist_node *tmp;
+	int bkt;
+
+	printk(KERN_INFO "nexus_vref: cleanup for team %d\n", team);
+
+	mutex_lock(&fd_map_lock);
+	hash_for_each_safe(fd_hashmap, bkt, tmp, entry, node) {
+		if (entry->team == team) {
+			printk(KERN_INFO "nexus_vref: releasing leaked vref %d for team %d\n",
+				entry->id, team);
+			kref_put(&entry->ref_count, nexus_vref_destroy);
+		}
+	}
+	mutex_unlock(&fd_map_lock);
+
 	return 0;
 }
 
