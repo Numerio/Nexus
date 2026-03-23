@@ -137,8 +137,6 @@ static long nexus_area_clone(struct nexus_area_clone __user *arg)
 		mutex_unlock(&area_lock);
 		return B_NO_MEMORY;
 	}
-	fd_install(fd, file);
-
 	kref_init(&area->ref_count);
 	area->id = atomic_inc_return(&area_id_counter);
 	strscpy(area->name, clone.name, B_OS_NAME_LENGTH);
@@ -148,19 +146,30 @@ static long nexus_area_clone(struct nexus_area_clone __user *arg)
 	area->protection = clone.protection;
 	area->team = current->tgid;
 
+	// Save source fields before releasing the lock (N7: source may be freed
+	// by a concurrent nexus_area_delete after we drop area_lock).
+	int source_id = source->id;
+	size_t source_size = source->size;
+
 	hash_add(area_hashmap, &area->node, area->id);
 
 	mutex_unlock(&area_lock);
 
-	pr_debug("nexus_area: cloned area %d from %d\n", area->id, source->id);
+	pr_debug("nexus_area: cloned area %d from %d\n", area->id, source_id);
 
 	clone.area = area->id;
 	clone.fd = fd;
-	clone.size = source->size;
+	clone.size = source_size;
 
-	if (copy_to_user(arg, &clone, sizeof(clone)))
+	// do copy_to_user before fd_install so the fd is not leaked if the
+	// copy fails.
+	if (copy_to_user(arg, &clone, sizeof(clone))) {
+		put_unused_fd(fd);
+		fput(file);
 		return -EFAULT;
+	}
 
+	fd_install(fd, file);
 	return B_OK;
 }
 
