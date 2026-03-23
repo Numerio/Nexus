@@ -134,6 +134,7 @@ void nexus_thread_destroy(struct kref* ref)
 	struct nexus_team* team = thread->team;
 	if (thread->id != team->id)
 		rb_erase(&thread->node, &team->threads);
+	kfree(thread->buffer);
 	kfree(thread);
 	printk(KERN_INFO "thread destroy exit");
 }
@@ -563,6 +564,13 @@ void nexus_port_destroy(struct kref* ref)
 	if (port->is_open)
 		nexus_port_close(port);
 
+	struct nexus_buffer *buf, *tmp;
+	list_for_each_entry_safe(buf, tmp, &port->queue, node) {
+		list_del(&buf->node);
+		kfree(buf->buffer);
+		kfree(buf);
+	}
+
 	write_lock(&port->rw_lock);
 	rb_erase(&port->node, &port->team->ports);
 	write_unlock(&port->rw_lock);
@@ -675,7 +683,7 @@ long nexus_port_read(struct nexus_port* port, int32_t* code, void* buffer,
 	}
 
 	if (code != NULL) {
-		if (copy_to_user(code, &buf->code, sizeof(code))) {
+		if (copy_to_user(code, &buf->code, sizeof(*code))) {
 			return B_BAD_VALUE;
 		}
 	}
@@ -796,8 +804,14 @@ status_t nexus_write_port(uint32_t id, int32_t code, const void *buffer,
 {
 	mutex_lock(&nexus_main_lock);
 
-	struct nexus_port* port = nexus_ports[id];	
+	if (id >= MAX_PORTS) {
+		mutex_unlock(&nexus_main_lock);
+		return B_BAD_PORT_ID;
+	}
+
+	struct nexus_port* port = nexus_ports[id];
 	if (port == NULL) {
+		mutex_unlock(&nexus_main_lock);
 		return B_BAD_PORT_ID;
 	}
 
@@ -915,7 +929,7 @@ long nexus_port_op(struct nexus_team *team, unsigned long arg)
 		return B_BAD_VALUE;
 	}
 
-	if (in_data.id < 0) {
+	if (in_data.id < 0 || in_data.id >= MAX_PORTS) {
 		return B_BAD_PORT_ID;
 	}
 
@@ -961,7 +975,10 @@ long nexus_port_op(struct nexus_team *team, unsigned long arg)
 			break;
 
 		case NEXUS_SET_PORT_OWNER:
-			// TODO check current team owns the port
+			if (port->team->id != current->tgid) {
+				ret = B_NOT_ALLOWED;
+				break;
+			}
 			ret = nexus_set_port_owner(port, in_data.cookie);
 			break;
 
@@ -993,8 +1010,10 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	if (team->id != current->tgid) {
 		printk(KERN_INFO "nexus_ioctl: fork detected (team->id=%d != tgid=%d), reinit",
 			team->id, current->tgid);
+		struct nexus_team *old_team = team;
 		team = nexus_team_init();
 		filp->private_data = (void*)team;
+		nexus_team_destroy(old_team);
 	}
 
 	if (team->id == current->pid) {
