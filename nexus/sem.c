@@ -76,6 +76,17 @@ static struct team_sem_list *get_or_create_team_list(team_id team)
 	spin_lock_init(&list->lock);
 
 	spin_lock_irqsave(&team_hash_lock, flags);
+	{
+		// Re-check: another thread may have inserted between our unlock and now 
+		struct team_sem_list *existing;
+		hash_for_each_possible(team_hash, existing, hash_node, team) {
+			if (existing->team == team) {
+				spin_unlock_irqrestore(&team_hash_lock, flags);
+				kfree(list);
+				return existing;
+			}
+		}
+	}
 	hash_add(team_hash, &list->hash_node, team);
 	spin_unlock_irqrestore(&team_hash_lock, flags);
 
@@ -282,7 +293,8 @@ static status_t nexus_acquire_sem(sem_id id, int32_t count, uint32_t flags, bigt
 			break;
 		}
 
-		if ((flags & B_CAN_INTERRUPT) && signal_pending(current)) {
+		if (fatal_signal_pending(current) ||
+		    ((flags & B_CAN_INTERRUPT) && signal_pending(current))) {
 			list_del(&waiter.list);
 			sem->count += count;
 			result = B_INTERRUPTED;
@@ -505,13 +517,55 @@ static long nexus_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
 static int nexus_sem_open(struct inode *inode, struct file *file)
 {
-	// TODO
+	file->private_data = (void *)(uintptr_t)current->tgid;
 	return 0;
 }
 
 static int nexus_sem_release(struct inode *inode, struct file *file)
 {
-	// TODO
+	team_id team = (team_id)(uintptr_t)file->private_data;
+	struct team_sem_list *team_list;
+	struct nexus_sem *sem;
+	struct hlist_node *tmp;
+	unsigned long flags;
+
+	pr_info("nexus_sem: cleanup for team %d\n", team);
+
+	team_list = get_team_list(team);
+	if (!team_list)
+		return 0;
+
+	// Delete all semaphores owned by this team, waking any blocked waiters.
+	// Lock ordering must match nexus_acquire_sem: sem_idr_lock → sem->lock.
+	// Acquire sem_idr_lock first, then sem->lock.
+	spin_lock_irqsave(&team_list->lock, flags);
+	hlist_for_each_entry_safe(sem, tmp, &team_list->sems, team_node) {
+		hlist_del(&sem->team_node);
+		spin_unlock_irqrestore(&team_list->lock, flags);
+
+		spin_lock_irqsave(&sem_idr_lock, flags);
+		if (!sem->deleted)
+			idr_remove(&sem_idr, sem->id);
+		spin_unlock_irqrestore(&sem_idr_lock, flags);
+
+		spin_lock_irqsave(&sem->lock, flags);
+		if (!sem->deleted) {
+			sem->deleted = true;
+			wake_all_waiters_error(sem, B_BAD_SEM_ID);
+		}
+		spin_unlock_irqrestore(&sem->lock, flags);
+
+		sem_put(sem);
+
+		spin_lock_irqsave(&team_list->lock, flags);
+	}
+	spin_unlock_irqrestore(&team_list->lock, flags);
+
+	spin_lock_irqsave(&team_hash_lock, flags);
+	hash_del(&team_list->hash_node);
+	spin_unlock_irqrestore(&team_hash_lock, flags);
+	kfree(team_list);
+
 	return 0;
 }
 
