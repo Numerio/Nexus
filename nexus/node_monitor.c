@@ -311,14 +311,19 @@ static void nexus_mark_free(struct fsnotify_mark *fs_mark)
 		spin_unlock_irqrestore(&marks_hash_lock, flags);
 	}
 
-	list_for_each_entry_safe(listener, tmp, &mark->listeners, list) {
-		nm_dbg("nexus_mark_free: freeing listener port=%d token=%u\n",
-			listener->port, listener->token);
-		list_del(&listener->list);
-		kfree(listener);
+	{
+		unsigned long lflags;
+		spin_lock_irqsave(&mark->lock, lflags);
+		list_for_each_entry_safe(listener, tmp, &mark->listeners, list) {
+			nm_dbg("nexus_mark_free: freeing listener port=%d token=%u\n",
+				listener->port, listener->token);
+			list_del(&listener->list);
+			kfree(listener);
 #if NEXUS_NM_DEBUG
-		atomic_dec(&stat_watches);
+			atomic_dec(&stat_watches);
 #endif
+		}
+		spin_unlock_irqrestore(&mark->lock, lflags);
 	}
 	kfree(mark);
 }
@@ -390,33 +395,33 @@ static int nexus_handle_event(struct fsnotify_group *group, u32 mask,
 
 		nm_dbg_lock("nexus_handle_event: acquiring mark->lock\n");
 
+		// Hold the lock for count+alloc+copy atomically so listeners
+		// cannot be added or removed between the count and the copy
 		snap_count = 0;
+		snap = NULL;
 		spin_lock_irqsave(&mark->lock, flags);
 		{
 			struct nexus_listener *l;
 			list_for_each_entry(l, &mark->listeners, list)
 				snap_count++;
 		}
-		spin_unlock_irqrestore(&mark->lock, flags);
 
-		if (snap_count == 0)
+		if (snap_count == 0) {
+			spin_unlock_irqrestore(&mark->lock, flags);
 			continue;
+		}
 
 		snap = kmalloc_array(snap_count, sizeof(*snap), GFP_ATOMIC);
 		if (!snap) {
+			spin_unlock_irqrestore(&mark->lock, flags);
 			nm_err("failed to allocate listener snapshot\n");
 			continue;
 		}
-		snap_cap = snap_count;
 
-		// Listener data needs lock
 		i = 0;
-		spin_lock_irqsave(&mark->lock, flags);
 		{
 			struct nexus_listener *l;
 			list_for_each_entry(l, &mark->listeners, list) {
-				if (i >= snap_cap)
-					break;
 				snap[i].port = l->port;
 				snap[i].token = l->token;
 				snap[i].flags = l->flags;
