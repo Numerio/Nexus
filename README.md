@@ -1,3 +1,8 @@
+<p align="center">
+  <img src="https://v-os.dev/img/vitruvianos-logo.svg" width="220" alt="VitruvianOS">
+</p>
+<img src="https://numerio.goatcounter.com/count?p=/nexus-readme" alt="" width="0" height="0">
+
 # nexus
 
 Nexus is a set of Linux kernel modules that bridge the Linux kernel with the BeOS/Haiku userspace runtime. It is a core component of [VitruvianOS](https://github.com/VitruvianOS/Vitruvian), included as a submodule.
