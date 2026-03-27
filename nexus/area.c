@@ -140,7 +140,7 @@ static long nexus_area_clone(struct nexus_area_clone __user *arg)
 	kref_init(&area->ref_count);
 	area->id = atomic_inc_return(&area_id_counter);
 	strscpy(area->name, clone.name, B_OS_NAME_LENGTH);
-	area->file = get_file(source->file);
+	area->file = file;
 	area->size = source->size;
 	area->lock = source->lock;
 	area->protection = clone.protection;
