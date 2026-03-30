@@ -458,10 +458,10 @@ static long nexus_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		if (copy_from_user(&ex, (void __user *)arg, sizeof(ex)))
 			return -EFAULT;
 		result = nexus_create_sem(ex.count, ex.name, &ex.id);
-		if (result == B_OK) {
-			if (copy_to_user((void __user *)arg, &ex, sizeof(ex)))
-				return -EFAULT;
-		}
+		if (result != B_OK)
+			return result;
+		if (copy_to_user((void __user *)arg, &ex, sizeof(ex)))
+			return -EFAULT;
 		return ex.id;
 
 	case NEXUS_SEM_DELETE:
