@@ -255,6 +255,35 @@ static long nexus_area_get_info(struct nexus_area_get_info __user *arg)
 	return B_OK;
 }
 
+static long nexus_area_transfer(struct nexus_area_transfer __user *arg)
+{
+	struct nexus_area_transfer tr;
+	struct nexus_area *area;
+
+	if (copy_from_user(&tr, arg, sizeof(tr)))
+		return -EFAULT;
+
+	mutex_lock(&area_lock);
+
+	area = find_area_by_id(tr.area);
+	if (!area) {
+		mutex_unlock(&area_lock);
+		return B_BAD_VALUE;
+	}
+
+	// Transfer ownership to the target team.  The area remains in the
+	// global hash so the target can clone it by id.
+	area->team = tr.target;
+	tr.new_area = area->id;
+
+	mutex_unlock(&area_lock);
+
+	if (copy_to_user(arg, &tr, sizeof(tr)))
+		return -EFAULT;
+
+	return B_OK;
+}
+
 static long nexus_area_resize(struct nexus_area_resize __user *arg)
 {
 	struct nexus_area_resize resize;
@@ -317,6 +346,8 @@ static long area_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			return nexus_area_get_info((struct nexus_area_get_info __user *)arg);
 		case NEXUS_AREA_RESIZE:
 			return nexus_area_resize((struct nexus_area_resize __user *)arg);
+		case NEXUS_AREA_TRANSFER:
+			return nexus_area_transfer((struct nexus_area_transfer __user *)arg);
 		case NEXUS_AREA_SET_PROTECTION:
 			return nexus_area_set_protection((struct nexus_area_set_protection __user *)arg);
 		default:
