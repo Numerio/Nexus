@@ -36,6 +36,7 @@ endif()
 
 add_custom_command(
 	TARGET nexus
+	POST_BUILD
 	COMMAND ${CMAKE_COMMAND} -E echo "Building nexus-dkms package..."
 	COMMAND bash "-c" "dpkg-buildpackage -uc -us"
 	#TODO this should be done more cleanly
