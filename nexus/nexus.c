@@ -476,9 +476,12 @@ long nexus_port_init(struct nexus_team* team, unsigned long arg)
 		return B_BAD_VALUE;
 	}
 
-	while (nexus_ports[id] != NULL && id < MAX_PORTS)
+	while (nexus_ports[id] != NULL && id < MAX_PORTS) {
 		id++;
-
+		// Allow other threads to run, preventing CPU spinning
+		if((id % 256) == 0)
+			cond_reshed(); 
+	}
 	printk(KERN_INFO "Allocated port id %d\n", id);
 
 	if (id >= MAX_PORTS) {
