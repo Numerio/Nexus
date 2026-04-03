@@ -269,25 +269,59 @@ static long nexus_area_get_info(struct nexus_area_get_info __user *arg)
 static long nexus_area_transfer(struct nexus_area_transfer __user *arg)
 {
 	struct nexus_area_transfer tr;
-	struct nexus_area *area;
+	struct nexus_area *source, *target_area;
+	struct file *file;
 
 	if (copy_from_user(&tr, arg, sizeof(tr)))
 		return -EFAULT;
 
 	mutex_lock(&area_lock);
 
-	area = find_area_by_id(tr.area);
-	if (!area) {
+	source = find_area_by_id(tr.area);
+	if (!source) {
 		mutex_unlock(&area_lock);
 		return B_BAD_VALUE;
 	}
 
-	// Transfer ownership to the target team.  The area remains in the
-	// global hash so the target can clone it by id.
-	area->team = tr.target;
-	tr.new_area = area->id;
+	if (source->team != current->tgid) {
+		mutex_unlock(&area_lock);
+		return B_NOT_ALLOWED;
+	}
+
+	file = get_file(source->file);
+	if (!file) {
+		mutex_unlock(&area_lock);
+		return B_ERROR;
+	}
+
+	target_area = kzalloc(sizeof(*target_area), GFP_KERNEL);
+	if (!target_area) {
+		fput(file);
+		mutex_unlock(&area_lock);
+		return B_NO_MEMORY;
+	}
+
+	kref_init(&target_area->ref_count);
+	target_area->id = atomic_inc_return(&area_id_counter);
+	strscpy(target_area->name, source->name, B_OS_NAME_LENGTH);
+	target_area->file = file;
+	target_area->size = source->size;
+	target_area->lock = source->lock;
+	target_area->protection = source->protection;
+	target_area->team = tr.target;
+
+	hash_del(&source->node);
+	fput(source->file);
+	kfree(source);
+
+	hash_add(area_hashmap, &target_area->node, target_area->id);
 
 	mutex_unlock(&area_lock);
+
+	pr_debug("nexus_area: transferred area %d -> new area %d for team %d\n",
+		tr.area, target_area->id, tr.target);
+
+	tr.new_area = target_area->id;
 
 	if (copy_to_user(arg, &tr, sizeof(tr)))
 		return -EFAULT;
