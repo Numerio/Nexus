@@ -637,6 +637,23 @@ long nexus_port_read(struct nexus_port* port, int32_t* code, void* buffer,
 		return B_BAD_VALUE;
 	}
 
+	if (buf->size > *size) {
+		list_del(&buf->node);
+		kfree(buf->buffer);
+		kfree(buf);
+		port->read_count--;
+		port->write_count++;
+		port->total_count++;
+		wake_up_interruptible(&port->buffer_write);
+		return B_BAD_VALUE;
+	}
+
+	list_del(&buf->node);
+	port->read_count--;
+	port->write_count++;
+	port->total_count++;
+	wake_up_interruptible(&port->buffer_write);
+
 	if (buf->buffer != NULL) {
 		if (copy_to_user(buffer, buf->buffer, buf->size)) {
 			kfree(buf->buffer);
@@ -648,17 +665,12 @@ long nexus_port_read(struct nexus_port* port, int32_t* code, void* buffer,
 
 	if (code != NULL) {
 		if (copy_to_user(code, &buf->code, sizeof(*code))) {
+			kfree(buf->buffer);
+			kfree(buf);
 			return B_BAD_VALUE;
 		}
 	}
 
-	port->read_count--;
-	port->write_count++;
-	port->total_count++;
-
-	wake_up_interruptible(&port->buffer_write);
-
-	list_del(&buf->node);
 	kfree(buf->buffer);
 	kfree(buf);
 
