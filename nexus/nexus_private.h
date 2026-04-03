@@ -31,6 +31,12 @@ enum {
 
 #define B_NAME_NOT_FOUND -2147454966
 
+#define B_READ_AREA			0x001
+#define B_WRITE_AREA		0x002
+#define B_EXECUTE_AREA		0x004
+#define B_STACK_AREA		0x008
+#define B_CLONEABLE_AREA	0x100
+
 
 struct nexus_thread;
 
