@@ -31,7 +31,6 @@ static void nexus_area_destroy(struct kref *kref)
 	if (area->file)
 		fput(area->file);
 
-	hash_del(&area->node);
 	kfree(area);
 }
 
@@ -122,6 +121,12 @@ static long nexus_area_clone(struct nexus_area_clone __user *arg)
 		return B_BAD_VALUE;
 	}
 
+	if (source->team != current->tgid
+			&& !(source->protection & B_CLONEABLE_AREA)) {
+		mutex_unlock(&area_lock);
+		return B_NOT_ALLOWED;
+	}
+
 	area = kzalloc(sizeof(*area), GFP_KERNEL);
 	if (!area) {
 		mutex_unlock(&area_lock);
@@ -189,6 +194,12 @@ static long nexus_area_delete(struct nexus_area_delete __user *arg)
 		return B_BAD_VALUE;
 	}
 
+	if (area->team != current->tgid) {
+		mutex_unlock(&area_lock);
+		return B_NOT_ALLOWED;
+	}
+
+	hash_del(&area->node);
 	kref_put(&area->ref_count, nexus_area_destroy);
 
 	mutex_unlock(&area_lock);
