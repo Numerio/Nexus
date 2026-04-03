@@ -612,10 +612,17 @@ long nexus_port_read(struct nexus_port* port, int32_t* code, void* buffer,
 		mutex_lock(&nexus_main_lock);
 		kref_put(&port->ref_count, nexus_port_destroy);
 
-		if (nexus_ports[port_id] == NULL
-				|| (!port->is_open && port->read_count == 0)
-					|| ret == -ERESTARTSYS) {
+		if (nexus_ports[port_id] == NULL) {
 			return B_BAD_PORT_ID;
+		}
+
+		if (!port->is_open && port->read_count == 0) {
+			return B_BAD_PORT_ID;
+		}
+
+		if (ret == -ERESTARTSYS || ret == -ERESTARTNOHAND
+				|| ret == -ERESTARTNOINTR) {
+			return B_INTERRUPTED;
 		}
 
 		if (flags & B_TIMEOUT && ret == -ETIME) {
@@ -631,7 +638,9 @@ long nexus_port_read(struct nexus_port* port, int32_t* code, void* buffer,
 	}
 
 	if (buf->buffer != NULL) {
-		if (copy_to_user(buffer, buf->buffer, min(buf->size, *size))) {
+		if (copy_to_user(buffer, buf->buffer, buf->size)) {
+			kfree(buf->buffer);
+			kfree(buf);
 			return B_BAD_VALUE;
 		}
 		*size = buf->size;
@@ -702,7 +711,13 @@ long nexus_port_write(struct nexus_port* port, int32_t* msg_code,
 			return B_BAD_PORT_ID;
 		}
 
-		if (!port->is_open || ret == -ERESTARTSYS) {
+		if (!port->is_open || ret == -ERESTARTSYS
+				|| ret == -ERESTARTNOHAND || ret == -ERESTARTNOINTR) {
+			if (ret == -ERESTARTSYS || ret == -ERESTARTNOHAND
+					|| ret == -ERESTARTNOINTR) {
+				port->write_count++;
+				return B_INTERRUPTED;
+			}
 			port->write_count++;
 			return B_BAD_PORT_ID;
 		}
@@ -717,9 +732,18 @@ long nexus_port_write(struct nexus_port* port, int32_t* msg_code,
 
 goahead:
 	buf = kzalloc(sizeof(struct nexus_buffer), GFP_KERNEL);
+	if (buf == NULL) {
+		port->write_count++;
+		return B_NO_MEMORY;
+	}
 
 	if (buffer != NULL) {
 		buf->buffer = kzalloc(size, GFP_KERNEL);
+		if (buf->buffer == NULL) {
+			kfree(buf);
+			port->write_count++;
+			return B_NO_MEMORY;
+		}
 		if (copy_from_user(buf->buffer, buffer, size)) {
 			kfree(buf->buffer);
 			kfree(buf);
@@ -839,9 +863,13 @@ long nexus_port_message_info(struct nexus_port* port,
 		kref_put(&port->ref_count, nexus_port_destroy);
 
 		if (nexus_ports[port_id] == NULL
-				|| (!port->is_open && port->read_count == 0)
-					|| ret == -ERESTARTSYS) {
+				|| (!port->is_open && port->read_count == 0)) {
 			return B_BAD_PORT_ID;
+		}
+
+		if (ret == -ERESTARTSYS || ret == -ERESTARTNOHAND
+				|| ret == -ERESTARTNOINTR) {
+			return B_INTERRUPTED;
 		}
 
 		if (flags & B_TIMEOUT && ret == -ETIME) {
