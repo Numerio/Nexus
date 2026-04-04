@@ -1,3 +1,4 @@
+nexus-objs := nexus_core.o port.o
 obj-m := nexus.o sem.o vref.o area.o node_monitor.o
 
 KERNEL_SRC  ?= /lib/modules/$(shell uname -r)/build
