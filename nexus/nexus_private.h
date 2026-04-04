@@ -210,11 +210,23 @@ void					nexus_team_destroy(struct nexus_team *team);
 
 struct nexus_thread*	nexus_thread_init(struct nexus_team *team, pid_t thread, const char *name);
 void 					nexus_thread_destroy(struct kref* ref);
-long					nexus_thread_op(struct nexus_thread *thread, unsigned long cmd);
 
+long					nexus_port_find(unsigned long arg);
 long					nexus_port_init(struct nexus_team* team, unsigned long arg);
+long					nexus_port_close(struct nexus_port* port);
 void					nexus_port_destroy(struct kref* ref);
-long					nexus_port_op(struct nexus_team *team, unsigned long cmd);
+long					nexus_set_port_owner(struct nexus_port* port, pid_t target_team);
+long					nexus_port_read(struct nexus_port* port, int32_t* code, void* buffer,
+							size_t* size, uint32_t flags, int64_t timeout);
+long					nexus_port_write(struct nexus_port* port, int32_t* msg_code,
+							const void* buffer, size_t size, uint32_t flags, int64_t timeout);
+status_t				nexus_write_port(uint32_t id, int32_t code, const void *buffer,
+							size_t buffer_size);
+long					nexus_port_info(struct nexus_port* port, struct nexus_port_info* info);
+long					nexus_port_message_info(struct nexus_port* port,
+							struct nexus_port_message_info* info, size_t size,
+							uint32_t flags, int64_t timeout);
+long					nexus_port_op(struct nexus_team *team, unsigned long arg);
 
 void					nexus_sem_delete(struct kref* ref);
 /*
