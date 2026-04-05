@@ -402,11 +402,28 @@ static long area_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
 static int area_open(struct inode *inode, struct file *file)
 {
+	file->private_data = (void *)(uintptr_t)current->tgid;
 	return 0;
 }
 
 static int area_release(struct inode *inode, struct file *file)
 {
+	pid_t team = (pid_t)(uintptr_t)file->private_data;
+	struct nexus_area *area;
+	struct hlist_node *tmp;
+	int bkt;
+
+	pr_debug("nexus_area: cleanup for team %d\n", team);
+
+	mutex_lock(&area_lock);
+	hash_for_each_safe(area_hashmap, bkt, tmp, area, node) {
+		if (area->team == team) {
+			hash_del(&area->node);
+			kref_put(&area->ref_count, nexus_area_destroy);
+		}
+	}
+	mutex_unlock(&area_lock);
+
 	return 0;
 }
 
