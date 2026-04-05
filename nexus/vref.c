@@ -83,7 +83,7 @@ int nexus_vref_acquire_fd(int32_t id) {
 		if (entry->id == id) {
 			kref_get(&entry->ref_count);
 			struct file* file = get_file(entry->file);
-			int fd = get_unused_fd_flags(O_RDWR);
+			int fd = get_unused_fd_flags(entry->file->f_flags & O_CLOEXEC);
 			if (fd < 0) {
 				kref_put(&entry->ref_count, nexus_vref_destroy);
 				fput(file);
@@ -107,7 +107,7 @@ int nexus_vref_open(int32_t id) {
 	hash_for_each_possible(fd_hashmap, entry, node, id) {
 		if (entry->id == id) {
 			struct file* file = get_file(entry->file);
-			int fd = get_unused_fd_flags(O_RDWR);
+			int fd = get_unused_fd_flags(entry->file->f_flags & O_CLOEXEC);
 			if (fd < 0) {
 				fput(file);
 				mutex_unlock(&fd_map_lock);

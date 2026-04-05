@@ -120,8 +120,10 @@ static status_t nexus_create_sem(int32_t count, const char __user *name, sem_id 
 	atomic_set(&sem->ref_count, 1);
 
 	if (name) {
-		if (strncpy_from_user(sem->name, name, B_OS_NAME_LENGTH - 1) < 0)
+		if (strncpy_from_user(sem->name, name, B_OS_NAME_LENGTH - 1) < 0) {
+			kfree(sem);
 			return B_BAD_VALUE;
+		}
 		sem->name[B_OS_NAME_LENGTH - 1] = '\0';
 	} else {
 		strcpy(sem->name, "Anonymous Sem");
