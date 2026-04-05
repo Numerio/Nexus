@@ -351,6 +351,7 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 					} else if (task->tgid == iter_team->id) {
 						dest_thread = find_thread_by_id(iter_team, user_data.receiver);
 						if (dest_thread == NULL) {
+							put_task_struct(task);
 							ret = B_BAD_THREAD_ID;
 							goto exit;
 						}
@@ -359,6 +360,7 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				}
 
 				if (dest_thread == NULL) {
+					put_task_struct(task);
 					ret = B_BAD_THREAD_ID;
 					goto exit;
 				}
@@ -368,23 +370,22 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				// if -1 release the process then -ERESTARTSYS
 				down_interruptible(&dest_thread->sem_write);
 				mutex_lock(&nexus_main_lock);
-				kref_put(&dest_thread->ref_count, nexus_thread_destroy);
-
-				// TODO define exact policy for retaining task structs
-
-				if (dest_thread == NULL) {
+				if (kref_put(&dest_thread->ref_count, nexus_thread_destroy)) {
+					put_task_struct(task);
 					ret = B_BAD_THREAD_ID;
 					goto exit;
 				}
 
 				dest_thread->buffer = kzalloc(user_data.size, GFP_KERNEL);
 				if (dest_thread->buffer == NULL) {
+					put_task_struct(task);
 					ret = B_NO_MEMORY;
 					goto exit;
 				}
 
 				if (copy_from_user(dest_thread->buffer, user_data.buffer,
 						user_data.size)) {
+					put_task_struct(task);
 					ret = B_BAD_VALUE;
 					goto exit;
 				}

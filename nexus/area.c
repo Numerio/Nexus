@@ -311,8 +311,7 @@ static long nexus_area_transfer(struct nexus_area_transfer __user *arg)
 	target_area->team = tr.target;
 
 	hash_del(&source->node);
-	fput(source->file);
-	kfree(source);
+	kref_put(&source->ref_count, nexus_area_destroy);
 
 	hash_add(area_hashmap, &target_area->node, target_area->id);
 
