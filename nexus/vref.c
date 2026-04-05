@@ -5,6 +5,7 @@
 
 #include <linux/cdev.h>
 #include <linux/file.h>
+#include <linux/idr.h>
 #include <linux/mutex.h>
 #include <linux/hashtable.h>
 #include <linux/kref.h>
@@ -19,16 +20,16 @@ static int major = -1;
 static struct cdev nexus_cdev;
 static struct class *nexus_class = NULL;
 
-// TODO maybe IDR fits better here
 static DEFINE_HASHTABLE(fd_hashmap, 10);
 static DEFINE_MUTEX(fd_map_lock);
-static int32_t id_counter = 1;
+static DEFINE_IDA(vref_ida);
 
 static void nexus_vref_destroy(struct kref *kref) {
 	struct nexus_vref *entry = container_of(kref, struct nexus_vref, ref_count);
 
 	printk("nexus_vref_destroy vref %d", entry->id);
 
+	ida_free(&vref_ida, entry->id);
 	fput(entry->file);
 	hash_del(&entry->node);
 	kfree(entry);
@@ -46,9 +47,16 @@ int32_t nexus_vref_create(int fd) {
 		return -ENOMEM;
 	}
 
+	int id = ida_alloc_min(&vref_ida, 1, GFP_KERNEL);
+	if (id < 0) {
+		fput(file);
+		kfree(entry);
+		return -ENOMEM;
+	}
+
 	mutex_lock(&fd_map_lock);
 	kref_init(&entry->ref_count);
-	entry->id = id_counter++;
+	entry->id = id;
 	entry->file = get_file(file);
 	entry->team = current->tgid;
 	printk( KERN_INFO "create vref %d %d", entry->id, kref_read(&entry->ref_count));
@@ -250,6 +258,7 @@ error:
 }
 
 static void __exit vref_exit(void) {
+	ida_destroy(&vref_ida);
 	nexus_cleanup_dev(1);
 	printk(KERN_INFO "nexus_vref: module unloaded\n");
 }
