@@ -6,6 +6,7 @@
 #include "nexus.h"
 
 #include <linux/fs.h>
+#include <linux/idr.h>
 #include <linux/kref.h>
 #include <linux/list.h>
 #include <linux/module.h>
@@ -20,7 +21,7 @@
 
 extern struct mutex nexus_main_lock;
 extern struct hlist_head nexus_teams;
-extern struct nexus_port *nexus_ports[MAX_PORTS];
+extern struct idr nexus_port_idr;
 
 long nexus_port_find(unsigned long arg)
 {
@@ -44,10 +45,12 @@ long nexus_port_find(unsigned long arg)
 
 	in_data.id = B_ERROR;
 
-	for (int i = 0; i < MAX_PORTS; i++) {
-		if (nexus_ports[i] != NULL) {
-			if (strcmp(nexus_ports[i]->name, name) == 0) {
-				in_data.id = nexus_ports[i]->id;
+	{
+		struct nexus_port *p;
+		int pid;
+		idr_for_each_entry(&nexus_port_idr, p, pid) {
+			if (strcmp(p->name, name) == 0) {
+				in_data.id = p->id;
 				break;
 			}
 		}
@@ -63,7 +66,6 @@ long nexus_port_find(unsigned long arg)
 
 long nexus_port_init(struct nexus_team* team, unsigned long arg)
 {
-	int32_t id = 0;
 	struct nexus_port *port = NULL;
 
 	struct nexus_port *next_port = NULL;
@@ -84,14 +86,9 @@ long nexus_port_init(struct nexus_team* team, unsigned long arg)
 		return B_BAD_VALUE;
 	}
 
-	while (nexus_ports[id] != NULL && id < MAX_PORTS)
-		id++;
-
-	if (id >= MAX_PORTS) {
-		return B_NO_MORE_PORTS;
-	}
-
 	port = kzalloc(sizeof(struct nexus_port), GFP_KERNEL);
+	if (!port)
+		return B_NO_MEMORY;
 
 	kref_init(&port->ref_count);
 
@@ -101,7 +98,6 @@ long nexus_port_init(struct nexus_team* team, unsigned long arg)
 	port->write_count = in_data.cookie;
 	port->is_open = true;
 
-	port->id = id;
 	port->capacity = in_data.cookie;
 	port->team = team;
 
@@ -110,6 +106,7 @@ long nexus_port_init(struct nexus_team* team, unsigned long arg)
 	// TODO check size
 	if (copy_from_user(port->name, in_data.buffer, min(in_data.size,
 			(size_t)B_OS_NAME_LENGTH))) {
+		kfree(port);
 		return B_BAD_VALUE;
 	}
 
@@ -134,7 +131,12 @@ long nexus_port_init(struct nexus_team* team, unsigned long arg)
 
 	rwlock_init(&port->rw_lock);
 
-	nexus_ports[id] = port;
+	int id = idr_alloc(&nexus_port_idr, port, 1, 0, GFP_KERNEL);
+	if (id < 0) {
+		kfree(port);
+		return B_NO_MORE_PORTS;
+	}
+	port->id = id;
 
 	out_data.id = id;
 
@@ -162,7 +164,7 @@ void nexus_port_destroy(struct kref* ref)
 {
 	struct nexus_port* port = container_of(ref, struct nexus_port, ref_count);
 
-	nexus_ports[port->id] = NULL;
+	idr_remove(&nexus_port_idr, port->id);
 
 	if (port->is_open)
 		nexus_port_close(port);
@@ -227,7 +229,7 @@ long nexus_port_read(struct nexus_port* port, int32_t* code, void* buffer,
 		return B_BAD_VALUE;
 	}
 
-	if (nexus_ports[port->id] == NULL || (!port->is_open && port->read_count == 0)) {
+	if (idr_find(&nexus_port_idr, port->id) == NULL || (!port->is_open && port->read_count == 0)) {
 		return B_BAD_PORT_ID;
 	}
 
@@ -254,7 +256,7 @@ long nexus_port_read(struct nexus_port* port, int32_t* code, void* buffer,
 		mutex_lock(&nexus_main_lock);
 		kref_put(&port->ref_count, nexus_port_destroy);
 
-		if (nexus_ports[port_id] == NULL) {
+		if (idr_find(&nexus_port_idr, port_id) == NULL) {
 			return B_BAD_PORT_ID;
 		}
 
@@ -361,7 +363,7 @@ long nexus_port_write(struct nexus_port* port, int32_t* msg_code,
 		mutex_lock(&nexus_main_lock);
 		kref_put(&port->ref_count, nexus_port_destroy);
 
-		if (nexus_ports[port_id] == NULL) {
+		if (idr_find(&nexus_port_idr, port_id) == NULL) {
 			return B_BAD_PORT_ID;
 		}
 
@@ -429,12 +431,7 @@ status_t nexus_write_port(uint32_t id, int32_t code, const void *buffer,
 {
 	mutex_lock(&nexus_main_lock);
 
-	if (id >= MAX_PORTS) {
-		mutex_unlock(&nexus_main_lock);
-		return B_BAD_PORT_ID;
-	}
-
-	struct nexus_port* port = nexus_ports[id];
+	struct nexus_port* port = idr_find(&nexus_port_idr, id);
 	if (port == NULL) {
 		mutex_unlock(&nexus_main_lock);
 		return B_BAD_PORT_ID;
@@ -457,7 +454,7 @@ long nexus_port_info(struct nexus_port* port, struct nexus_port_info* info)
 		return B_BAD_VALUE;
 	}
 
-	if (nexus_ports[port->id] == NULL
+	if (idr_find(&nexus_port_idr, port->id) == NULL
 			|| (!port->is_open && port->read_count == 0)) {
 		return B_BAD_PORT_ID;
 	}
@@ -490,7 +487,7 @@ long nexus_port_message_info(struct nexus_port* port,
 		return B_BAD_VALUE;
 	}
 
-	if (nexus_ports[port->id] == NULL
+	if (idr_find(&nexus_port_idr, port->id) == NULL
 			|| (!port->is_open && port->read_count == 0)) {
 		return B_BAD_PORT_ID;
 	}
@@ -516,7 +513,7 @@ long nexus_port_message_info(struct nexus_port* port,
 		mutex_lock(&nexus_main_lock);
 		kref_put(&port->ref_count, nexus_port_destroy);
 
-		if (nexus_ports[port_id] == NULL
+		if (idr_find(&nexus_port_idr, port_id) == NULL
 				|| (!port->is_open && port->read_count == 0)) {
 			return B_BAD_PORT_ID;
 		}
@@ -558,18 +555,14 @@ long nexus_port_op(struct nexus_team *team, unsigned long arg)
 		return B_BAD_VALUE;
 	}
 
-	if (in_data.id < 0 || in_data.id >= MAX_PORTS) {
-		return B_BAD_PORT_ID;
-	}
-
-	port = nexus_ports[in_data.id];
+	port = idr_find(&nexus_port_idr, in_data.id);
 	if (port == NULL) {
 		return B_BAD_PORT_ID;
 	}
 
 	switch (in_data.op) {
 		case NEXUS_PORT_DELETE:
-			nexus_ports[port->id] = NULL;
+			idr_remove(&nexus_port_idr, port->id);
 			if (port->is_open)
 				nexus_port_close(port);
 

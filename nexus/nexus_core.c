@@ -10,6 +10,7 @@
 #include <linux/kref.h>
 #include <linux/list.h>
 #include <linux/module.h>
+#include <linux/idr.h>
 #include <linux/mutex.h>
 #include <linux/rbtree.h>
 #include <linux/kallsyms.h>
@@ -30,10 +31,9 @@ static struct class *nexus_class = NULL;
 DEFINE_MUTEX(nexus_main_lock);
 HLIST_HEAD(nexus_teams);
 
-struct nexus_port *nexus_ports[MAX_PORTS];
+DEFINE_IDR(nexus_port_idr);
 
 // TODO make non-exported functions static
-// TODO use IDRs
 // TODO fine-grained locking through spinlocks
 // TODO per-team lock
 
@@ -207,13 +207,12 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 
 	mutex_lock(&nexus_main_lock);
 
-	// Someone forked let's reinit the team
-	// TODO is the child fd in conflict with the father's?
+	// Forked child must open its own /dev/nexus fd via ReinitChildAtFork.
+	// filp->private_data is per-struct-file (shared across fork), so touching
+	// it here would corrupt the parent's team. Reject the call.
 	if (team->id != current->tgid) {
-		struct nexus_team *old_team = team;
-		team = nexus_team_init();
-		filp->private_data = (void*)team;
-		nexus_team_destroy(old_team);
+		mutex_unlock(&nexus_main_lock);
+		return -EPERM;
 	}
 
 	if (team->id == current->pid) {
@@ -419,6 +418,7 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 					} else if (task->tgid == iter_team->id) {
 						dest_thread = find_thread_by_id(iter_team, user_data.receiver);
 						if (dest_thread == NULL) {
+							put_task_struct(task);
 							ret = B_BAD_THREAD_ID;
 							goto exit;
 						}
@@ -451,7 +451,12 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				struct task_struct* task = get_pid_task(find_get_pid(
 					(pid_t)user_data.receiver), PIDTYPE_PID);
 
-				if (task == NULL || (task->mm != current->mm)) {
+				if (task == NULL) {
+					ret = B_BAD_THREAD_ID;
+					goto exit;
+				}
+				if (task->mm != current->mm) {
+					put_task_struct(task);
 					ret = B_BAD_THREAD_ID;
 					goto exit;
 				}
@@ -472,6 +477,10 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 					goto exit;
 				}
 
+				// Read exit_status now while the thread is guaranteed alive
+				// (under nexus_main_lock, before any kref_put that could free it).
+				int32_t exit_status = dest_thread->exit_status;
+
 				if (!dest_thread->has_thread_exited) {
 					int wret;
 
@@ -488,10 +497,12 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 						goto exit;
 					}
 
+					// Re-read after wait: EXIT will have set the final value.
+					exit_status = dest_thread->exit_status;
 					kref_put(&dest_thread->ref_count, nexus_thread_destroy);
 				}
 
-				user_data.return_code = dest_thread->exit_status;
+				user_data.return_code = exit_status;
 				user_ret = B_OK;
 
 				put_task_struct(task);
@@ -738,8 +749,6 @@ static int nexus_init(void)
 	cdev_init(&nexus_cdev, &nexus_interface_fops);
 	if (cdev_add(&nexus_cdev, major, 1) == -1)
 		goto error;
-
-	memset(nexus_ports, 0, MAX_PORTS*sizeof(struct nexus_port*));
 
 	printk(KERN_INFO "nexus: loaded\n");
 	return 0;

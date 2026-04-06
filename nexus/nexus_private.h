@@ -11,7 +11,6 @@
 // NOTE: not sure if we want that stuff to be configurable
 // just in case better to leave a note here.
 #define MAX_SEMS 65536
-#define MAX_PORTS 4096
 
 enum {
 	B_TIMEOUT						= 0x8,
