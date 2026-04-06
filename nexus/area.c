@@ -17,7 +17,6 @@ static int major = -1;
 static struct cdev nexus_cdev;
 static struct class *nexus_class = NULL;
 
-// TODO maybe IDR fits better here
 static DEFINE_HASHTABLE(area_hashmap, 12);
 static DEFINE_MUTEX(area_lock);
 static atomic_t area_id_counter = ATOMIC_INIT(1);
@@ -151,12 +150,9 @@ static long nexus_area_clone(struct nexus_area_clone __user *arg)
 	area->protection = clone.protection;
 	area->team = current->tgid;
 
-	// Save source fields before releasing the lock (N7: source may be freed
-	// by a concurrent nexus_area_delete after we drop area_lock).
+	// Save source fields before releasing the lock.
 	int source_id = source->id;
 	size_t source_size = source->size;
-
-	hash_add(area_hashmap, &area->node, area->id);
 
 	mutex_unlock(&area_lock);
 
@@ -166,13 +162,17 @@ static long nexus_area_clone(struct nexus_area_clone __user *arg)
 	clone.fd = fd;
 	clone.size = source_size;
 
-	// do copy_to_user before fd_install so the fd is not leaked if the
-	// copy fails.
 	if (copy_to_user(arg, &clone, sizeof(clone))) {
 		put_unused_fd(fd);
 		fput(file);
+		kfree(area);
 		return -EFAULT;
 	}
+
+	// Only publish to the hash now that userspace has the id and fd.
+	mutex_lock(&area_lock);
+	hash_add(area_hashmap, &area->node, area->id);
+	mutex_unlock(&area_lock);
 
 	fd_install(fd, file);
 	return B_OK;
@@ -482,9 +482,7 @@ static void __exit area_exit(void)
 	mutex_lock(&area_lock);
 	hash_for_each_safe(area_hashmap, bkt, tmp, area, node) {
 		hash_del(&area->node);
-		if (area->file)
-			fput(area->file);
-		kfree(area);
+		kref_put(&area->ref_count, nexus_area_destroy);
 	}
 	mutex_unlock(&area_lock);
 
