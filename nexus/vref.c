@@ -27,7 +27,6 @@ static DEFINE_IDA(vref_ida);
 static void nexus_vref_destroy(struct kref *kref) {
 	struct nexus_vref *entry = container_of(kref, struct nexus_vref, ref_count);
 
-	printk("nexus_vref_destroy vref %d", entry->id);
 
 	ida_free(&vref_ida, entry->id);
 	fput(entry->file);
@@ -59,7 +58,6 @@ int32_t nexus_vref_create(int fd) {
 	entry->id = id;
 	entry->file = get_file(file);
 	entry->team = current->tgid;
-	printk( KERN_INFO "create vref %d %d", entry->id, kref_read(&entry->ref_count));
 	hash_add(fd_hashmap, &entry->node, entry->id);
 	fput(file);
 	mutex_unlock(&fd_map_lock);
@@ -90,17 +88,14 @@ int nexus_vref_acquire_fd(int32_t id) {
 	mutex_lock(&fd_map_lock);
 	hash_for_each_possible_safe(fd_hashmap, entry, tmp, node, id) {
 		if (entry->id == id) {
-			kref_get(&entry->ref_count);
 			struct file* file = get_file(entry->file);
 			int fd = get_unused_fd_flags(entry->file->f_flags & O_CLOEXEC);
 			if (fd < 0) {
-				kref_put(&entry->ref_count, nexus_vref_destroy);
 				fput(file);
 				mutex_unlock(&fd_map_lock);
 				return -1;
 			}
 			fd_install(fd, file);
-			printk( KERN_INFO "acquire kref %d", kref_read(&entry->ref_count));
 			mutex_unlock(&fd_map_lock);
 			return fd;
 		}
@@ -123,7 +118,6 @@ int nexus_vref_open(int32_t id) {
 				return B_ENTRY_NOT_FOUND;
 			}
 			fd_install(fd, file);
-			printk( KERN_INFO "acquire kref %d", kref_read(&entry->ref_count));
 			mutex_unlock(&fd_map_lock);
 			return fd;
 		}
@@ -133,7 +127,6 @@ int nexus_vref_open(int32_t id) {
 }
 
 long nexus_vref_release(int32_t id) {
-	printk(KERN_INFO "release called %d", current->pid);
 
 	struct nexus_vref *entry = NULL;
 	struct hlist_node *tmp = NULL;
@@ -203,12 +196,11 @@ static int vref_release(struct inode *inode, struct file *file) {
 	struct hlist_node *tmp;
 	int bkt;
 
-	printk(KERN_INFO "nexus_vref: cleanup for team %d\n", team);
 
 	mutex_lock(&fd_map_lock);
 	hash_for_each_safe(fd_hashmap, bkt, tmp, entry, node) {
 		if (entry->team == team) {
-			printk(KERN_INFO "nexus_vref: releasing leaked vref %d for team %d\n",
+			pr_debug("nexus_vref: releasing leaked vref %d for team %d\n",
 				entry->id, team);
 			kref_put(&entry->ref_count, nexus_vref_destroy);
 		}
