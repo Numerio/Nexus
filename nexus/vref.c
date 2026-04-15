@@ -74,6 +74,7 @@ int nexus_vref_acquire(int32_t id) {
 	hash_for_each_possible(fd_hashmap, entry, node, id) {
 		if (entry->id == id) {
 			kref_get(&entry->ref_count);
+			entry->team = current->tgid;
 			mutex_unlock(&fd_map_lock);
 			return B_OK;
 		}
@@ -140,7 +141,10 @@ long nexus_vref_release(int32_t id) {
 	mutex_lock(&fd_map_lock);
 	hash_for_each_possible_safe(fd_hashmap, entry, tmp, node, id) {
 		if (entry->id == id) {
-			printk( KERN_INFO "release vref %d count %d", id, kref_read(&entry->ref_count));
+			if (entry->team != current->tgid) {
+				mutex_unlock(&fd_map_lock);
+				return 0;
+			}
 			kref_put(&entry->ref_count, nexus_vref_destroy);
 			mutex_unlock(&fd_map_lock);
 			return 0;
@@ -151,6 +155,9 @@ long nexus_vref_release(int32_t id) {
 }
 
 static long vref_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
+	if ((pid_t)(uintptr_t)file->private_data != current->tgid)
+		return -EPERM;
+
 	int fd = -1;
 	int32_t id = -1;
 
