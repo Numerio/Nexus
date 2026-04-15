@@ -449,7 +449,10 @@ static status_t nexus_get_next_sem_info(team_id team, int32_t *cookie,
 
 static long nexus_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
-	// TODO we should expect reinit on fork otherwise kill the team?
+	// Reject calls from a forked child that has not respected the rules.
+	if ((pid_t)(uintptr_t)file->private_data != current->tgid)
+		return -EPERM;
+
 	struct nexus_sem_exchange ex;
 	struct nexus_sem_info info;
 	struct nexus_sem_next_info next_info;
