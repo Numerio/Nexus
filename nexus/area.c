@@ -6,6 +6,7 @@
 #include <linux/cdev.h>
 #include <linux/file.h>
 #include <linux/hashtable.h>
+#include <linux/idr.h>
 
 #include "errors.h"
 #include "nexus.h"
@@ -19,13 +20,15 @@ static struct class *nexus_class = NULL;
 
 static DEFINE_HASHTABLE(area_hashmap, 12);
 static DEFINE_MUTEX(area_lock);
-static atomic_t area_id_counter = ATOMIC_INIT(1);
+static DEFINE_IDA(area_ida);
 
 static void nexus_area_destroy(struct kref *kref)
 {
 	struct nexus_area *area = container_of(kref, struct nexus_area, ref_count);
 
 	pr_debug("nexus_area: destroy area %d '%s'\n", area->id, area->name);
+
+	ida_free(&area_ida, area->id);
 
 	if (area->file)
 		fput(area->file);
@@ -76,10 +79,17 @@ static long nexus_area_create(struct nexus_area_create __user *arg)
 		return B_NO_MEMORY;
 	}
 
+	int id = ida_alloc_min(&area_ida, 1, GFP_KERNEL);
+	if (id < 0) {
+		fput(file);
+		kfree(area);
+		return B_NO_MEMORY;
+	}
+
 	mutex_lock(&area_lock);
 
 	kref_init(&area->ref_count);
-	area->id = atomic_inc_return(&area_id_counter);
+	area->id = id;
 	strscpy(area->name, create.name, B_OS_NAME_LENGTH);
 	area->file = file;
 	area->size = create.size;
@@ -106,7 +116,6 @@ static long nexus_area_clone(struct nexus_area_clone __user *arg)
 {
 	struct nexus_area_clone clone;
 	struct nexus_area *source, *area;
-	struct file *file;
 	int fd;
 
 	if (copy_from_user(&clone, arg, sizeof(clone)))
@@ -132,17 +141,22 @@ static long nexus_area_clone(struct nexus_area_clone __user *arg)
 		return B_NO_MEMORY;
 	}
 
-	file = get_file(source->file);
+	int id = ida_alloc_min(&area_ida, 1, GFP_KERNEL);
+	if (id < 0) {
+		put_unused_fd(fd);
+		kfree(area);
+		mutex_unlock(&area_lock);
+		return B_NO_MEMORY;
+	}
 
 	fd = get_unused_fd_flags(O_RDWR | O_CLOEXEC);
 	if (fd < 0) {
-		fput(file);
 		kfree(area);
 		mutex_unlock(&area_lock);
 		return B_NO_MEMORY;
 	}
 	kref_init(&area->ref_count);
-	area->id = atomic_inc_return(&area_id_counter);
+	area->id = id;
 	strscpy(area->name, clone.name, B_OS_NAME_LENGTH);
 	area->file = get_file(source->file);
 	area->size = source->size;
@@ -150,7 +164,6 @@ static long nexus_area_clone(struct nexus_area_clone __user *arg)
 	area->protection = clone.protection;
 	area->team = current->tgid;
 
-	// Save source fields before releasing the lock.
 	int source_id = source->id;
 	size_t source_size = source->size;
 
@@ -164,17 +177,16 @@ static long nexus_area_clone(struct nexus_area_clone __user *arg)
 
 	if (copy_to_user(arg, &clone, sizeof(clone))) {
 		put_unused_fd(fd);
-		fput(file);
-		kfree(area);
+		fput(area->file);
+		kref_put(&area->ref_count, nexus_area_destroy);
 		return -EFAULT;
 	}
 
-	// Only publish to the hash now that userspace has the id and fd.
 	mutex_lock(&area_lock);
 	hash_add(area_hashmap, &area->node, area->id);
 	mutex_unlock(&area_lock);
 
-	fd_install(fd, file);
+	fd_install(fd, source->file);
 	return B_OK;
 }
 
@@ -275,6 +287,12 @@ static long nexus_area_transfer(struct nexus_area_transfer __user *arg)
 	if (copy_from_user(&tr, arg, sizeof(tr)))
 		return -EFAULT;
 
+	// Check the target process is alive
+	struct pid *target_pid = find_get_pid(tr.target);
+	if (!target_pid)
+		return B_BAD_TEAM_ID;
+	put_pid(target_pid);
+
 	mutex_lock(&area_lock);
 
 	source = find_area_by_id(tr.area);
@@ -301,8 +319,16 @@ static long nexus_area_transfer(struct nexus_area_transfer __user *arg)
 		return B_NO_MEMORY;
 	}
 
+	int id = ida_alloc_min(&area_ida, 1, GFP_KERNEL);
+	if (id < 0) {
+		fput(file);
+		kfree(target_area);
+		mutex_unlock(&area_lock);
+		return B_NO_MEMORY;
+	}
+
 	kref_init(&target_area->ref_count);
-	target_area->id = atomic_inc_return(&area_id_counter);
+	target_area->id = id;
 	strscpy(target_area->name, source->name, B_OS_NAME_LENGTH);
 	target_area->file = file;
 	target_area->size = source->size;
@@ -344,6 +370,11 @@ static long nexus_area_resize(struct nexus_area_resize __user *arg)
 		return B_BAD_VALUE;
 	}
 
+	if (area->team != current->tgid) {
+		mutex_unlock(&area_lock);
+		return B_NOT_ALLOWED;
+	}
+
 	area->size = resize.new_size;
 
 	mutex_unlock(&area_lock);
@@ -367,6 +398,11 @@ static long nexus_area_set_protection(struct nexus_area_set_protection __user *a
 		return B_BAD_VALUE;
 	}
 
+	if (area->team != current->tgid) {
+		mutex_unlock(&area_lock);
+		return B_NOT_ALLOWED;
+	}
+
 	area->protection = prot.protection;
 
 	mutex_unlock(&area_lock);
@@ -376,7 +412,10 @@ static long nexus_area_set_protection(struct nexus_area_set_protection __user *a
 
 static long area_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
-	// TODO we should expect reinit on fork otherwise kill the team?
+	// Reject a forked process that didn't respect rules.
+	if ((pid_t)(uintptr_t)file->private_data != current->tgid)
+		return -EPERM;
+
 	switch (cmd) {
 		case NEXUS_AREA_CREATE:
 			return nexus_area_create((struct nexus_area_create __user *)arg);
@@ -486,6 +525,7 @@ static void __exit area_exit(void)
 	}
 	mutex_unlock(&area_lock);
 
+	ida_destroy(&area_ida);
 	cleanup_dev(1);
 	pr_info("nexus_area: module unloaded\n");
 }

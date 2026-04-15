@@ -24,6 +24,7 @@
 #define B_WOULD_BLOCK				-EAGAIN
 #define B_INTERRUPTED				-EINTR
 
+#define B_BAD_ADDRESS				-EFAULT
 #define B_NOT_ALLOWED				(B_GENERAL_ERROR_BASE + 16)
 
 #define B_ERROR						(-1)
