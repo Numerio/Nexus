@@ -37,7 +37,7 @@ static struct nexus_sem *sem_get(sem_id id)
 
 	spin_lock_irqsave(&sem_idr_lock, flags);
 	sem = idr_find(&sem_idr, id);
-	// TODO maybe use kref_get/kref_put
+
 	if (sem && !sem->deleted)
 		atomic_inc(&sem->ref_count);
 	else
@@ -77,7 +77,6 @@ static struct team_sem_list *get_or_create_team_list(team_id team)
 
 	spin_lock_irqsave(&team_hash_lock, flags);
 	{
-		// Re-check: another thread may have inserted between our unlock and now 
 		struct team_sem_list *existing;
 		hash_for_each_possible(team_hash, existing, hash_node, team) {
 			if (existing->team == team) {
@@ -534,7 +533,7 @@ static int nexus_sem_release(struct inode *inode, struct file *file)
 	struct hlist_node *tmp;
 	unsigned long flags;
 
-	pr_info("nexus_sem: cleanup for team %d\n", team);
+	pr_debug("nexus_sem: cleanup for team %d\n", team);
 
 	team_list = get_team_list(team);
 	if (!team_list)
@@ -638,6 +637,18 @@ static void __exit nexus_exit(void)
 	spin_unlock_irqrestore(&sem_idr_lock, flags);
 
 	idr_destroy(&sem_idr);
+
+	{
+		struct team_sem_list *list;
+		struct hlist_node *tmp;
+		int bkt;
+		spin_lock_irqsave(&team_hash_lock, flags);
+		hash_for_each_safe(team_hash, bkt, tmp, list, hash_node) {
+			hash_del(&list->hash_node);
+			kfree(list);
+		}
+		spin_unlock_irqrestore(&team_hash_lock, flags);
+	}
 
 	cdev_del(&nexus_cdev);
 	device_destroy(nexus_class, dev_num);
