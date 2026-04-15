@@ -164,7 +164,9 @@ void nexus_port_destroy(struct kref* ref)
 {
 	struct nexus_port* port = container_of(ref, struct nexus_port, ref_count);
 
-	idr_remove(&nexus_port_idr, port->id);
+	// id is zeroed by PORT_DELETE to avoid double removal
+	if (port->id != 0)
+		idr_remove(&nexus_port_idr, port->id);
 
 	if (port->is_open)
 		nexus_port_close(port);
@@ -230,6 +232,9 @@ long nexus_set_port_owner(struct nexus_port* port, pid_t target_team)
 	struct nexus_port *next_port = NULL;
 	struct rb_node *parent = NULL;
 	struct rb_node **p = NULL;
+
+	if (port->team == NULL)
+		return B_ERROR;
 
 	// TODO just like the port init we want to reduce code duplication here
 	hlist_for_each_entry(dest_team, &nexus_teams, node) {
@@ -297,7 +302,9 @@ long nexus_port_read(struct nexus_port* port, int32_t* code, void* buffer,
 		mutex_lock(&nexus_main_lock);
 		kref_put(&port->ref_count, nexus_port_destroy);
 
-		if (idr_find(&nexus_port_idr, port_id) == NULL) {
+		// Re-fetch via IDR: port may have been freed.
+		port = idr_find(&nexus_port_idr, port_id);
+		if (port == NULL) {
 			return B_BAD_PORT_ID;
 		}
 
@@ -404,7 +411,9 @@ long nexus_port_write(struct nexus_port* port, int32_t* msg_code,
 		mutex_lock(&nexus_main_lock);
 		kref_put(&port->ref_count, nexus_port_destroy);
 
-		if (idr_find(&nexus_port_idr, port_id) == NULL) {
+		// Re-fetch via IDR: kref_put may have freed port if the last ref dropped.
+		port = idr_find(&nexus_port_idr, port_id);
+		if (port == NULL) {
 			return B_BAD_PORT_ID;
 		}
 
@@ -500,6 +509,9 @@ long nexus_port_info(struct nexus_port* port, struct nexus_port_info* info)
 		return B_BAD_PORT_ID;
 	}
 
+	if (port->team == NULL)
+		return B_BAD_PORT_ID;
+
 	message_info.port = port->id;
 	message_info.team = port->team->id;
 	message_info.capacity = port->capacity;
@@ -554,8 +566,9 @@ long nexus_port_message_info(struct nexus_port* port,
 		mutex_lock(&nexus_main_lock);
 		kref_put(&port->ref_count, nexus_port_destroy);
 
-		if (idr_find(&nexus_port_idr, port_id) == NULL
-				|| (!port->is_open && port->read_count == 0)) {
+		// Re-fetch via IDR: kref_put may have freed port if the last ref dropped.
+		port = idr_find(&nexus_port_idr, port_id);
+		if (port == NULL || (!port->is_open && port->read_count == 0)) {
 			return B_BAD_PORT_ID;
 		}
 
@@ -604,6 +617,8 @@ long nexus_port_op(struct nexus_team *team, unsigned long arg)
 	switch (in_data.op) {
 		case NEXUS_PORT_DELETE:
 			idr_remove(&nexus_port_idr, port->id);
+			// Zero the id so that destroy skips idr_remove
+			port->id = 0;
 			if (port->is_open)
 				nexus_port_close(port);
 
