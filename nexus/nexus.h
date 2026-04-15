@@ -29,15 +29,16 @@ typedef s64 bigtime_t;
 #define NEXUS_MAGIC	'n'
 
 #define NEXUS_THREAD_SPAWN			_IO (NEXUS_MAGIC, 1)
-#define NEXUS_THREAD_EXIT			_IO (NEXUS_MAGIC, 2)
 #define NEXUS_THREAD_OP				_IO (NEXUS_MAGIC, 3)
 #define NEXUS_THREAD_WAIT_NEWBORN	_IO (NEXUS_MAGIC, 4)
 #define NEXUS_THREAD_CLONE_EXECUTED	_IO (NEXUS_MAGIC, 5)
 #define NEXUS_THREAD_RESUME			_IO (NEXUS_MAGIC, 6)
+#define NEXUS_THREAD_SET_RETURN_CODE _IO (NEXUS_MAGIC, 7)
 
 #define NEXUS_PORT_CREATE			_IO(NEXUS_MAGIC, 10)
 #define NEXUS_PORT_OP				_IO(NEXUS_MAGIC, 11)
 #define NEXUS_PORT_FIND				_IO(NEXUS_MAGIC, 12)
+#define NEXUS_GET_NEXT_PORT_FOR_TEAM	_IOWR(NEXUS_MAGIC, 13, struct nexus_get_next_port)
 
 #define NEXUS_SEM_CREATE			_IO(NEXUS_MAGIC, 1)
 #define NEXUS_SEM_ACQUIRE			_IO(NEXUS_MAGIC, 2)
@@ -144,6 +145,13 @@ struct nexus_port_info {
 	int32_t		capacity;
 	int32_t		queue_count;
 	int32_t		total_count;
+};
+
+struct nexus_get_next_port {
+	pid_t					team;
+	int32_t					cookie;		/* in: last seen port id (0 = start) */
+	/* out */
+	struct nexus_port_info	info;
 };
 
 

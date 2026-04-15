@@ -58,6 +58,7 @@ struct nexus_team {
 struct nexus_thread {
 	struct rb_node			node;
 	struct kref				ref_count;
+	struct callback_head	exit_work;		// passive exit detection via task_work
 
 	thread_id				id;
 
@@ -67,6 +68,7 @@ struct nexus_thread {
 	bool					thread_resumed;
 	bool					thread_wait_newborn;
 	bool					has_thread_exited;
+	bool					has_return_code;	// set by NEXUS_THREAD_SET_RETURN_CODE
 
 	thread_id				child_thread;
 
@@ -212,6 +214,7 @@ void 					nexus_thread_destroy(struct kref* ref);
 
 long					nexus_port_find(unsigned long arg);
 long					nexus_port_init(struct nexus_team* team, unsigned long arg);
+long					nexus_get_next_port_for_team(unsigned long arg);
 long					nexus_port_close(struct nexus_port* port);
 void					nexus_port_destroy(struct kref* ref);
 long					nexus_set_port_owner(struct nexus_port* port, pid_t target_team);

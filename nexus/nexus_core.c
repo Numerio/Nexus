@@ -703,27 +703,9 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			ret = B_OK;
 			break;
 
-		case NEXUS_THREAD_EXIT:
-			if (arg != 0) {
-				struct nexus_thread_exchange exit_data;
-				if (copy_from_user(&exit_data,
-					(struct __user nexus_thread_exchange *)arg,
-						sizeof(exit_data)) == 0) {
-				thread->exit_status = exit_data.return_code;
-				} else {
-					thread->exit_status = B_OK;
-				}
-			} else {
-				thread->exit_status = B_OK;
-			}
-
-			thread->has_thread_exited = 1;
-
-			mutex_unlock(&nexus_main_lock);
-			wake_up_interruptible(&thread->thread_exit);
-			mutex_lock(&nexus_main_lock);
-
-			kref_put(&thread->ref_count, nexus_thread_destroy);
+		case NEXUS_THREAD_SET_RETURN_CODE:
+			thread->exit_status = (int32_t)(long)arg;
+			thread->has_return_code = true;
 			ret = B_OK;
 			break;
 
