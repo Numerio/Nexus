@@ -176,12 +176,53 @@ void nexus_port_destroy(struct kref* ref)
 		kfree(buf);
 	}
 
-	write_lock(&port->rw_lock);
-	rb_erase(&port->node, &port->team->ports);
-	write_unlock(&port->rw_lock);
+	if (port->team != NULL) {
+		write_lock(&port->rw_lock);
+		rb_erase(&port->node, &port->team->ports);
+		write_unlock(&port->rw_lock);
+	}
 
 	kfree(port);
 }
+
+long nexus_get_next_port_for_team(unsigned long arg)
+{
+	struct nexus_get_next_port req;
+	struct nexus_team *team;
+	struct rb_node *node;
+
+	if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
+		return B_BAD_VALUE;
+
+	team = NULL;
+	hlist_for_each_entry(team, &nexus_teams, node) {
+		if (team->id == req.team)
+			goto found;
+	}
+	return B_BAD_TEAM_ID;
+
+found:
+	for (node = rb_first(&team->ports); node != NULL; node = rb_next(node)) {
+		struct nexus_port *p = rb_entry(node, struct nexus_port, node);
+		if (p->id <= req.cookie)
+			continue;
+
+		req.info.port       = p->id;
+		req.info.team       = team->id;
+		req.info.capacity   = p->capacity;
+		req.info.queue_count = p->read_count;
+		req.info.total_count = p->total_count;
+		strncpy(req.info.name, p->name, B_OS_NAME_LENGTH);
+		req.info.name[B_OS_NAME_LENGTH - 1] = '\0';
+
+		if (copy_to_user((void __user *)arg, &req, sizeof(req)))
+			return B_BAD_VALUE;
+		return B_OK;
+	}
+
+	return B_BAD_PORT_ID;
+}
+
 
 long nexus_set_port_owner(struct nexus_port* port, pid_t target_team)
 {
