@@ -17,6 +17,8 @@
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 #include <linux/version.h>
+#include <linux/signal.h>
+#include <linux/task_work.h>
 #include <linux/wait.h>
 
 #include "errors.h"
@@ -36,6 +38,46 @@ DEFINE_IDR(nexus_port_idr);
 // TODO make non-exported functions static
 // TODO fine-grained locking through spinlocks
 // TODO per-team lock
+
+
+static void nexus_thread_exit_work(struct callback_head *head)
+{
+	struct nexus_thread *thread = container_of(head, struct nexus_thread, exit_work);
+
+	mutex_lock(&nexus_main_lock);
+
+	if (!thread->has_thread_exited) {
+		if (!thread->has_return_code) {
+			int sig = current->exit_code & 0x7f;
+			switch (sig) {
+			case 0:
+				thread->exit_status = B_OK;
+				break;
+			case SIGSEGV:
+			case SIGBUS:
+			case SIGILL:
+			case SIGFPE:
+				thread->exit_status = B_BAD_ADDRESS;
+				break;
+			case SIGABRT:
+				thread->exit_status = B_ERROR;
+				break;
+			default:
+				thread->exit_status = B_INTERRUPTED;
+				break;
+			}
+		}
+		thread->has_thread_exited = true;
+	}
+
+	wake_up_all(&thread->thread_exit);
+	wake_up_all(&thread->thread_suspended);
+	wake_up_all(&thread->thread_has_newborn);
+	wake_up_all(&thread->buffer_read);
+
+	kref_put(&thread->ref_count, nexus_thread_destroy);
+	mutex_unlock(&nexus_main_lock);
+}
 
 struct nexus_team* nexus_team_init()
 {
@@ -60,7 +102,7 @@ struct nexus_team* nexus_team_init()
 
 void nexus_team_destroy(struct nexus_team *team)
 {
-	printk(KERN_INFO "team destroy");
+	pr_debug("nexus: team %d destroyed\n", team->id);
 
 	struct rb_node *node;
 	struct nexus_port *port;
@@ -70,17 +112,25 @@ void nexus_team_destroy(struct nexus_team *team)
 	while (node) {
 		port = rb_entry(node, struct nexus_port, node);
 		node = rb_next(node);
-		nexus_port_destroy(&port->ref_count);
+		rb_erase(&port->node, &team->ports);
+		RB_CLEAR_NODE(&port->node);
+		port->team = NULL;
+		nexus_port_close(port);
+		kref_put(&port->ref_count, nexus_port_destroy);
 	}
 
 	node = rb_first(&team->threads);
 	while (node) {
 		thread = rb_entry(node, struct nexus_thread, node);
 		node = rb_next(node);
-		nexus_thread_destroy(&thread->ref_count);
+		rb_erase(&thread->node, &team->threads);
+		RB_CLEAR_NODE(&thread->node);
+		thread->team = NULL;
+		kref_put(&thread->ref_count, nexus_thread_destroy);
 	}
 
-	nexus_thread_destroy(&team->main_thread->ref_count);
+	team->main_thread->team = NULL;
+	kref_put(&team->main_thread->ref_count, nexus_thread_destroy);
 	team->main_thread = NULL;
 	hlist_del(&team->node);
 	kfree(team);
@@ -116,6 +166,7 @@ struct nexus_thread* nexus_thread_init(struct nexus_team *team, pid_t id, const 
 		thread->team = team;
 		thread->exit_status = 0;
 		thread->has_thread_exited = false;
+		thread->has_return_code = false;
 		thread->return_code = B_ERROR;
 		thread->thread_wait_newborn = false;
 		thread->thread_resumed = false;
@@ -127,7 +178,19 @@ void nexus_thread_destroy(struct kref* ref)
 {
 	struct nexus_thread* thread = container_of(ref, struct nexus_thread, ref_count);
 	struct nexus_team* team = thread->team;
-	if (thread->id != team->id)
+
+	// Just in case thread was allocated and never spawned.
+	if (!thread->has_thread_exited) {
+		thread->has_thread_exited = true;
+		if (!thread->has_return_code)
+			thread->exit_status = B_ERROR;
+		wake_up_all(&thread->thread_exit);
+		wake_up_all(&thread->thread_suspended);
+		wake_up_all(&thread->thread_has_newborn);
+		wake_up_all(&thread->buffer_read);
+	}
+
+	if (team != NULL && thread->id != team->id)
 		rb_erase(&thread->node, &team->threads);
 	kfree(thread->buffer);
 	kfree(thread);
@@ -207,9 +270,7 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 
 	mutex_lock(&nexus_main_lock);
 
-	// Forked child must open its own /dev/nexus fd via ReinitChildAtFork.
-	// filp->private_data is per-struct-file (shared across fork), so touching
-	// it here would corrupt the parent's team. Reject the call.
+	// Forked child didn't respect rules.
 	if (team->id != current->tgid) {
 		mutex_unlock(&nexus_main_lock);
 		return -EPERM;
@@ -230,6 +291,18 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				}
 
 				ret = nexus_thread_spawn(team, spawn_data.name);
+
+				struct nexus_thread *self_new =
+					find_thread_by_id(team, current->pid);
+				if (self_new != NULL) {
+					kref_get(&self_new->ref_count);
+					init_task_work(&self_new->exit_work,
+						nexus_thread_exit_work);
+					if (task_work_add(current, &self_new->exit_work,
+							TWA_NONE) != 0)
+						kref_put(&self_new->ref_count,
+							nexus_thread_destroy);
+				}
 
 				task = get_pid_task(
 					find_get_pid((pid_t)spawn_data.father),
@@ -477,8 +550,7 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 					goto exit;
 				}
 
-				// Read exit_status now while the thread is guaranteed alive
-				// (under nexus_main_lock, before any kref_put that could free it).
+				// Cache exit status while we're still alive.
 				int32_t exit_status = dest_thread->exit_status;
 
 				if (!dest_thread->has_thread_exited) {
@@ -496,8 +568,6 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 						ret = B_INTERRUPTED;
 						goto exit;
 					}
-
-					// Re-read after wait: EXIT will have set the final value.
 					exit_status = dest_thread->exit_status;
 					kref_put(&dest_thread->ref_count, nexus_thread_destroy);
 				}
@@ -669,6 +739,10 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			ret = nexus_port_find(arg);
 			break;
 
+		case NEXUS_GET_NEXT_PORT_FOR_TEAM:
+			ret = nexus_get_next_port_for_team(arg);
+			break;
+
 		default:
 			break;
 	}
@@ -684,9 +758,17 @@ static int nexus_open(struct inode *nodp, struct file *filp)
 
 	mutex_lock(&nexus_main_lock);
 	team = nexus_team_init();
-	if (team == NULL)
+	if (team == NULL) {
+		mutex_unlock(&nexus_main_lock);
 		return -ENOMEM;
+	}
 	mutex_unlock(&nexus_main_lock);
+
+	kref_get(&team->main_thread->ref_count);
+	init_task_work(&team->main_thread->exit_work, nexus_thread_exit_work);
+	if (task_work_add(current, &team->main_thread->exit_work, TWA_NONE) != 0) {
+		kref_put(&team->main_thread->ref_count, nexus_thread_destroy);
+	}
 
 	filp->private_data = (void*)team;
 
