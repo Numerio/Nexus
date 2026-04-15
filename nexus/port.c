@@ -652,7 +652,7 @@ long nexus_port_op(struct nexus_team *team, unsigned long arg)
 			break;
 
 		case NEXUS_SET_PORT_OWNER:
-			if (port->team->id != current->tgid) {
+			if (port->team == NULL || port->team->id != current->tgid) {
 				ret = B_NOT_ALLOWED;
 				break;
 			}
