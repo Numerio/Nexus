@@ -29,32 +29,49 @@ typedef s64 bigtime_t;
 #define NEXUS_MAGIC	'n'
 
 #define NEXUS_THREAD_SPAWN			_IO (NEXUS_MAGIC, 1)
-#define NEXUS_THREAD_OP				_IO (NEXUS_MAGIC, 3)
+#define NEXUS_THREAD_SET_NAME      _IOW (NEXUS_MAGIC, 3,  struct nexus_thread_set_name_req)
+#define NEXUS_THREAD_READ          _IOWR(NEXUS_MAGIC, 20, struct nexus_thread_rw)
+#define NEXUS_THREAD_WRITE         _IOW (NEXUS_MAGIC, 21, struct nexus_thread_rw)
+#define NEXUS_THREAD_HAS_DATA      _IOWR(NEXUS_MAGIC, 22, struct nexus_thread_rw)
+#define NEXUS_THREAD_WAITFOR       _IOWR(NEXUS_MAGIC, 23, struct nexus_thread_waitfor_req)
 #define NEXUS_THREAD_WAIT_NEWBORN	_IO (NEXUS_MAGIC, 4)
 #define NEXUS_THREAD_CLONE_EXECUTED	_IO (NEXUS_MAGIC, 5)
 #define NEXUS_THREAD_RESUME			_IO (NEXUS_MAGIC, 6)
 #define NEXUS_THREAD_SET_RETURN_CODE _IO (NEXUS_MAGIC, 7)
 
-#define NEXUS_PORT_CREATE			_IO(NEXUS_MAGIC, 10)
-#define NEXUS_PORT_OP				_IO(NEXUS_MAGIC, 11)
-#define NEXUS_PORT_FIND				_IO(NEXUS_MAGIC, 12)
+#define NEXUS_PORT_CREATE        _IOWR(NEXUS_MAGIC, 10, struct nexus_port_create)
+#define NEXUS_PORT_CLOSE         _IOW (NEXUS_MAGIC, 11, struct nexus_port_id)
+#define NEXUS_PORT_DELETE        _IOW (NEXUS_MAGIC, 30, struct nexus_port_id)
+#define NEXUS_PORT_READ          _IOWR(NEXUS_MAGIC, 31, struct nexus_port_read)
+#define NEXUS_PORT_WRITE         _IOW (NEXUS_MAGIC, 32, struct nexus_port_write)
+#define NEXUS_PORT_INFO          _IOWR(NEXUS_MAGIC, 33, struct nexus_port_get_info)
+#define NEXUS_PORT_MESSAGE_INFO  _IOWR(NEXUS_MAGIC, 34, struct nexus_port_get_message_info)
+#define NEXUS_SET_PORT_OWNER     _IOW (NEXUS_MAGIC, 35, struct nexus_port_set_owner)
+#define NEXUS_PORT_FIND          _IOWR(NEXUS_MAGIC, 12, struct nexus_port_find_req)
 #define NEXUS_GET_NEXT_PORT_FOR_TEAM	_IOWR(NEXUS_MAGIC, 13, struct nexus_get_next_port)
 
-#define NEXUS_SEM_CREATE			_IO(NEXUS_MAGIC, 1)
-#define NEXUS_SEM_ACQUIRE			_IO(NEXUS_MAGIC, 2)
-#define NEXUS_SEM_RELEASE			_IO(NEXUS_MAGIC, 3)
-#define NEXUS_SEM_DELETE			_IO(NEXUS_MAGIC, 4)
-#define NEXUS_SEM_COUNT				_IO(NEXUS_MAGIC, 5)
-#define NEXUS_SEM_INFO				_IO(NEXUS_MAGIC, 6)
-#define NEXUS_SEM_NEXT_INFO			_IO(NEXUS_MAGIC, 7)
+#define NEXUS_SEM_CREATE   _IOWR(NEXUS_MAGIC, 40, struct nexus_sem_create)
+#define NEXUS_SEM_ACQUIRE  _IOW (NEXUS_MAGIC, 41, struct nexus_sem_op)
+#define NEXUS_SEM_RELEASE  _IOW (NEXUS_MAGIC, 42, struct nexus_sem_op)
+#define NEXUS_SEM_DELETE   _IOW (NEXUS_MAGIC, 43, struct nexus_sem_delete_req)
+#define NEXUS_SEM_COUNT    _IOWR(NEXUS_MAGIC, 44, struct nexus_sem_count_req)
+#define NEXUS_SEM_INFO     _IOWR(NEXUS_MAGIC, 45, struct nexus_sem_info_req)
+#define NEXUS_SEM_NEXT_INFO _IOWR(NEXUS_MAGIC, 46, struct nexus_sem_next_info)
 
-//#define NEXUS_VREF_MAGIC	'V'
+#define NEXUS_VREF_MAGIC	'V'
 
-#define NEXUS_VREF_CREATE			_IO(NEXUS_MAGIC, 1)
-#define NEXUS_VREF_ACQUIRE			_IO(NEXUS_MAGIC, 2)
-#define NEXUS_VREF_ACQUIRE_FD		_IO(NEXUS_MAGIC, 3)
-#define NEXUS_VREF_OPEN				_IO(NEXUS_MAGIC, 4)
-#define NEXUS_VREF_RELEASE			_IO(NEXUS_MAGIC, 5)
+#define NEXUS_VREF_CREATE			_IO(NEXUS_VREF_MAGIC, 1)
+#define NEXUS_VREF_ACQUIRE			_IO(NEXUS_VREF_MAGIC, 2)
+#define NEXUS_VREF_ACQUIRE_FD		_IO(NEXUS_VREF_MAGIC, 3)
+#define NEXUS_VREF_OPEN				_IO(NEXUS_VREF_MAGIC, 4)
+#define NEXUS_VREF_RELEASE			_IO(NEXUS_VREF_MAGIC, 5)
+
+#ifdef __KERNEL__
+/* Team-exit notification callbacks — callable from external modules */
+typedef void (*nexus_team_notify_fn)(pid_t team);
+int  nexus_register_team_exit(nexus_team_notify_fn fn);
+void nexus_unregister_team_exit(nexus_team_notify_fn fn);
+#endif
 
 #define NEXUS_AREA_MAGIC 'A'
 
@@ -72,62 +89,97 @@ typedef s64 bigtime_t;
 /* Thread */
 
 
-enum thread_ops {
-	NEXUS_THREAD_SET_NAME = 0,
-	NEXUS_THREAD_READ,
-	NEXUS_THREAD_WRITE,
-	NEXUS_THREAD_HAS_DATA,
-	NEXUS_THREAD_WAITFOR
-};
+
 
 struct nexus_thread_spawn {
 	const char*				name;
 	thread_id				father;
 };
 
-struct nexus_thread_exchange {
-	uint32_t				op;
+struct nexus_thread_set_name_req {
+	const char*	name;
+	size_t		size;
+};
 
-	int32_t					sender;
-	int32_t					receiver;
+struct nexus_thread_rw {
+	int32_t		sender;
+	int32_t		receiver;
+	void*		buffer;
+	ssize_t		size;
+	uint32_t	flags;
+	int64_t		timeout;
+	int32_t		return_code;
+};
 
-	void*					buffer;
-	ssize_t					size;
-
-	uint32_t				flags;
-	uint64_t				timeout;
-
-	int32_t					status;
-
-	int32_t					return_code;
+struct nexus_thread_waitfor_req {
+	int32_t		receiver;
+	uint32_t	flags;
+	int64_t		timeout;
+	/* out */
+	int32_t		return_code;
 };
 
 
 /* Port */
 
 
-enum port_ops {
-	NEXUS_PORT_DELETE = 0,
-	NEXUS_PORT_CLOSE,
-	NEXUS_PORT_READ,
-	NEXUS_PORT_WRITE,
-	NEXUS_PORT_INFO,
-	NEXUS_PORT_MESSAGE_INFO,
-	NEXUS_SET_PORT_OWNER,
+
+
+struct nexus_port_create {
+	const char*		name;
+	size_t			size;		/* length of name string */
+	int32_t			capacity;
+	/* out */
+	int32_t			id;
 };
 
-struct nexus_port_exchange {
-	uint32_t				op;
-	int32_t					id;
+struct nexus_port_id {
+	int32_t			id;
+};
 
-	//
-	int32_t*				code;
-	void*					buffer;
-	size_t					size;
-	uint32_t				flags;
-	int64_t					timeout;
+struct nexus_port_read {
+	int32_t			id;
+	int32_t*		code;
+	void*			buffer;
+	size_t			size;		/* in: buf capacity, out: bytes read */
+	uint32_t		flags;
+	int64_t			timeout;
+};
 
-	int32_t					cookie;
+struct nexus_port_write {
+	int32_t			id;
+	int32_t*		code;
+	const void*		buffer;
+	size_t			size;
+	uint32_t		flags;
+	int64_t			timeout;
+};
+
+struct nexus_port_get_info {
+	int32_t			id;
+	/* out via nexus_port_info pointer */
+	struct nexus_port_info* info;
+};
+
+struct nexus_port_get_message_info {
+	int32_t			id;
+	size_t			size;
+	uint32_t		flags;
+	int64_t			timeout;
+	/* out via nexus_port_message_info pointer */
+	struct nexus_port_message_info* info;
+};
+
+struct nexus_port_set_owner {
+	int32_t			id;
+	int32_t			team;
+};
+
+struct nexus_port_find_req {
+	const char*		name;
+	size_t			size;		/* length of name string */
+	/* out */
+	int32_t			id;
 };
 
 struct nexus_port_message_info {
@@ -158,15 +210,28 @@ struct nexus_get_next_port {
 /* Sem */
 
 
-struct nexus_sem_exchange {
-	sem_id  	id;
+struct nexus_sem_create {
+	const char*	name;
+	int32_t		count;
+	/* out */
+	sem_id		id;
+};
 
-	int32_t   	count;
-	uint32_t  	flags;
-	bigtime_t 	timeout;
-	const char 	*name;
+struct nexus_sem_op {
+	sem_id		id;
+	int32_t		count;
+	uint32_t	flags;
+	bigtime_t	timeout;
+};
 
-	team_id   	team;
+struct nexus_sem_delete_req {
+	sem_id		id;
+};
+
+struct nexus_sem_count_req {
+	sem_id		id;
+	/* out */
+	int32_t		count;
 };
 
 struct nexus_sem_info {
@@ -176,6 +241,13 @@ struct nexus_sem_info {
 	char      	name[B_OS_NAME_LENGTH];
 	int32_t   	count;
 	thread_id 	latest_holder;
+};
+
+struct nexus_sem_info_req {
+	sem_id		id;
+	team_id		team;
+	/* out */
+	struct nexus_sem_info info;
 };
 
 struct nexus_sem_next_info {

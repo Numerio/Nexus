@@ -26,28 +26,22 @@ extern struct idr nexus_port_idr;
 long nexus_port_find(unsigned long arg)
 {
 	char name[B_OS_NAME_LENGTH];
+	struct nexus_port_find_req in_data;
 
-	struct nexus_port_exchange in_data;
-
-	if (copy_from_user(&in_data, (struct __user nexus_port_exchange*)arg,
+	if (copy_from_user(&in_data, (struct __user nexus_port_find_req*)arg,
 			sizeof(in_data))) {
 		return B_BAD_VALUE;
 	}
 
-	if (in_data.buffer == NULL) {
-		return B_BAD_VALUE;
-	}
-
-	if (copy_from_user(name, in_data.buffer,
+	if (copy_from_user(name, in_data.name,
 			min(in_data.size, (size_t) B_OS_NAME_LENGTH))) {
 		return B_BAD_VALUE;
 	}
 
-	in_data.id = B_ERROR;
-
 	{
 		struct nexus_port *p;
 		int pid;
+		in_data.id = B_ERROR;
 		idr_for_each_entry(&nexus_port_idr, p, pid) {
 			if (strcmp(p->name, name) == 0) {
 				in_data.id = p->id;
@@ -56,7 +50,11 @@ long nexus_port_find(unsigned long arg)
 		}
 	}
 
-	if (copy_to_user((struct __user nexus_port_exchange*)arg, &in_data,
+	if (in_data.id == B_ERROR) {
+		return B_NAME_NOT_FOUND;
+	}
+
+	if (copy_to_user((struct __user nexus_port_find_req*)arg, &in_data,
 			sizeof(in_data))) {
 		return B_BAD_VALUE;
 	}
@@ -64,25 +62,22 @@ long nexus_port_find(unsigned long arg)
 	return 0;
 }
 
-long nexus_port_init(struct nexus_team* team, unsigned long arg)
+long nexus_port_create(struct nexus_team* team, unsigned long arg)
 {
 	struct nexus_port *port = NULL;
-
 	struct nexus_port *next_port = NULL;
 	struct rb_node *parent = NULL;
 	struct rb_node **p = NULL;
+	struct nexus_port_create in_data;
 
-	struct nexus_port_exchange in_data;
-	struct nexus_port_exchange out_data;
-
-	if (copy_from_user(&in_data, (struct __user nexus_port_exchange*)arg,
+	if (copy_from_user(&in_data, (struct __user nexus_port_create*)arg,
 			sizeof(in_data))) {
 		return B_BAD_VALUE;
 	}
 
-	if (in_data.cookie < 0 || in_data.cookie > PORT_MAX_QUEUE
+	if (in_data.capacity < 0 || in_data.capacity > PORT_MAX_QUEUE
 			|| in_data.size > B_OS_NAME_LENGTH
-				|| in_data.buffer == NULL) {
+				|| in_data.name == NULL) {
 		return B_BAD_VALUE;
 	}
 
@@ -95,16 +90,17 @@ long nexus_port_init(struct nexus_team* team, unsigned long arg)
 	init_waitqueue_head(&port->buffer_read);
 	init_waitqueue_head(&port->buffer_write);
 
-	port->write_count = in_data.cookie;
+	port->write_count = in_data.capacity;
 	port->is_open = true;
 
-	port->capacity = in_data.cookie;
+	port->capacity = in_data.capacity;
 	port->team = team;
+	port->read_count = 0;
 
 	INIT_LIST_HEAD(&port->queue);
 
 	// TODO check size
-	if (copy_from_user(port->name, in_data.buffer, min(in_data.size,
+	if (copy_from_user(port->name, in_data.name, min(in_data.size,
 			(size_t)B_OS_NAME_LENGTH))) {
 		kfree(port);
 		return B_BAD_VALUE;
@@ -138,10 +134,10 @@ long nexus_port_init(struct nexus_team* team, unsigned long arg)
 	}
 	port->id = id;
 
-	out_data.id = id;
+	in_data.id = id;
 
-	if (copy_to_user((struct __user nexus_port_exchange*)arg, &out_data,
-			sizeof(out_data))) {
+	if (copy_to_user((struct __user nexus_port_create*)arg, &in_data,
+			sizeof(in_data))) {
 		return B_BAD_VALUE;
 	}
 
@@ -150,12 +146,13 @@ long nexus_port_init(struct nexus_team* team, unsigned long arg)
 
 long nexus_port_close(struct nexus_port* port)
 {
+	/* Caller holds nexus_main_lock. wake_up_interruptible is safe under
+	 * a mutex; do NOT drop the lock here — nexus_team_destroy walks the
+	 * team's port rb-tree across this call and would race with concurrent
+	 * port operations (set_owner, get_next_port, etc.) if we unlocked. */
 	port->is_open = false;
-
-	mutex_unlock(&nexus_main_lock);
 	wake_up_interruptible(&port->buffer_write);
 	wake_up_interruptible(&port->buffer_read);
-	mutex_lock(&nexus_main_lock);
 
 	return B_OK;
 }
@@ -239,6 +236,7 @@ long nexus_set_port_owner(struct nexus_port* port, pid_t target_team)
 	// TODO just like the port init we want to reduce code duplication here
 	hlist_for_each_entry(dest_team, &nexus_teams, node) {
 		if (dest_team->id == target_team) {
+			write_lock(&port->rw_lock);
 			rb_erase(&port->node, &port->team->ports);
 
 			p = &dest_team->ports.rb_node;
@@ -257,8 +255,10 @@ long nexus_set_port_owner(struct nexus_port* port, pid_t target_team)
 				rb_link_node(&port->node, parent, p);
 				rb_insert_color(&port->node, &dest_team->ports);
 				port->team = dest_team;
+				write_unlock(&port->rw_lock);
 				return B_OK;
 			}
+			write_unlock(&port->rw_lock);
 		}
 	}
 	return B_ERROR;
@@ -300,13 +300,19 @@ long nexus_port_read(struct nexus_port* port, int32_t* code, void* buffer,
 				port->read_count > 0 || port->is_open == false);
 		}
 		mutex_lock(&nexus_main_lock);
-		kref_put(&port->ref_count, nexus_port_destroy);
 
-		// Re-fetch via IDR: port may have been freed.
-		port = idr_find(&nexus_port_idr, port_id);
-		if (port == NULL) {
+		/* Re-fetch via IDR BEFORE kref_put: idr_remove happens at destroy
+		 * time, so if the kref_put would free the port we want to detect
+		 * it here without risking that the freed slot got reallocated
+		 * to a brand-new port between put and find. */
+		struct nexus_port *fresh = idr_find(&nexus_port_idr, port_id);
+		if (fresh != port) {
+			/* Port was deleted; our ref keeps the struct alive but the
+			 * id is gone or reused. Drop our ref and bail. */
+			kref_put(&port->ref_count, nexus_port_destroy);
 			return B_BAD_PORT_ID;
 		}
+		kref_put(&port->ref_count, nexus_port_destroy);
 
 		if (!port->is_open && port->read_count == 0) {
 			return B_BAD_PORT_ID;
@@ -319,8 +325,9 @@ long nexus_port_read(struct nexus_port* port, int32_t* code, void* buffer,
 
 		if (flags & B_TIMEOUT && ret == -ETIME) {
 			return B_TIMED_OUT;
-		} else  if (ret == 0 || ret == -ETIME) {
-			break;
+		} else if (ret == 0 || ret == -ETIME) {
+			if (port->read_count > 0)
+				break;
 		}
 	}
 
@@ -329,16 +336,7 @@ long nexus_port_read(struct nexus_port* port, int32_t* code, void* buffer,
 		return B_BAD_VALUE;
 	}
 
-	if (buf->size > *size) {
-		list_del(&buf->node);
-		kfree(buf->buffer);
-		kfree(buf);
-		port->read_count--;
-		port->write_count++;
-		port->total_count++;
-		wake_up_interruptible(&port->buffer_write);
-		return B_BAD_VALUE;
-	}
+	size_t bufferSize = *size;
 
 	list_del(&buf->node);
 	port->read_count--;
@@ -346,13 +344,15 @@ long nexus_port_read(struct nexus_port* port, int32_t* code, void* buffer,
 	port->total_count++;
 	wake_up_interruptible(&port->buffer_write);
 
+	size_t copySize = min(bufferSize, buf->size);
+
 	if (buf->buffer != NULL) {
-		if (copy_to_user(buffer, buf->buffer, buf->size)) {
+		if (copy_to_user(buffer, buf->buffer, copySize)) {
 			kfree(buf->buffer);
 			kfree(buf);
 			return B_BAD_VALUE;
 		}
-		*size = buf->size;
+		*size = copySize;
 	}
 
 	if (code != NULL) {
@@ -409,13 +409,13 @@ long nexus_port_write(struct nexus_port* port, int32_t* msg_code,
 				port->write_count >= 0 || port->is_open == false);
 		}
 		mutex_lock(&nexus_main_lock);
-		kref_put(&port->ref_count, nexus_port_destroy);
 
-		// Re-fetch via IDR: kref_put may have freed port if the last ref dropped.
-		port = idr_find(&nexus_port_idr, port_id);
-		if (port == NULL) {
+		struct nexus_port *fresh = idr_find(&nexus_port_idr, port_id);
+		if (fresh != port) {
+			kref_put(&port->ref_count, nexus_port_destroy);
 			return B_BAD_PORT_ID;
 		}
+		kref_put(&port->ref_count, nexus_port_destroy);
 
 		if (!port->is_open || ret == -ERESTARTSYS
 				|| ret == -ERESTARTNOHAND || ret == -ERESTARTNOINTR) {
@@ -431,7 +431,8 @@ long nexus_port_write(struct nexus_port* port, int32_t* msg_code,
 		if (flags & B_TIMEOUT && ret == -ETIME) {
 			port->write_count++;
 			return B_TIMED_OUT;
-		} else if (ret == 0) {
+		}
+		if (ret == 0 && port->write_count >= 0) {
 			break;
 		}
 	}
@@ -509,14 +510,18 @@ long nexus_port_info(struct nexus_port* port, struct nexus_port_info* info)
 		return B_BAD_PORT_ID;
 	}
 
-	if (port->team == NULL)
+	read_lock(&port->rw_lock);
+	if (port->team == NULL) {
+		read_unlock(&port->rw_lock);
 		return B_BAD_PORT_ID;
+	}
 
 	message_info.port = port->id;
 	message_info.team = port->team->id;
 	message_info.capacity = port->capacity;
 	message_info.queue_count = port->read_count;
 	message_info.total_count = port->total_count;
+	read_unlock(&port->rw_lock);
 
 	if (copy_to_user(info, &message_info, sizeof(*info))) {
 		return B_BAD_VALUE;
@@ -564,11 +569,15 @@ long nexus_port_message_info(struct nexus_port* port,
 				port->read_count > 0 || port->is_open == false);
 		}
 		mutex_lock(&nexus_main_lock);
+
+		struct nexus_port *fresh = idr_find(&nexus_port_idr, port_id);
+		if (fresh != port) {
+			kref_put(&port->ref_count, nexus_port_destroy);
+			return B_BAD_PORT_ID;
+		}
 		kref_put(&port->ref_count, nexus_port_destroy);
 
-		// Re-fetch via IDR: kref_put may have freed port if the last ref dropped.
-		port = idr_find(&nexus_port_idr, port_id);
-		if (port == NULL || (!port->is_open && port->read_count == 0)) {
+		if (!port->is_open && port->read_count == 0) {
 			return B_BAD_PORT_ID;
 		}
 
@@ -580,7 +589,8 @@ long nexus_port_message_info(struct nexus_port* port,
 		if (flags & B_TIMEOUT && ret == -ETIME) {
 			return B_TIMED_OUT;
 		} else if (ret == 0) {
-			break;
+			if (port->read_count > 0)
+				break;
 		}
 	}
 
@@ -598,75 +608,132 @@ long nexus_port_message_info(struct nexus_port* port,
 	return B_OK;
 }
 
-long nexus_port_op(struct nexus_team *team, unsigned long arg)
+long nexus_port_io_close(struct nexus_team *team, unsigned long arg)
 {
+	struct nexus_port_id data;
 	struct nexus_port *port;
-	struct nexus_port_exchange in_data;
+
+	if (copy_from_user(&data, (struct __user nexus_port_id*)arg, sizeof(data)))
+		return B_BAD_VALUE;
+	
+	port = idr_find(&nexus_port_idr, data.id);
+	if (port == NULL)
+		return B_BAD_PORT_ID;
+	
+	return nexus_port_close(port);
+}
+
+long nexus_port_io_delete(struct nexus_team *team, unsigned long arg)
+{
+	struct nexus_port_id data;
+	struct nexus_port *port;
 	long ret;
 
-	if (copy_from_user(&in_data, (struct __user nexus_port_exchange*)arg,
-			sizeof(in_data))) {
+	if (copy_from_user(&data, (struct __user nexus_port_id*)arg, sizeof(data)))
 		return B_BAD_VALUE;
-	}
-
-	port = idr_find(&nexus_port_idr, in_data.id);
-	if (port == NULL) {
+	
+	port = idr_find(&nexus_port_idr, data.id);
+	if (port == NULL)
 		return B_BAD_PORT_ID;
-	}
-
-	switch (in_data.op) {
-		case NEXUS_PORT_DELETE:
-			idr_remove(&nexus_port_idr, port->id);
-			// Zero the id so that destroy skips idr_remove
-			port->id = 0;
-			if (port->is_open)
-				nexus_port_close(port);
-
-			kref_put(&port->ref_count, nexus_port_destroy);
-			ret = B_OK;
-			break;
-
-		case NEXUS_PORT_CLOSE:
-			ret = nexus_port_close(port);
-			break;
-
-		case NEXUS_PORT_READ:
-			ret = nexus_port_read(port, in_data.code, in_data.buffer,
-				&in_data.size, in_data.flags, in_data.timeout);
-			break;
-
-		case NEXUS_PORT_WRITE:
-			ret = nexus_port_write(port, in_data.code, in_data.buffer,
-				in_data.size, in_data.flags, in_data.timeout);
-			break;
-
-		case NEXUS_PORT_MESSAGE_INFO:
-			ret = nexus_port_message_info(port,
-				(struct nexus_port_message_info*)in_data.buffer,
-					in_data.size, in_data.flags, in_data.timeout);
-			break;
-
-		case NEXUS_PORT_INFO:
-			ret = nexus_port_info(port,
-				(struct nexus_port_info*)in_data.buffer);
-			break;
-
-		case NEXUS_SET_PORT_OWNER:
-			if (port->team == NULL || port->team->id != current->tgid) {
-				ret = B_NOT_ALLOWED;
-				break;
-			}
-			ret = nexus_set_port_owner(port, in_data.cookie);
-			break;
-
-		default:
-			return B_ERROR;
-	}
-
-	if (copy_to_user((struct __user nexus_port_exchange*)arg, &in_data,
-			sizeof(in_data))) {
+	
+	idr_remove(&nexus_port_idr, port->id);
+	if (port->is_open)
+		nexus_port_close(port);
+	port->id = 0;
+	kref_put(&port->ref_count, nexus_port_destroy);
+	ret = B_OK;
+	
+	if (copy_to_user((struct __user nexus_port_id*)arg, &data, sizeof(data)))
 		return B_BAD_VALUE;
-	}
-
+	
 	return ret;
 }
+
+long nexus_port_io_read(struct nexus_team *team, unsigned long arg)
+{
+	struct nexus_port_read data;
+	struct nexus_port *port;
+	long ret;
+
+	if (copy_from_user(&data, (struct __user nexus_port_read*)arg, sizeof(data)))
+		return B_BAD_VALUE;
+
+	port = idr_find(&nexus_port_idr, data.id);
+	if (port == NULL)
+		return B_BAD_PORT_ID;
+
+	ret = nexus_port_read(port, data.code, data.buffer, &data.size, data.flags, data.timeout);
+	if (ret == B_OK) {
+		if (copy_to_user((struct __user nexus_port_read*)arg, &data, sizeof(data)))
+			return B_BAD_VALUE;
+	}
+	return ret;
+}
+
+long nexus_port_io_write(struct nexus_team *team, unsigned long arg)
+{
+	struct nexus_port_write data;
+	struct nexus_port *port;
+
+	if (copy_from_user(&data, (struct __user nexus_port_write*)arg, sizeof(data)))
+		return B_BAD_VALUE;
+	
+	port = idr_find(&nexus_port_idr, data.id);
+	if (port == NULL)
+		return B_BAD_PORT_ID;
+	
+	return nexus_port_write(port, data.code, data.buffer, data.size, data.flags, data.timeout);
+}
+
+long nexus_port_io_info(struct nexus_team *team, unsigned long arg)
+{
+	struct nexus_port_get_info data;
+	struct nexus_port *port;
+
+	if (copy_from_user(&data, (struct __user nexus_port_get_info*)arg, sizeof(data)))
+		return B_BAD_VALUE;
+	
+	port = idr_find(&nexus_port_idr, data.id);
+	if (port == NULL)
+		return B_BAD_PORT_ID;
+	
+	return nexus_port_info(port, data.info);
+}
+
+long nexus_port_io_message_info(struct nexus_team *team, unsigned long arg)
+{
+	struct nexus_port_get_message_info data;
+	struct nexus_port *port;
+
+	if (copy_from_user(&data, (struct __user nexus_port_get_message_info*)arg, sizeof(data)))
+		return B_BAD_VALUE;
+	
+	port = idr_find(&nexus_port_idr, data.id);
+	if (port == NULL)
+		return B_BAD_PORT_ID;
+	
+	return nexus_port_message_info(port, data.info, data.size, data.flags, data.timeout);
+}
+
+long nexus_port_io_set_owner(struct nexus_team *team, unsigned long arg)
+{
+	struct nexus_port_set_owner data;
+	struct nexus_port *port;
+
+	if (copy_from_user(&data, (struct __user nexus_port_set_owner*)arg, sizeof(data)))
+		return B_BAD_VALUE;
+	
+	port = idr_find(&nexus_port_idr, data.id);
+	if (port == NULL)
+		return B_BAD_PORT_ID;
+	
+	if (port->team == NULL || port->team->id != current->tgid)
+		return B_NOT_ALLOWED;
+	
+	if (nexus_set_port_owner(port, data.team) == 0)
+		return B_OK;
+	else
+		return B_ERROR;
+}
+
+

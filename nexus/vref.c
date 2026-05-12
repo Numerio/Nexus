@@ -3,22 +3,19 @@
  * Copyright (C) 2025-2026. Dario Casalinuovo
  */
 
-#include <linux/cdev.h>
 #include <linux/file.h>
+#include <linux/fs.h>
 #include <linux/idr.h>
 #include <linux/mutex.h>
 #include <linux/hashtable.h>
 #include <linux/kref.h>
+#include <linux/slab.h>
+#include <linux/uaccess.h>
 
 #include "errors.h"
 #include "nexus.h"
 #include "nexus_private.h"
-
-#define DEV_NAME "nexus_vref"
-
-static int major = -1;
-static struct cdev nexus_cdev;
-static struct class *nexus_class = NULL;
+#include "vref.h"
 
 static DEFINE_HASHTABLE(fd_hashmap, 10);
 static DEFINE_MUTEX(fd_map_lock);
@@ -34,7 +31,7 @@ static void nexus_vref_destroy(struct kref *kref) {
 	kfree(entry);
 }
 
-int32_t nexus_vref_create(int fd) {
+static int32_t nexus_vref_create(int fd) {
 	struct file *file = fget(fd);
 	if (!file) {
 		return -EBADF;
@@ -65,12 +62,13 @@ int32_t nexus_vref_create(int fd) {
 	return entry->id;
 }
 
-int nexus_vref_acquire(int32_t id) {
+static int nexus_vref_acquire(int32_t id) {
 	struct nexus_vref *entry = NULL;
 
 	mutex_lock(&fd_map_lock);
 	hash_for_each_possible(fd_hashmap, entry, node, id) {
 		if (entry->id == id) {
+			/* Bumps refcount; matched by nexus_vref_release. */
 			kref_get(&entry->ref_count);
 			entry->team = current->tgid;
 			mutex_unlock(&fd_map_lock);
@@ -81,7 +79,7 @@ int nexus_vref_acquire(int32_t id) {
 	return -EINVAL;
 }
 
-int nexus_vref_acquire_fd(int32_t id) {
+static int nexus_vref_acquire_fd(int32_t id) {
 	struct nexus_vref *entry = NULL;
 	struct hlist_node *tmp;
 
@@ -104,7 +102,7 @@ int nexus_vref_acquire_fd(int32_t id) {
 	return -EINVAL;
 }
 
-int nexus_vref_open(int32_t id) {
+static int nexus_vref_open(int32_t id) {
 	struct nexus_vref *entry = NULL;
 
 	mutex_lock(&fd_map_lock);
@@ -126,7 +124,7 @@ int nexus_vref_open(int32_t id) {
 	return B_ENTRY_NOT_FOUND;
 }
 
-long nexus_vref_release(int32_t id) {
+static long nexus_vref_release(int32_t id) {
 
 	struct nexus_vref *entry = NULL;
 	struct hlist_node *tmp = NULL;
@@ -147,10 +145,7 @@ long nexus_vref_release(int32_t id) {
 	return -EINVAL;
 }
 
-static long vref_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
-	if ((pid_t)(uintptr_t)file->private_data != current->tgid)
-		return -EPERM;
-
+long nexus_vref_ioctl(unsigned int cmd, unsigned long arg) {
 	int fd = -1;
 	int32_t id = -1;
 
@@ -164,7 +159,7 @@ static long vref_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
 			if (copy_from_user(&id, (int __user *)arg, sizeof(id)))
 				return -EFAULT;
 			return nexus_vref_acquire_fd(id);
-		
+
 		case NEXUS_VREF_ACQUIRE:
 			if (copy_from_user(&id, (int __user *)arg, sizeof(id)))
 				return -EFAULT;
@@ -181,90 +176,37 @@ static long vref_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
 			return nexus_vref_release(id);
 
 		default:
-			return -EINVAL;
+			return -ENOTTY;
 	}
 }
 
-static int vref_open(struct inode *inode, struct file *file) {
-	file->private_data = (void *)(uintptr_t)current->tgid;
+int nexus_vref_init(void)
+{
+	pr_info("nexus_vref: initialized\n");
 	return 0;
 }
 
-static int vref_release(struct inode *inode, struct file *file) {
-	pid_t team = (pid_t)(uintptr_t)file->private_data;
+void nexus_vref_exit(void)
+{
+	ida_destroy(&vref_ida);
+	pr_info("nexus_vref: cleaned up\n");
+}
+
+void nexus_vref_team_exit(pid_t team)
+{
 	struct nexus_vref *entry;
 	struct hlist_node *tmp;
 	int bkt;
 
-
 	mutex_lock(&fd_map_lock);
 	hash_for_each_safe(fd_hashmap, bkt, tmp, entry, node) {
-		if (entry->team == team) {
-			pr_debug("nexus_vref: releasing leaked vref %d for team %d\n",
+		if (entry->team == (int)team) {
+			pr_debug("nexus_vref: releasing vref %d for exiting team %d\n",
 				entry->id, team);
 			kref_put(&entry->ref_count, nexus_vref_destroy);
 		}
 	}
 	mutex_unlock(&fd_map_lock);
-
-	return 0;
 }
 
-static const struct file_operations vref_fops = {
-	.owner = THIS_MODULE,
-	.open = vref_open,
-	.release = vref_release,
-	.unlocked_ioctl = vref_ioctl,
-};
 
-static void nexus_cleanup_dev(int device_created)
-{
-	if (device_created) {
-		device_destroy(nexus_class, major);
-		cdev_del(&nexus_cdev);
-	}
-	if (nexus_class)
-		class_destroy(nexus_class);
-	if (major != -1)
-		unregister_chrdev_region(major, 1);
-}
-
-static int __init vref_init(void) {
-	int device_created = 0;
-
-	if (alloc_chrdev_region(&major, 0, 1, DEV_NAME "_proc") < 0)
-		goto error;
-
-	nexus_class = class_create(DEV_NAME "_sys");
-
-	if (nexus_class == NULL)
-		goto error;
-
-	if (device_create(nexus_class, NULL, major, NULL, DEV_NAME) == NULL)
-		goto error;
-
-	device_created = 1;
-	cdev_init(&nexus_cdev, &vref_fops);
-	if (cdev_add(&nexus_cdev, major, 1) == -1)
-		goto error;
-
-	printk(KERN_INFO "nexus_vref: module loaded\n");
-	return 0;
-
-error:
-	nexus_cleanup_dev(device_created);
-	return -1;
-}
-
-static void __exit vref_exit(void) {
-	ida_destroy(&vref_ida);
-	nexus_cleanup_dev(1);
-	printk(KERN_INFO "nexus_vref: module unloaded\n");
-}
-
-module_init(vref_init);
-module_exit(vref_exit);
-
-MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Dario Casalinuovo");
-MODULE_DESCRIPTION("Nexus reference counted file descriptor handles.");

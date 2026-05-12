@@ -15,6 +15,11 @@
 
 #include "kmsg.h"
 #include "node_monitor.h"
+#include "nexus.h"
+#include "vref.h"
+#include "query.h"
+#include "attribute.h"
+#include "index.h"
 
 #ifndef NEXUS_NM_DEBUG
 #define NEXUS_NM_DEBUG 0
@@ -351,7 +356,7 @@ static int nexus_handle_event(struct fsnotify_group *group, u32 mask,
 	LIST_HEAD(notifications);
 
 	struct listener_snapshot *snap = NULL;
-	int snap_count = 0, snap_cap = 0, i;
+	int snap_count = 0, i;
 
 #if NEXUS_NM_DEBUG
 	atomic_inc(&stat_events);
@@ -927,6 +932,12 @@ static long nexus_nm_ioctl(struct file *file, unsigned int cmd, unsigned long ar
 		return nexus_stop_watching((void __user *)arg);
 	case NEXUS_STOP_NOTIFYING:
 		return nexus_stop_notifying((void __user *)arg);
+	case NEXUS_VREF_CREATE:
+	case NEXUS_VREF_ACQUIRE:
+	case NEXUS_VREF_ACQUIRE_FD:
+	case NEXUS_VREF_OPEN:
+	case NEXUS_VREF_RELEASE:
+		return nexus_vref_ioctl(cmd, arg);
 	default:
 		nm_warn("nexus_nm_ioctl: unknown cmd=0x%x\n", cmd);
 		return -ENOTTY;
@@ -1148,6 +1159,12 @@ static int __init nexus_node_monitor_init(void)
 	if (ret < 0)
 		nm_warn("xattr tracking disabled (kprobes failed)\n");
 
+	nexus_vref_init();
+	nexus_register_team_exit(nexus_vref_team_exit);
+	nexus_query_init();
+	nexus_attr_init();
+	nexus_index_init();
+
 	nm_info("loaded successfully: /dev/%s\n", NEXUS_NODE_MONITOR_DEVICE);
 	return 0;
 }
@@ -1165,6 +1182,12 @@ static void __exit nexus_node_monitor_exit(void)
 		atomic_read(&stat_messages));
 #endif
 
+		nexus_index_exit();
+	nexus_attr_exit();
+	nexus_query_exit();
+	nexus_unregister_team_exit(nexus_vref_team_exit);
+	nexus_vref_exit();
+
 	unregister_xattr_kprobes();
 	misc_deregister(&nexus_nm_miscdev);
 	fsnotify_put_group(nexus_fsn_group);
@@ -1178,6 +1201,8 @@ static void __exit nexus_node_monitor_exit(void)
 
 	nm_info("unloaded\n");
 }
+
+
 
 module_init(nexus_node_monitor_init);
 module_exit(nexus_node_monitor_exit);

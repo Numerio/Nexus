@@ -79,6 +79,42 @@ static void nexus_thread_exit_work(struct callback_head *head)
 	mutex_unlock(&nexus_main_lock);
 }
 
+/* Team-exit callback list */
+#define NEXUS_MAX_TEAM_EXIT_CBS 8
+
+static nexus_team_notify_fn team_exit_callbacks[NEXUS_MAX_TEAM_EXIT_CBS];
+static int team_exit_cb_count = 0;
+static DEFINE_SPINLOCK(team_exit_cb_lock);
+
+int nexus_register_team_exit(nexus_team_notify_fn fn)
+{
+	unsigned long flags;
+	spin_lock_irqsave(&team_exit_cb_lock, flags);
+	if (team_exit_cb_count >= NEXUS_MAX_TEAM_EXIT_CBS) {
+		spin_unlock_irqrestore(&team_exit_cb_lock, flags);
+		return -ENOMEM;
+	}
+	team_exit_callbacks[team_exit_cb_count++] = fn;
+	spin_unlock_irqrestore(&team_exit_cb_lock, flags);
+	return 0;
+}
+EXPORT_SYMBOL(nexus_register_team_exit);
+
+void nexus_unregister_team_exit(nexus_team_notify_fn fn)
+{
+	unsigned long flags;
+	int i;
+	spin_lock_irqsave(&team_exit_cb_lock, flags);
+	for (i = 0; i < team_exit_cb_count; i++) {
+		if (team_exit_callbacks[i] == fn) {
+			team_exit_callbacks[i] = team_exit_callbacks[--team_exit_cb_count];
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&team_exit_cb_lock, flags);
+}
+EXPORT_SYMBOL(nexus_unregister_team_exit);
+
 struct nexus_team* nexus_team_init()
 {
 	struct nexus_team* team = kzalloc(sizeof(struct nexus_team), GFP_KERNEL);
@@ -102,6 +138,19 @@ struct nexus_team* nexus_team_init()
 
 void nexus_team_destroy(struct nexus_team *team)
 {
+	nexus_sem_team_exit(team->id);
+
+	int _i;
+	unsigned long _flags;
+	spin_lock_irqsave(&team_exit_cb_lock, _flags);
+	for (_i = 0; _i < team_exit_cb_count; _i++) {
+		nexus_team_notify_fn _fn = team_exit_callbacks[_i];
+		spin_unlock_irqrestore(&team_exit_cb_lock, _flags);
+		_fn(team->id);
+		spin_lock_irqsave(&team_exit_cb_lock, _flags);
+	}
+	spin_unlock_irqrestore(&team_exit_cb_lock, _flags);
+
 	pr_debug("nexus: team %d destroyed\n", team->id);
 
 	struct rb_node *node;
@@ -196,7 +245,7 @@ void nexus_thread_destroy(struct kref* ref)
 	kfree(thread);
 }
 
-struct nexus_thread* find_thread(struct nexus_team *team, const char *name) {
+static struct nexus_thread* find_thread(struct nexus_team *team, const char *name) {
 	struct nexus_thread *thread = NULL;
 	struct rb_node *parent = NULL;
 	struct rb_node **p = &team->threads.rb_node;
@@ -229,7 +278,7 @@ struct nexus_thread* find_thread(struct nexus_team *team, const char *name) {
 	return thread;
 }
 
-struct nexus_thread* find_thread_by_id(struct nexus_team *team, int32_t pid) {
+static struct nexus_thread* find_thread_by_id(struct nexus_team *team, int32_t pid) {
 	if (team->main_thread && team->main_thread->id == pid) {
 		return team->main_thread;
 	}
@@ -274,6 +323,21 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	if (team->id != current->tgid) {
 		mutex_unlock(&nexus_main_lock);
 		return -EPERM;
+	}
+
+	switch (cmd) {
+	case NEXUS_SEM_CREATE:
+	case NEXUS_SEM_ACQUIRE:
+	case NEXUS_SEM_RELEASE:
+	case NEXUS_SEM_DELETE:
+	case NEXUS_SEM_COUNT:
+	case NEXUS_SEM_INFO:
+	case NEXUS_SEM_NEXT_INFO:
+		mutex_unlock(&nexus_main_lock);
+		ret = nexus_sem_ioctl(cmd, arg);
+		return ret;
+	default:
+		break;
 	}
 
 	if (team->id == current->pid) {
@@ -367,223 +431,186 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	}
 
 	switch (cmd) {
-		case NEXUS_THREAD_OP: {
-			struct nexus_thread_exchange user_data;
-			if (copy_from_user(&user_data, (struct __user nexus_thread_exchange*)arg,
+			case NEXUS_THREAD_SET_NAME: {
+			struct nexus_thread_set_name_req user_data;
+			if (copy_from_user(&user_data, (struct __user nexus_thread_set_name_req*)arg,
+					sizeof(user_data))) {
+				ret = B_BAD_VALUE;
+				break;
+			}
+			if (strncpy_from_user(thread->name, user_data.name,
+					min(B_OS_NAME_LENGTH, user_data.size)) < 0)
+				ret = B_BAD_VALUE;
+			else
+				ret = B_OK;
+			break;
+		}
+
+		case NEXUS_THREAD_READ: {
+			struct nexus_thread_rw user_data;
+			if (copy_from_user(&user_data, (struct __user nexus_thread_rw*)arg,
+					sizeof(user_data))) {
+				ret = B_BAD_VALUE;
+				break;
+			}
+			if (thread->id != current->pid) {
+				ret = B_BAD_THREAD_ID;
+				break;
+			}
+			if (down_interruptible(&thread->sem_read)) {
+				ret = B_INTERRUPTED;
+				break;
+			}
+			mutex_unlock(&nexus_main_lock);
+			wait_event_interruptible(thread->buffer_read, thread->buffer_ready != 0);
+			mutex_lock(&nexus_main_lock);
+			if (copy_to_user(user_data.buffer, thread->buffer,
+					min(user_data.size, thread->buffer_size))) {
+				ret = B_BAD_VALUE;
+				break;
+			}
+			user_data.sender = thread->sender;
+			user_data.return_code = thread->unblock_code;
+			if (copy_to_user((struct __user nexus_thread_rw*)arg, &user_data,
+					sizeof(user_data)))
+				ret = B_BAD_VALUE;
+			kfree(thread->buffer);
+			thread->buffer = NULL;
+			thread->buffer_size = 0;
+			thread->buffer_ready = 0;
+			thread->sender = -1;
+			thread->unblock_code = -1;
+			up(&thread->sem_write);
+			ret = B_OK;
+			break;
+		}
+
+		case NEXUS_THREAD_WRITE: {
+			struct nexus_thread_rw user_data;
+			struct nexus_team *iter_team = NULL;
+			struct nexus_thread *dest_thread = NULL;
+			if (copy_from_user(&user_data, (struct __user nexus_thread_rw*)arg,
+					sizeof(user_data))) {
+				ret = B_BAD_VALUE;
+				break;
+			}
+			struct task_struct *task = get_pid_task(find_get_pid(
+				(pid_t)user_data.receiver), PIDTYPE_PID);
+			if (task == NULL) { ret = B_BAD_THREAD_ID; break; }
+			hlist_for_each_entry(iter_team, &nexus_teams, node) {
+				if (task->pid == iter_team->id) {
+					dest_thread = iter_team->main_thread; break;
+				} else if (task->tgid == iter_team->id) {
+					dest_thread = find_thread_by_id(iter_team, user_data.receiver);
+					if (dest_thread == NULL) { put_task_struct(task); ret = B_BAD_THREAD_ID; goto exit; }
+					break;
+				}
+			}
+			if (dest_thread == NULL) { put_task_struct(task); ret = B_BAD_THREAD_ID; break; }
+			kref_get(&dest_thread->ref_count);
+			mutex_unlock(&nexus_main_lock);
+			int sem_ret = down_interruptible(&dest_thread->sem_write);
+			mutex_lock(&nexus_main_lock);
+			if (kref_put(&dest_thread->ref_count, nexus_thread_destroy)) {
+				put_task_struct(task); ret = B_BAD_THREAD_ID; break;
+			}
+			if (sem_ret) {
+				put_task_struct(task);
+				ret = B_INTERRUPTED;
+				break;
+			}
+			dest_thread->buffer = kzalloc(user_data.size, GFP_KERNEL);
+			if (dest_thread->buffer == NULL) { put_task_struct(task); ret = B_NO_MEMORY; break; }
+			if (copy_from_user(dest_thread->buffer, user_data.buffer, user_data.size)) {
+				kfree(dest_thread->buffer);
+				dest_thread->buffer = NULL;
+				put_task_struct(task);
+				ret = B_BAD_VALUE;
+				break;
+			}
+			dest_thread->sender = current->pid;
+			dest_thread->buffer_size = user_data.size;
+			dest_thread->buffer_ready = 1;
+			dest_thread->unblock_code = user_data.return_code;
+			wake_up_interruptible(&dest_thread->buffer_read);
+			up(&dest_thread->sem_read);
+			put_task_struct(task);
+			ret = B_OK;
+			break;
+		}
+
+		case NEXUS_THREAD_HAS_DATA: {
+			struct nexus_thread_rw user_data;
+			struct nexus_team *iter_team = NULL;
+			struct nexus_thread *dest_thread = NULL;
+			if (copy_from_user(&user_data, (struct __user nexus_thread_rw*)arg,
+					sizeof(user_data))) {
+				ret = B_BAD_VALUE;
+				break;
+			}
+			struct task_struct *task = get_pid_task(find_get_pid(
+				(pid_t)user_data.receiver), PIDTYPE_PID);
+			if (task == NULL) { ret = B_BAD_THREAD_ID; break; }
+			hlist_for_each_entry(iter_team, &nexus_teams, node) {
+				if (task->pid == iter_team->id) {
+					dest_thread = iter_team->main_thread; break;
+				} else if (task->tgid == iter_team->id) {
+					dest_thread = find_thread_by_id(iter_team, user_data.receiver);
+					if (dest_thread == NULL) { put_task_struct(task); ret = B_BAD_THREAD_ID; goto exit; }
+					break;
+				}
+			}
+			put_task_struct(task);
+			if (dest_thread == NULL) { ret = B_BAD_THREAD_ID; break; }
+			ret = (dest_thread->buffer_ready == 1) ? B_OK : B_WOULD_BLOCK;
+			break;
+		}
+
+		case NEXUS_THREAD_WAITFOR: {
+			struct nexus_thread_waitfor_req user_data;
+			if (copy_from_user(&user_data, (struct __user nexus_thread_waitfor_req*)arg,
 					sizeof(user_data))) {
 				ret = B_BAD_VALUE;
 				break;
 			}
 
-			int32_t user_ret = B_OK;
-
-			if (user_data.op == NEXUS_THREAD_READ) {
-				if (thread->id != current->pid) {
-					ret = B_BAD_THREAD_ID;
-					goto exit;
-				}
-
-				down_interruptible(&thread->sem_read);
-
-				mutex_unlock(&nexus_main_lock);
-				wait_event_interruptible(thread->buffer_read, thread->buffer_ready != 0);
-				mutex_lock(&nexus_main_lock);
-				if (copy_to_user(user_data.buffer, thread->buffer,
-						min(user_data.size, thread->buffer_size))) {
-					ret = B_BAD_VALUE;
-					goto exit;
-				}
-
-				user_data.sender = thread->sender;
-				user_ret = thread->unblock_code;
-
-				kfree(thread->buffer);
-				thread->buffer = NULL;
-				thread->buffer_size = 0;
-				thread->buffer_ready = 0;
-				thread->sender = -1;
-				thread->unblock_code = -1;
-
-				up(&thread->sem_write);
-			} else if (user_data.op == NEXUS_THREAD_WRITE) {
-				struct nexus_team *iter_team = NULL;
-				struct nexus_thread *dest_thread = NULL;
-
-				struct task_struct* task = get_pid_task(find_get_pid(
-					(pid_t)user_data.receiver),PIDTYPE_PID);
-				if (task == NULL) {
-					ret = B_BAD_THREAD_ID;
-					goto exit;
-				}
-
-				hlist_for_each_entry(iter_team, &nexus_teams, node) {
-					if (task->pid == iter_team->id) {
-						dest_thread = iter_team->main_thread;
-						break;
-					} else if (task->tgid == iter_team->id) {
-						dest_thread = find_thread_by_id(iter_team, user_data.receiver);
-						if (dest_thread == NULL) {
-							put_task_struct(task);
-							ret = B_BAD_THREAD_ID;
-							goto exit;
-						}
-						break;
-					}
-				}
-
-				if (dest_thread == NULL) {
-					put_task_struct(task);
-					ret = B_BAD_THREAD_ID;
-					goto exit;
-				}
-
-				kref_get(&dest_thread->ref_count);
-				mutex_unlock(&nexus_main_lock);
-				// if -1 release the process then -ERESTARTSYS
-				down_interruptible(&dest_thread->sem_write);
-				mutex_lock(&nexus_main_lock);
-				if (kref_put(&dest_thread->ref_count, nexus_thread_destroy)) {
-					put_task_struct(task);
-					ret = B_BAD_THREAD_ID;
-					goto exit;
-				}
-
-				dest_thread->buffer = kzalloc(user_data.size, GFP_KERNEL);
-				if (dest_thread->buffer == NULL) {
-					put_task_struct(task);
-					ret = B_NO_MEMORY;
-					goto exit;
-				}
-
-				if (copy_from_user(dest_thread->buffer, user_data.buffer,
-						user_data.size)) {
-					put_task_struct(task);
-					ret = B_BAD_VALUE;
-					goto exit;
-				}
-
-				dest_thread->sender = current->pid;
-
-				dest_thread->buffer_size = user_data.size;
-				dest_thread->buffer_ready = 1;
-				dest_thread->unblock_code = user_data.return_code;
-
-				wake_up_interruptible(&dest_thread->buffer_read);
-				up(&dest_thread->sem_read);
-
-				put_task_struct(task);
-
-			} else if (user_data.op == NEXUS_THREAD_HAS_DATA) {
-				struct nexus_team *iter_team = NULL;
-				struct nexus_thread *dest_thread = NULL;
-
-				struct task_struct* task = get_pid_task(find_get_pid(
-					(pid_t)user_data.receiver),PIDTYPE_PID);
-				if (task == NULL) {
-					ret = B_BAD_THREAD_ID;
-					goto exit;
-				}
-
-				hlist_for_each_entry(iter_team, &nexus_teams, node) {
-					if (task->pid == iter_team->id) {
-						dest_thread = iter_team->main_thread;
-						break;
-					} else if (task->tgid == iter_team->id) {
-						dest_thread = find_thread_by_id(iter_team, user_data.receiver);
-						if (dest_thread == NULL) {
-							put_task_struct(task);
-							ret = B_BAD_THREAD_ID;
-							goto exit;
-						}
-						break;
-					}
-				}
-
-				if (dest_thread == NULL) {
-					put_task_struct(task);
-					ret = B_BAD_THREAD_ID;
-					goto exit;
-				}
-
-				if (dest_thread->buffer_ready != 1) {
-					put_task_struct(task);
-					ret = B_WOULD_BLOCK;
-					goto exit;
-				}
-
-				put_task_struct(task);
-			} else if (user_data.op == NEXUS_THREAD_SET_NAME) {
-				if (strncpy_from_user(thread->name, user_data.buffer,
-						min(B_OS_NAME_LENGTH, user_data.size)) < 0) {
-					ret = B_BAD_VALUE;
-					goto exit;
-				}
-			} else if (user_data.op == NEXUS_THREAD_WAITFOR) {
-				struct nexus_team *team;
-				struct nexus_thread *dest_thread = NULL;
-				struct task_struct* task = get_pid_task(find_get_pid(
-					(pid_t)user_data.receiver), PIDTYPE_PID);
-
-				if (task == NULL) {
-					ret = B_BAD_THREAD_ID;
-					goto exit;
-				}
-				if (task->mm != current->mm) {
-					put_task_struct(task);
-					ret = B_BAD_THREAD_ID;
-					goto exit;
-				}
-
-				hlist_for_each_entry(team, &nexus_teams, node) {
-					if (task->pid == team->id) {
-						dest_thread = team->main_thread;
-						break;
-					} else if (task->tgid == team->id) {
-						dest_thread = find_thread_by_id(team, user_data.receiver);
-						break;
-					}
-				}
-
-				if (dest_thread == NULL) {
-					put_task_struct(task);
-					ret = B_BAD_THREAD_ID;
-					goto exit;
-				}
-
-				// Cache exit status while we're still alive.
-				int32_t exit_status = dest_thread->exit_status;
-
-				if (!dest_thread->has_thread_exited) {
-					int wret;
-
-					kref_get(&dest_thread->ref_count);
-					mutex_unlock(&nexus_main_lock);
-					wret = wait_event_interruptible(dest_thread->thread_exit,
-						dest_thread->has_thread_exited);
-					mutex_lock(&nexus_main_lock);
-
-					if (wret == -ERESTARTSYS) {
-						kref_put(&dest_thread->ref_count, nexus_thread_destroy);
-						put_task_struct(task);
-						ret = B_INTERRUPTED;
-						goto exit;
-					}
-					exit_status = dest_thread->exit_status;
-					kref_put(&dest_thread->ref_count, nexus_thread_destroy);
-				}
-
-				user_data.return_code = exit_status;
-				user_ret = B_OK;
-
-				put_task_struct(task);
-			}
-
-			if (copy_to_user((struct __user nexus_thread_exchange*)arg, &user_data,
-					sizeof(user_data))) {
-				ret = B_BAD_VALUE;
+			// Can't wait for yourself.
+			if ((pid_t)user_data.receiver == current->pid) {
+				ret = -EDEADLK;
 				break;
 			}
-			ret = user_ret;
+			struct nexus_team *wf_team;
+			struct nexus_thread *dest_thread = NULL;
+			struct task_struct *task = get_pid_task(find_get_pid(
+				(pid_t)user_data.receiver), PIDTYPE_PID);
+			if (task == NULL) { ret = B_BAD_THREAD_ID; break; }
+			if (task->mm != current->mm) { put_task_struct(task); ret = B_BAD_THREAD_ID; break; }
+			hlist_for_each_entry(wf_team, &nexus_teams, node) {
+				if (task->pid == wf_team->id) {
+					dest_thread = wf_team->main_thread; break;
+				} else if (task->tgid == wf_team->id) {
+					dest_thread = find_thread_by_id(wf_team, user_data.receiver); break;
+				}
+			}
+			put_task_struct(task);
+			if (dest_thread == NULL) { ret = B_BAD_THREAD_ID; break; }
+			kref_get(&dest_thread->ref_count);
+			mutex_unlock(&nexus_main_lock);
+			int wret = wait_event_interruptible(dest_thread->thread_exit,
+				dest_thread->has_thread_exited);
+			mutex_lock(&nexus_main_lock);
+			if (wret == -ERESTARTSYS) {
+				kref_put(&dest_thread->ref_count, nexus_thread_destroy);
+				ret = B_INTERRUPTED;
+				break;
+			}
+			user_data.return_code = dest_thread->exit_status;
+			if (copy_to_user((struct __user nexus_thread_waitfor_req*)arg, &user_data,
+					sizeof(user_data)))
+				ret = B_BAD_VALUE;
+			else
+				ret = B_OK;
+			kref_put(&dest_thread->ref_count, nexus_thread_destroy);
 			break;
 		}
 
@@ -710,11 +737,29 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			break;
 
 		case NEXUS_PORT_CREATE:
-			ret = nexus_port_init(team, arg);
+			ret = nexus_port_create(team, arg);
 			break;
 
-		case NEXUS_PORT_OP:
-			ret = nexus_port_op(team, arg);
+			case NEXUS_PORT_CLOSE:
+			ret = nexus_port_io_close(team, arg);
+			break;
+		case NEXUS_PORT_DELETE:
+			ret = nexus_port_io_delete(team, arg);
+			break;
+		case NEXUS_PORT_READ:
+			ret = nexus_port_io_read(team, arg);
+			break;
+		case NEXUS_PORT_WRITE:
+			ret = nexus_port_io_write(team, arg);
+			break;
+		case NEXUS_PORT_INFO:
+			ret = nexus_port_io_info(team, arg);
+			break;
+		case NEXUS_PORT_MESSAGE_INFO:
+			ret = nexus_port_io_message_info(team, arg);
+			break;
+		case NEXUS_SET_PORT_OWNER:
+			ret = nexus_port_io_set_owner(team, arg);
 			break;
 
 		case NEXUS_PORT_FIND:
@@ -759,7 +804,6 @@ static int nexus_open(struct inode *nodp, struct file *filp)
 
 static int nexus_release(struct inode *nodp, struct file *filp)
 {
-	struct nexus_team *team = filp->private_data;
 	mutex_lock(&nexus_main_lock);
 	nexus_team_destroy((struct nexus_team*)filp->private_data);
 	mutex_unlock(&nexus_main_lock);
@@ -814,19 +858,28 @@ static int nexus_init(void)
 	if (cdev_add(&nexus_cdev, major, 1) == -1)
 		goto error;
 
+	int ret = nexus_sem_init();
+	if (ret < 0) {
+		pr_err("nexus: failed to init sem: %d\n", ret);
+		goto error;
+	}
+
 	printk(KERN_INFO "nexus: loaded\n");
 	return 0;
 
 error:
 	nexus_cleanup_dev(device_created);
-	return -1;
+	return ret < 0 ? ret : -ENOMEM;
 }
 
 static void nexus_exit(void)
 {
+	nexus_sem_exit();
 	nexus_cleanup_dev(1);
 	printk(KERN_INFO "nexus: unloaded\n");
 }
+
+
 
 module_init(nexus_init);
 module_exit(nexus_exit);

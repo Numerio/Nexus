@@ -1,5 +1,6 @@
-nexus-objs := nexus_core.o port.o
-obj-m := nexus.o sem.o vref.o area.o node_monitor.o
+nexus-objs := nexus_core.o port.o sem.o
+nexus_node_monitor-objs := node_monitor.o vref.o query.o attribute.o index.o
+obj-m := nexus.o area.o nexus_node_monitor.o
 
 KERNEL_SRC  ?= /lib/modules/$(shell uname -r)/build
 
@@ -14,6 +15,8 @@ default: $(PWD)/Makefile
 
 install:
 	cp build/nexus.ko $(DESTDIR)/
+	cp build/area.ko $(DESTDIR)/
+	cp build/nexus_node_monitor.ko $(DESTDIR)/
 
 clean:
 	rm -rf deps.h *.o *.ko *.mod.c *.symvers *.order .*.cmd .tmp_versions *.mod *.o .*.o .*.d
