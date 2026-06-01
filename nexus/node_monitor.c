@@ -12,6 +12,10 @@
 #include <linux/hashtable.h>
 #include <linux/kprobes.h>
 #include <linux/xattr.h>
+#include <linux/mount.h>
+#include <linux/dcache.h>
+#include <linux/cred.h>
+#include <linux/fs.h>
 
 #include "kmsg.h"
 #include "node_monitor.h"
@@ -20,6 +24,7 @@
 #include "query.h"
 #include "attribute.h"
 #include "index.h"
+#include "volume.h"
 
 #ifndef NEXUS_NM_DEBUG
 #define NEXUS_NM_DEBUG 0
@@ -66,7 +71,7 @@
 #endif
 
 #if NEXUS_NM_DEBUG_EVENTS
-static const char *fsn_mask_str(u32 mask)
+static const char *fsn_mask_str(uint32_t mask)
 {
 	static char buf[256];
 	buf[0] = '\0';
@@ -129,6 +134,9 @@ struct nexus_mark {
 	bool modified;
 
 	struct hlist_node hash_node;
+
+	int32_t          vref_id;
+	struct vfsmount *mnt_stored;
 };
 
 struct pending_move {
@@ -148,6 +156,69 @@ static DEFINE_SPINLOCK(move_lock);
 static DEFINE_HASHTABLE(marks_hash, MARK_HASH_BITS);
 static DEFINE_SPINLOCK(marks_hash_lock);
 
+#define PROBE_SUPPRESS_BITS 6
+
+struct probe_suppress_entry {
+	struct hlist_node  node;
+	struct task_struct *task;
+};
+
+static DEFINE_HASHTABLE(probe_suppress, PROBE_SUPPRESS_BITS);
+static DEFINE_SPINLOCK(probe_suppress_lock);
+
+bool nexus_probe_is_suppressed(void)
+{
+	struct probe_suppress_entry *e;
+	unsigned long flags;
+	bool found = false;
+
+	spin_lock_irqsave(&probe_suppress_lock, flags);
+	hash_for_each_possible(probe_suppress, e, node,
+		(unsigned long)current) {
+		if (e->task == current) {
+			found = true;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&probe_suppress_lock, flags);
+	return found;
+}
+
+void nexus_probe_suppress_enter(void)
+{
+	struct probe_suppress_entry *e;
+	unsigned long flags;
+
+	e = kmalloc(sizeof(*e), GFP_KERNEL);
+	if (!e) {
+		nm_warn("probe_suppress_enter: alloc failed for task %d\n",
+			task_pid_nr(current));
+		return;
+	}
+	e->task = current;
+
+	spin_lock_irqsave(&probe_suppress_lock, flags);
+	hash_add(probe_suppress, &e->node, (unsigned long)current);
+	spin_unlock_irqrestore(&probe_suppress_lock, flags);
+}
+
+void nexus_probe_suppress_exit(void)
+{
+	struct probe_suppress_entry *e;
+	unsigned long flags;
+
+	spin_lock_irqsave(&probe_suppress_lock, flags);
+	hash_for_each_possible(probe_suppress, e, node,
+		(unsigned long)current) {
+		if (e->task == current) {
+			hash_del(&e->node);
+			kfree(e);
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&probe_suppress_lock, flags);
+}
+
 #if NEXUS_NM_DEBUG
 static atomic_t stat_watches = ATOMIC_INIT(0);
 static atomic_t stat_events = ATOMIC_INIT(0);
@@ -159,9 +230,9 @@ static inline struct nexus_mark *get_nexus_mark(struct fsnotify_mark *fs_mark)
 	return container_of(fs_mark, struct nexus_mark, fs_mark);
 }
 
-static inline u32 hash_dev_ino(dev_t dev, ino_t ino)
+static inline uint32_t hash_dev_ino(dev_t dev, ino_t ino)
 {
-	return hash_32((u32)dev ^ (u32)(ino >> 32) ^ (u32)ino, MARK_HASH_BITS);
+	return hash_32((uint32_t)dev ^ (uint32_t)(ino >> 32) ^ (uint32_t)ino, MARK_HASH_BITS);
 }
 
 /*
@@ -249,19 +320,25 @@ static void send_to_listener(struct nexus_listener *listener,
 }
 
 static void notify_attr_changed(struct nexus_listener *listener, dev_t device,
-	ino_t node, const char *attr, int cause)
+	int32_t node_vref_id, int32_t dir_vref_id, const char *attr, int cause)
 {
 	char buf[KMSG_BUFFER_SIZE];
 	struct kmsg_builder msg;
+	int64_t sentinel = (int64_t)nexus_volume_sentinel_dev();
 
-	nm_dbg_msg("notify_attr_changed: dev=%u node=%lu attr='%s' cause=%d\n",
-		(unsigned)device, (unsigned long)node,
+	nm_dbg_msg("notify_attr_changed: dev=%u node_vref=%d dir_vref=%d "
+		"attr='%s' cause=%d\n",
+		(unsigned)device, node_vref_id, dir_vref_id,
 		attr ? attr : "(null)", cause);
 
 	kmsg_init(&msg, buf, sizeof(buf), B_NODE_MONITOR);
 	kmsg_add_int32(&msg, "opcode", B_ATTR_CHANGED);
 	kmsg_add_int64(&msg, "device", (int64_t)device);
-	kmsg_add_int64(&msg, "node", node);
+	kmsg_add_noderef(&msg, "virtual:node", sentinel, (int64_t)node_vref_id);
+
+	if (dir_vref_id >= 0)
+		kmsg_add_entryref(&msg, "virtual:directory", sentinel,
+			(int64_t)dir_vref_id, "");
 	if (attr && attr[0])
 		kmsg_add_string(&msg, "attr", attr);
 	kmsg_add_int32(&msg, "cause", cause);
@@ -305,31 +382,38 @@ static void nexus_mark_free(struct fsnotify_mark *fs_mark)
 	struct nexus_mark *mark = get_nexus_mark(fs_mark);
 	struct nexus_listener *listener, *tmp;
 
-	nm_dbg("nexus_mark_free: dev=%u ino=%lu\n",
-		(unsigned)mark->device, (unsigned long)mark->inode);
+	nm_dbg("nexus_mark_free: dev=%u ino=%lu vref_id=%d\n",
+		(unsigned)mark->device, (unsigned long)mark->inode,
+		mark->vref_id);
 
-	{
-		unsigned long flags;
-		nm_dbg_lock("nexus_mark_free: acquiring marks_hash_lock\n");
-		spin_lock_irqsave(&marks_hash_lock, flags);
-		hlist_del_init(&mark->hash_node);
-		spin_unlock_irqrestore(&marks_hash_lock, flags);
-	}
+	unsigned long flags;
+	nm_dbg_lock("nexus_mark_free: acquiring marks_hash_lock\n");
+	spin_lock_irqsave(&marks_hash_lock, flags);
+	hlist_del_init(&mark->hash_node);
+	spin_unlock_irqrestore(&marks_hash_lock, flags);
 
-	{
-		unsigned long lflags;
-		spin_lock_irqsave(&mark->lock, lflags);
-		list_for_each_entry_safe(listener, tmp, &mark->listeners, list) {
-			nm_dbg("nexus_mark_free: freeing listener port=%d token=%u\n",
-				listener->port, listener->token);
-			list_del(&listener->list);
-			kfree(listener);
+	unsigned long lflags;
+	spin_lock_irqsave(&mark->lock, lflags);
+	list_for_each_entry_safe(listener, tmp, &mark->listeners, list) {
+		nm_dbg("nexus_mark_free: freeing listener port=%d token=%u\n",
+			listener->port, listener->token);
+		list_del(&listener->list);
+		kfree(listener);
 #if NEXUS_NM_DEBUG
-			atomic_dec(&stat_watches);
+		atomic_dec(&stat_watches);
 #endif
-		}
-		spin_unlock_irqrestore(&mark->lock, lflags);
 	}
+	spin_unlock_irqrestore(&mark->lock, lflags);
+
+	// Release the mnt reference taken at start_watching time.
+	if (mark->mnt_stored) {
+		mntput(mark->mnt_stored);
+		mark->mnt_stored = NULL;
+	}
+
+	// Linearize release
+	mark->vref_id = -1;
+
 	kfree(mark);
 }
 
@@ -339,10 +423,50 @@ static void nexus_freeing_mark(struct fsnotify_mark *mark,
 	nm_dbg("nexus_freeing_mark called\n");
 }
 
+static int32_t nm_vref_from_inode(struct inode *inode, struct vfsmount *mnt)
+{
+	struct dentry *dentry;
+	struct path p;
+	struct file *f;
+	int32_t vref_id = -1;
 
-static int nexus_handle_event(struct fsnotify_group *group, u32 mask,
+	if (!inode || !mnt)
+		return -1;
+
+	dentry = d_find_alias(inode);
+	if (!dentry) {
+		nm_dbg("nm_vref_from_inode: d_find_alias returned NULL for ino=%lu\n",
+			(unsigned long)inode->i_ino);
+		return -1;
+	}
+
+	p.dentry = dentry;
+	p.mnt    = mnt;
+
+	// TODO(permissions): gate by watcher team's access rights once Vitruvian
+	// has a permissions model. Today kernel cred bypasses checks.
+	f = dentry_open(&p, O_PATH | O_NOFOLLOW, current_cred());
+	if (IS_ERR(f)) {
+		nm_dbg("nm_vref_from_inode: dentry_open failed (%ld) for ino=%lu\n",
+			PTR_ERR(f), (unsigned long)inode->i_ino);
+		dput(dentry);
+		return -1;
+	}
+
+	vref_id = nexus_vref_create_from_file(f);
+	fput(f);
+	dput(dentry);
+
+	if (vref_id < 0)
+		nm_dbg("nm_vref_from_inode: nexus_vref_create_from_file failed for ino=%lu\n",
+			(unsigned long)inode->i_ino);
+
+	return vref_id;
+}
+
+static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 	const void *data, int data_type, struct inode *dir,
-	const struct qstr *file_name, u32 cookie,
+	const struct qstr *file_name, uint32_t cookie,
 	struct fsnotify_iter_info *iter_info)
 {
 	struct fsnotify_mark *fs_mark;
@@ -350,10 +474,11 @@ static int nexus_handle_event(struct fsnotify_group *group, u32 mask,
 	struct inode *inode = NULL;
 	const char *name;
 	dev_t device;
-	ino_t ino, dir_ino;
+	ino_t ino;
 	unsigned long flags;
 	int type;
 	LIST_HEAD(notifications);
+	int64_t sentinel;
 
 	struct listener_snapshot *snap = NULL;
 	int snap_count = 0, i;
@@ -382,14 +507,19 @@ static int nexus_handle_event(struct fsnotify_group *group, u32 mask,
 
 	device = inode->i_sb->s_dev;
 	ino = inode->i_ino;
-	dir_ino = dir ? dir->i_ino : ino;
 
 	nm_dbg_event("nexus_handle_event: mask=%s dev=%u ino=%lu dir_ino=%lu "
 		"name='%s' cookie=%u\n",
 		fsn_mask_str(mask), (unsigned)device, (unsigned long)ino,
-		(unsigned long)dir_ino, name, cookie);
+		(unsigned long)(dir ? dir->i_ino : ino), name, cookie);
+
+	sentinel = (int64_t)nexus_volume_sentinel_dev();
 
 	for (type = 0; type < FSNOTIFY_ITER_TYPE_COUNT; type++) {
+		int32_t node_vref_id = -1;
+		int32_t dir_vref_id  = -1;
+		bool dir_vref_tried = false;
+
 		fs_mark = iter_info->marks[type];
 		if (!fs_mark)
 			continue;
@@ -397,19 +527,16 @@ static int nexus_handle_event(struct fsnotify_group *group, u32 mask,
 			continue;
 
 		mark = get_nexus_mark(fs_mark);
+		node_vref_id = mark->vref_id;
 
 		nm_dbg_lock("nexus_handle_event: acquiring mark->lock\n");
 
-		// Hold the lock for count+alloc+copy atomically so listeners
-		// cannot be added or removed between the count and the copy
 		snap_count = 0;
 		snap = NULL;
 		spin_lock_irqsave(&mark->lock, flags);
-		{
-			struct nexus_listener *l;
-			list_for_each_entry(l, &mark->listeners, list)
-				snap_count++;
-		}
+		struct nexus_listener *l;
+		list_for_each_entry(l, &mark->listeners, list)
+			snap_count++;
 
 		if (snap_count == 0) {
 			spin_unlock_irqrestore(&mark->lock, flags);
@@ -424,19 +551,16 @@ static int nexus_handle_event(struct fsnotify_group *group, u32 mask,
 		}
 
 		i = 0;
-		{
-			struct nexus_listener *l;
-			list_for_each_entry(l, &mark->listeners, list) {
-				snap[i].port = l->port;
-				snap[i].token = l->token;
-				snap[i].flags = l->flags;
-				i++;
-			}
+		l = NULL;
+		list_for_each_entry(l, &mark->listeners, list) {
+			snap[i].port = l->port;
+			snap[i].token = l->token;
+			snap[i].flags = l->flags;
+			i++;
 		}
 		spin_unlock_irqrestore(&mark->lock, flags);
 		snap_count = i;
 
-		// We don't want to hold locks here
 		for (i = 0; i < snap_count; i++) {
 			port_id port = snap[i].port;
 			uint32_t token = snap[i].token;
@@ -448,11 +572,28 @@ static int nexus_handle_event(struct fsnotify_group *group, u32 mask,
 			if ((mask & FS_CREATE) && (lflags & B_WATCH_DIRECTORY)) {
 				char buf[KMSG_BUFFER_SIZE];
 				struct kmsg_builder msg;
+
+				if (!dir_vref_tried && dir && mark->mnt_stored) {
+					dir_vref_id = nm_vref_from_inode(dir,
+						mark->mnt_stored);
+					dir_vref_tried = true;
+					if (dir_vref_id < 0)
+						nm_dbg("handle_event CREATE: "
+							"parent vref unavailable, "
+							"virtual:directory omitted\n");
+				}
+
 				kmsg_init(&msg, buf, sizeof(buf), B_NODE_MONITOR);
 				kmsg_add_int32(&msg, "opcode", B_ENTRY_CREATED);
 				kmsg_add_int64(&msg, "device", (int64_t)device);
-				kmsg_add_int64(&msg, "directory", dir_ino);
-				kmsg_add_int64(&msg, "node", ino);
+
+				if (dir_vref_id >= 0)
+					kmsg_add_entryref(&msg, "virtual:directory",
+						sentinel, (int64_t)dir_vref_id, name);
+
+				if (node_vref_id >= 0)
+					kmsg_add_noderef(&msg, "virtual:node",
+						sentinel, (int64_t)node_vref_id);
 				if (name && name[0])
 					kmsg_add_string(&msg, "name", name);
 				queue_notification(&notifications, &msg, port, token);
@@ -461,11 +602,26 @@ static int nexus_handle_event(struct fsnotify_group *group, u32 mask,
 			if ((mask & FS_DELETE) && (lflags & B_WATCH_DIRECTORY)) {
 				char buf[KMSG_BUFFER_SIZE];
 				struct kmsg_builder msg;
+
+				if (!dir_vref_tried && dir && mark->mnt_stored) {
+					dir_vref_id = nm_vref_from_inode(dir,
+						mark->mnt_stored);
+					dir_vref_tried = true;
+					if (dir_vref_id < 0)
+						nm_dbg("handle_event DELETE: "
+							"parent vref unavailable, "
+							"virtual:directory omitted\n");
+				}
+
 				kmsg_init(&msg, buf, sizeof(buf), B_NODE_MONITOR);
 				kmsg_add_int32(&msg, "opcode", B_ENTRY_REMOVED);
 				kmsg_add_int64(&msg, "device", (int64_t)device);
-				kmsg_add_int64(&msg, "directory", dir_ino);
-				kmsg_add_int64(&msg, "node", ino);
+				if (dir_vref_id >= 0)
+					kmsg_add_entryref(&msg, "virtual:directory",
+						sentinel, (int64_t)dir_vref_id, name);
+				if (node_vref_id >= 0)
+					kmsg_add_noderef(&msg, "virtual:node",
+						sentinel, (int64_t)node_vref_id);
 				if (name && name[0])
 					kmsg_add_string(&msg, "name", name);
 				queue_notification(&notifications, &msg, port, token);
@@ -482,9 +638,10 @@ static int nexus_handle_event(struct fsnotify_group *group, u32 mask,
 				if (pm) {
 					pm->cookie = cookie;
 					pm->device = device;
-					pm->old_dir = dir_ino;
+					pm->old_dir = dir ? dir->i_ino : ino;
 					pm->inode = ino;
-					pm->expires = jiffies + msecs_to_jiffies(MOVE_TIMEOUT_MS);
+					pm->expires = jiffies +
+						msecs_to_jiffies(MOVE_TIMEOUT_MS);
 					strscpy(pm->old_name, name, NAME_MAX);
 					list_add(&pm->list, &pending_moves);
 				}
@@ -494,27 +651,51 @@ static int nexus_handle_event(struct fsnotify_group *group, u32 mask,
 			if ((mask & FS_MOVED_TO) && (lflags & B_WATCH_NAME)) {
 				struct pending_move *pm;
 				unsigned long mflags;
-				ino_t from_dir = dir_ino;
+				ino_t from_dir_ino = dir ? dir->i_ino : ino;
 				char old_name[NAME_MAX] = "";
 				char buf[KMSG_BUFFER_SIZE];
 				struct kmsg_builder msg;
+				int32_t to_dir_vref_id  = -1;
+				int32_t from_dir_vref_id = -1;
 
 				spin_lock_irqsave(&move_lock, mflags);
 				pm = find_pending_move(cookie);
 				if (pm) {
-					from_dir = pm->old_dir;
+					from_dir_ino = pm->old_dir;
 					strscpy(old_name, pm->old_name, NAME_MAX);
 					list_del(&pm->list);
 					kfree(pm);
 				}
 				spin_unlock_irqrestore(&move_lock, mflags);
 
+				if (!dir_vref_tried && dir && mark->mnt_stored) {
+					dir_vref_id = nm_vref_from_inode(dir,
+						mark->mnt_stored);
+					dir_vref_tried = true;
+				}
+				to_dir_vref_id = dir_vref_id;
+
+				nm_dbg("handle_event MOVED_TO: from_dir vref unavailable "
+					"(only ino=%lu stored), virtual:from directory "
+					"will use sentinel+ino fallback\n",
+					(unsigned long)from_dir_ino);
+
+				from_dir_vref_id = (int32_t)from_dir_ino;
+
 				kmsg_init(&msg, buf, sizeof(buf), B_NODE_MONITOR);
 				kmsg_add_int32(&msg, "opcode", B_ENTRY_MOVED);
 				kmsg_add_int64(&msg, "device", (int64_t)device);
-				kmsg_add_int64(&msg, "from directory", from_dir);
-				kmsg_add_int64(&msg, "to directory", dir_ino);
-				kmsg_add_int64(&msg, "node", ino);
+
+				kmsg_add_int64(&msg, "node device", (int64_t)device);
+				kmsg_add_entryref(&msg, "virtual:from directory",
+					sentinel, (int64_t)from_dir_vref_id,
+					old_name[0] ? old_name : "");
+				if (to_dir_vref_id >= 0)
+					kmsg_add_entryref(&msg, "virtual:to directory",
+						sentinel, (int64_t)to_dir_vref_id, name);
+				if (node_vref_id >= 0)
+					kmsg_add_noderef(&msg, "virtual:node",
+						sentinel, (int64_t)node_vref_id);
 				if (name && name[0])
 					kmsg_add_string(&msg, "name", name);
 				if (old_name[0])
@@ -529,7 +710,9 @@ static int nexus_handle_event(struct fsnotify_group *group, u32 mask,
 				kmsg_init(&msg, buf, sizeof(buf), B_NODE_MONITOR);
 				kmsg_add_int32(&msg, "opcode", B_STAT_CHANGED);
 				kmsg_add_int64(&msg, "device", (int64_t)device);
-				kmsg_add_int64(&msg, "node", ino);
+				if (node_vref_id >= 0)
+					kmsg_add_noderef(&msg, "virtual:node",
+						sentinel, (int64_t)node_vref_id);
 				kmsg_add_int32(&msg, "fields",
 					B_STAT_SIZE | B_STAT_MODIFICATION_TIME);
 				if (interim)
@@ -543,19 +726,37 @@ static int nexus_handle_event(struct fsnotify_group *group, u32 mask,
 				kmsg_init(&msg, buf, sizeof(buf), B_NODE_MONITOR);
 				kmsg_add_int32(&msg, "opcode", B_STAT_CHANGED);
 				kmsg_add_int64(&msg, "device", (int64_t)device);
-				kmsg_add_int64(&msg, "node", ino);
+				if (node_vref_id >= 0)
+					kmsg_add_noderef(&msg, "virtual:node",
+						sentinel, (int64_t)node_vref_id);
 				kmsg_add_int32(&msg, "fields",
-					B_STAT_MODE | B_STAT_UID | B_STAT_GID | B_STAT_CHANGE_TIME);
+					B_STAT_MODE | B_STAT_UID | B_STAT_GID |
+					B_STAT_CHANGE_TIME);
 				queue_notification(&notifications, &msg, port, token);
 			}
 
 			if ((mask & FS_ATTRIB) && (lflags & B_WATCH_ATTR)) {
 				char buf[KMSG_BUFFER_SIZE];
 				struct kmsg_builder msg;
+
+				if (!dir_vref_tried && dir && mark->mnt_stored) {
+					dir_vref_id = nm_vref_from_inode(dir,
+						mark->mnt_stored);
+					dir_vref_tried = true;
+					if (dir_vref_id < 0)
+						nm_dbg("handle_event ATTRIB: "
+							"parent vref unavailable\n");
+				}
+
 				kmsg_init(&msg, buf, sizeof(buf), B_NODE_MONITOR);
 				kmsg_add_int32(&msg, "opcode", B_ATTR_CHANGED);
 				kmsg_add_int64(&msg, "device", (int64_t)device);
-				kmsg_add_int64(&msg, "node", ino);
+				if (node_vref_id >= 0)
+					kmsg_add_noderef(&msg, "virtual:node",
+						sentinel, (int64_t)node_vref_id);
+				if (dir_vref_id >= 0)
+					kmsg_add_entryref(&msg, "virtual:directory",
+						sentinel, (int64_t)dir_vref_id, "");
 				kmsg_add_int32(&msg, "cause", B_ATTR_CAUSE_CHANGED);
 				queue_notification(&notifications, &msg, port, token);
 			}
@@ -563,6 +764,138 @@ static int nexus_handle_event(struct fsnotify_group *group, u32 mask,
 
 		kfree(snap);
 		snap = NULL;
+
+		if (dir) {
+			struct nexus_mark *parent_mark;
+			uint32_t phash = hash_dev_ino(device, dir->i_ino);
+			struct nexus_mark *pm_iter;
+			unsigned long hlflags;
+
+			parent_mark = NULL;
+			spin_lock_irqsave(&marks_hash_lock, hlflags);
+			hlist_for_each_entry(pm_iter, &marks_hash[phash], hash_node) {
+				if (pm_iter->device == device &&
+				    pm_iter->inode == dir->i_ino) {
+					parent_mark = pm_iter;
+					break;
+				}
+			}
+			spin_unlock_irqrestore(&marks_hash_lock, hlflags);
+
+			if (parent_mark) {
+				struct listener_snapshot *psnap = NULL;
+				int psnap_count = 0, pi;
+
+				spin_lock_irqsave(&parent_mark->lock, hlflags);
+				{
+					struct nexus_listener *l;
+					list_for_each_entry(l,
+						&parent_mark->listeners, list)
+						psnap_count++;
+				}
+
+				if (psnap_count > 0) {
+					psnap = kmalloc_array(psnap_count,
+						sizeof(*psnap), GFP_ATOMIC);
+					if (psnap) {
+						struct nexus_listener *l;
+						pi = 0;
+						list_for_each_entry(l,
+							&parent_mark->listeners,
+							list) {
+							psnap[pi].port = l->port;
+							psnap[pi].token = l->token;
+							psnap[pi].flags = l->flags;
+							pi++;
+						}
+						psnap_count = pi;
+					}
+				}
+				spin_unlock_irqrestore(&parent_mark->lock, hlflags);
+
+				for (pi = 0; psnap && pi < psnap_count; pi++) {
+					uint32_t pflags = psnap[pi].flags;
+
+					if (!(pflags & B_WATCH_CHILDREN))
+						continue;
+
+					if ((mask & FS_CREATE) &&
+					    (pflags & B_WATCH_DIRECTORY)) {
+						char buf2[KMSG_BUFFER_SIZE];
+						struct kmsg_builder msg2;
+						int32_t pdvref = -1;
+
+						if (parent_mark->mnt_stored)
+							pdvref = nm_vref_from_inode(
+								dir,
+								parent_mark->mnt_stored);
+						kmsg_init(&msg2, buf2,
+							sizeof(buf2), B_NODE_MONITOR);
+						kmsg_add_int32(&msg2, "opcode",
+							B_ENTRY_CREATED);
+						kmsg_add_int64(&msg2, "device",
+							(int64_t)device);
+						if (pdvref >= 0)
+							kmsg_add_entryref(&msg2,
+								"virtual:directory",
+								sentinel,
+								(int64_t)pdvref,
+								name);
+						if (node_vref_id >= 0)
+							kmsg_add_noderef(&msg2,
+								"virtual:node",
+								sentinel,
+								(int64_t)node_vref_id);
+						if (name && name[0])
+							kmsg_add_string(&msg2, "name",
+								name);
+						queue_notification(&notifications,
+							&msg2, psnap[pi].port,
+							psnap[pi].token);
+					}
+
+					if ((mask & FS_DELETE) &&
+					    (pflags & B_WATCH_DIRECTORY)) {
+						char buf2[KMSG_BUFFER_SIZE];
+						struct kmsg_builder msg2;
+						int32_t pdvref = -1;
+
+						if (parent_mark->mnt_stored)
+							pdvref = nm_vref_from_inode(
+								dir,
+								parent_mark->mnt_stored);
+						kmsg_init(&msg2, buf2,
+							sizeof(buf2), B_NODE_MONITOR);
+						kmsg_add_int32(&msg2, "opcode",
+							B_ENTRY_REMOVED);
+						kmsg_add_int64(&msg2, "device",
+							(int64_t)device);
+						if (pdvref >= 0)
+							kmsg_add_entryref(&msg2,
+								"virtual:directory",
+								sentinel,
+								(int64_t)pdvref,
+								name);
+						if (node_vref_id >= 0)
+							kmsg_add_noderef(&msg2,
+								"virtual:node",
+								sentinel,
+								(int64_t)node_vref_id);
+						if (name && name[0])
+							kmsg_add_string(&msg2, "name",
+								name);
+						queue_notification(&notifications,
+							&msg2, psnap[pi].port,
+							psnap[pi].token);
+					}
+				}
+
+				kfree(psnap);
+			}
+		} else {
+			nm_dbg("nexus_handle_event: dir=NULL, "
+				"B_WATCH_CHILDREN walk skipped\n");
+		}
 	}
 
 	send_queued_notifications(&notifications);
@@ -605,6 +938,8 @@ static struct nexus_mark *find_or_create_mark(struct inode *inode)
 	mark->device = inode->i_sb->s_dev;
 	mark->inode = inode->i_ino;
 	mark->is_dir = S_ISDIR(inode->i_mode);
+	mark->vref_id = -1;
+	mark->mnt_stored = NULL;
 
 	nm_dbg("find_or_create_mark: creating new mark dev=%u ino=%lu is_dir=%d\n",
 		(unsigned)mark->device, (unsigned long)mark->inode, mark->is_dir);
@@ -616,14 +951,12 @@ static struct nexus_mark *find_or_create_mark(struct inode *inode)
 		return ERR_PTR(ret);
 	}
 
-	{
-		unsigned long flags;
-		u32 hash = hash_dev_ino(mark->device, mark->inode);
-		nm_dbg_lock("find_or_create_mark: acquiring marks_hash_lock\n");
-		spin_lock_irqsave(&marks_hash_lock, flags);
-		hlist_add_head(&mark->hash_node, &marks_hash[hash]);
-		spin_unlock_irqrestore(&marks_hash_lock, flags);
-	}
+	unsigned long flags;
+	uint32_t hash = hash_dev_ino(mark->device, mark->inode);
+	nm_dbg_lock("find_or_create_mark: acquiring marks_hash_lock\n");
+	spin_lock_irqsave(&marks_hash_lock, flags);
+	hlist_add_head(&mark->hash_node, &marks_hash[hash]);
+	spin_unlock_irqrestore(&marks_hash_lock, flags);
 
 	return mark;
 }
@@ -732,6 +1065,25 @@ static int nexus_start_watching(struct nexus_watch_fd __user *exchange)
 	listener->port = req.port;
 	listener->token = req.token;
 	listener->flags = req.flags;
+
+	if (mark->vref_id < 0) {
+		int32_t vref = nexus_vref_create_from_file(file);
+		if (vref < 0) {
+			nm_warn("nexus_start_watching: vref creation failed for fd=%d "
+				"(vref_id will be -1, virtual:node unavailable)\n",
+				req.fd);
+		} else {
+			mark->vref_id = vref;
+			nm_dbg("nexus_start_watching: created vref_id=%d for ino=%lu\n",
+				vref, (unsigned long)inode->i_ino);
+		}
+	}
+
+	if (!mark->mnt_stored && file->f_path.mnt) {
+		mark->mnt_stored = mntget(file->f_path.mnt);
+		nm_dbg("nexus_start_watching: stored mnt %p for ino=%lu\n",
+			mark->mnt_stored, (unsigned long)inode->i_ino);
+	}
 
 	nm_dbg_lock("nexus_start_watching: acquiring mark->lock\n");
 	spin_lock_irqsave(&mark->lock, flags);
@@ -938,6 +1290,30 @@ static long nexus_nm_ioctl(struct file *file, unsigned int cmd, unsigned long ar
 	case NEXUS_VREF_OPEN:
 	case NEXUS_VREF_RELEASE:
 		return nexus_vref_ioctl(cmd, arg);
+	case NEXUS_QUERY_VOLUME_FLAGS:
+		return nexus_volume_ioctl_query_flags(arg);
+	case NEXUS_ATTR_DIR_OPEN:
+		return nexus_attr_ioctl_dir_open(arg);
+	case NEXUS_ATTR_READ:
+		return nexus_attr_ioctl_read(arg);
+	case NEXUS_ATTR_WRITE:
+		return nexus_attr_ioctl_write(arg);
+	case NEXUS_ATTR_STAT:
+		return nexus_attr_ioctl_stat(arg);
+	case NEXUS_ATTR_REMOVE:
+		return nexus_attr_ioctl_remove(arg);
+	case NEXUS_ATTR_RENAME:
+		return nexus_attr_ioctl_rename(arg);
+	case NEXUS_INDEX_DIR_OPEN:
+		return nexus_index_ioctl_dir_open(arg);
+	case NEXUS_INDEX_CREATE:
+		return nexus_index_ioctl_create(arg);
+	case NEXUS_INDEX_REMOVE:
+		return nexus_index_ioctl_remove(arg);
+	case NEXUS_INDEX_STAT:
+		return nexus_index_ioctl_stat(arg);
+	case NEXUS_QUERY_OPEN:
+		return nexus_query_ioctl_open(arg);
 	default:
 		nm_warn("nexus_nm_ioctl: unknown cmd=0x%x\n", cmd);
 		return -ENOTTY;
@@ -957,6 +1333,12 @@ static struct miscdevice nexus_nm_miscdev = {
 	.name = NEXUS_NODE_MONITOR_DEVICE,
 	.fops = &nexus_nm_fops,
 };
+
+uint64_t nexus_node_monitor_dev(void)
+{
+	return nexus_nm_miscdev.this_device
+		? (uint64_t)nexus_nm_miscdev.this_device->devt : 0;
+}
 
 struct xattr_probe_data {
 	struct inode *inode;
@@ -983,6 +1365,14 @@ static void notify_xattr_change(struct inode *inode, const char *name, int cause
 	nm_dbg("notify_xattr_change: ino=%lu name='%s' cause=%d\n",
 		(unsigned long)inode->i_ino, name ? name : "(null)", cause);
 
+	// Only user.beos.* xattrs are visible
+	if (!name)
+		return;
+	static const char kBeosPrefix[] = "user.beos.";
+	if (strncmp(name, kBeosPrefix, sizeof(kBeosPrefix) - 1) != 0)
+		return;
+	const char *stripped_name = name + sizeof(kBeosPrefix) - 1;
+
 	fs_mark = fsnotify_find_mark(&inode->i_fsnotify_marks,
 		FSNOTIFY_OBJ_TYPE_INODE, nexus_fsn_group);
 	if (!fs_mark)
@@ -990,15 +1380,129 @@ static void notify_xattr_change(struct inode *inode, const char *name, int cause
 
 	mark = get_nexus_mark(fs_mark);
 
+	struct listener_snapshot *snap = NULL;
+	int snap_count = 0, i = 0;
+	int32_t node_vref_id;
+	dev_t device;
+
 	nm_dbg_lock("notify_xattr_change: acquiring mark->lock\n");
 	spin_lock_irqsave(&mark->lock, flags);
-
-	list_for_each_entry(listener, &mark->listeners, list) {
+	node_vref_id = mark->vref_id;
+	device = mark->device;
+	list_for_each_entry(listener, &mark->listeners, list)
 		if (listener->flags & B_WATCH_ATTR)
-			notify_attr_changed(listener, mark->device, mark->inode, name, cause);
+			snap_count++;
+	if (snap_count > 0) {
+		snap = kmalloc_array(snap_count, sizeof(*snap), GFP_ATOMIC);
+		if (snap) {
+			list_for_each_entry(listener, &mark->listeners, list) {
+				if (listener->flags & B_WATCH_ATTR) {
+					snap[i].port  = listener->port;
+					snap[i].token = listener->token;
+					snap[i].flags = listener->flags;
+					i++;
+				}
+			}
+			snap_count = i;
+		} else {
+			snap_count = 0;
+		}
+	}
+	spin_unlock_irqrestore(&mark->lock, flags);
+
+	for (i = 0; i < snap_count; i++) {
+		struct nexus_listener tmp_listener = {
+			.port  = snap[i].port,
+			.token = snap[i].token,
+			.flags = snap[i].flags,
+		};
+		notify_attr_changed(&tmp_listener, device,
+			node_vref_id, -1, stripped_name, cause);
+	}
+	kfree(snap);
+
+	fsnotify_put_mark(fs_mark);
+}
+
+void nexus_emit_attr_changed(struct file *file, const char *attr, int cause)
+{
+	struct inode *inode;
+	struct fsnotify_mark *fs_mark;
+	struct nexus_mark *mark;
+	struct nexus_listener *listener;
+	unsigned long flags;
+	int32_t node_vref_id = -1;
+	int32_t dir_vref_id  = -1;
+
+	if (!file || !attr)
+		return;
+
+	inode = file_inode(file);
+	if (!inode)
+		return;
+
+	nm_dbg("nexus_emit_attr_changed: ino=%lu attr='%s' cause=%d\n",
+		(unsigned long)inode->i_ino, attr, cause);
+
+	fs_mark = fsnotify_find_mark(&inode->i_fsnotify_marks,
+		FSNOTIFY_OBJ_TYPE_INODE, nexus_fsn_group);
+	if (!fs_mark)
+		return;
+
+	mark = get_nexus_mark(fs_mark);
+
+	node_vref_id = mark->vref_id;
+	if (mark->mnt_stored) {
+		struct dentry *dentry = d_find_alias(inode);
+		if (dentry) {
+			struct dentry *parent = dget_parent(dentry);
+			if (parent && parent != dentry)
+				dir_vref_id = nm_vref_from_inode(d_inode(parent),
+								 mark->mnt_stored);
+			dput(parent);
+			dput(dentry);
+		}
 	}
 
+	struct listener_snapshot *snap = NULL;
+	int snap_count = 0, i = 0;
+	dev_t device = mark->device;
+
+	nm_dbg_lock("nexus_emit_attr_changed: acquiring mark->lock\n");
+	spin_lock_irqsave(&mark->lock, flags);
+	list_for_each_entry(listener, &mark->listeners, list)
+		if (listener->flags & B_WATCH_ATTR)
+			snap_count++;
+	if (snap_count > 0) {
+		snap = kmalloc_array(snap_count, sizeof(*snap), GFP_ATOMIC);
+		if (snap) {
+			list_for_each_entry(listener, &mark->listeners, list) {
+				if (listener->flags & B_WATCH_ATTR) {
+					snap[i].port  = listener->port;
+					snap[i].token = listener->token;
+					snap[i].flags = listener->flags;
+					i++;
+				}
+			}
+			snap_count = i;
+		} else {
+			snap_count = 0;
+		}
+	}
 	spin_unlock_irqrestore(&mark->lock, flags);
+
+	for (i = 0; i < snap_count; i++) {
+		struct nexus_listener tmp_listener = {
+			.port  = snap[i].port,
+			.token = snap[i].token,
+			.flags = snap[i].flags,
+		};
+		notify_attr_changed(&tmp_listener, device,
+				    node_vref_id, dir_vref_id,
+				    attr, cause);
+	}
+	kfree(snap);
+
 	fsnotify_put_mark(fs_mark);
 }
 
@@ -1039,6 +1543,12 @@ static int setxattr_ret_handler(struct kretprobe_instance *ri, struct pt_regs *r
 	long ret = regs_return_value(regs);
 
 	nm_dbg("setxattr_ret_handler: ret=%ld\n", ret);
+
+	if (nexus_probe_is_suppressed()) {
+		nm_dbg("setxattr_ret_handler: suppressed, skipping\n");
+		data->inode = NULL;
+		return 0;
+	}
 
 	if (ret == 0 && data->inode && data->name[0])
 		notify_xattr_change(data->inode, data->name, data->cause);
@@ -1083,6 +1593,12 @@ static int removexattr_ret_handler(struct kretprobe_instance *ri, struct pt_regs
 	long ret = regs_return_value(regs);
 
 	nm_dbg("removexattr_ret_handler: ret=%ld\n", ret);
+
+	if (nexus_probe_is_suppressed()) {
+		nm_dbg("removexattr_ret_handler: suppressed, skipping\n");
+		data->inode = NULL;
+		return 0;
+	}
 
 	if (ret == 0 && data->inode && data->name[0])
 		notify_xattr_change(data->inode, data->name, B_ATTR_CAUSE_REMOVED);
@@ -1159,6 +1675,7 @@ static int __init nexus_node_monitor_init(void)
 	if (ret < 0)
 		nm_warn("xattr tracking disabled (kprobes failed)\n");
 
+	nexus_volume_init();
 	nexus_vref_init();
 	nexus_register_team_exit(nexus_vref_team_exit);
 	nexus_query_init();
@@ -1187,6 +1704,7 @@ static void __exit nexus_node_monitor_exit(void)
 	nexus_query_exit();
 	nexus_unregister_team_exit(nexus_vref_team_exit);
 	nexus_vref_exit();
+	nexus_volume_exit();
 
 	unregister_xattr_kprobes();
 	misc_deregister(&nexus_nm_miscdev);
@@ -1202,12 +1720,10 @@ static void __exit nexus_node_monitor_exit(void)
 	nm_info("unloaded\n");
 }
 
-
-
 module_init(nexus_node_monitor_init);
 module_exit(nexus_node_monitor_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Dario Casalinuovo");
 MODULE_DESCRIPTION("Nexus node monitor");
-MODULE_VERSION("0.5");
+MODULE_VERSION("0.9");
