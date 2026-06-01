@@ -76,14 +76,16 @@ static long nexus_area_create(struct nexus_area_create __user *arg)
 	area = kzalloc(sizeof(*area), GFP_KERNEL);
 	if (!area) {
 		fput(file);
-		return B_NO_MEMORY;
+		create.ret = B_NO_MEMORY;
+		goto out_copy;
 	}
 
 	int id = ida_alloc_min(&area_ida, 1, GFP_KERNEL);
 	if (id < 0) {
 		fput(file);
 		kfree(area);
-		return B_NO_MEMORY;
+		create.ret = B_NO_MEMORY;
+		goto out_copy;
 	}
 
 	mutex_lock(&area_lock);
@@ -105,11 +107,13 @@ static long nexus_area_create(struct nexus_area_create __user *arg)
 			 area->id, area->name, (unsigned long long)area->size);
 
 	create.area = area->id;
+	create.ret = B_OK;
 
+out_copy:
 	if (copy_to_user(arg, &create, sizeof(create)))
 		return -EFAULT;
 
-	return B_OK;
+	return 0;
 }
 
 static long nexus_area_clone(struct nexus_area_clone __user *arg)
@@ -126,19 +130,30 @@ static long nexus_area_clone(struct nexus_area_clone __user *arg)
 	source = find_area_by_id(clone.source);
 	if (!source) {
 		mutex_unlock(&area_lock);
-		return B_BAD_VALUE;
+		clone.ret = B_BAD_VALUE;
+		goto out_copy;
 	}
 
 	if (source->team != current->tgid
 			&& !(source->protection & B_CLONEABLE_AREA)) {
 		mutex_unlock(&area_lock);
-		return B_NOT_ALLOWED;
+		clone.ret = B_NOT_ALLOWED;
+		goto out_copy;
 	}
 
 	area = kzalloc(sizeof(*area), GFP_KERNEL);
 	if (!area) {
 		mutex_unlock(&area_lock);
-		return B_NO_MEMORY;
+		clone.ret = B_NO_MEMORY;
+		goto out_copy;
+	}
+
+	fd = get_unused_fd_flags(O_RDWR | O_CLOEXEC);
+	if (fd < 0) {
+		kfree(area);
+		mutex_unlock(&area_lock);
+		clone.ret = B_NO_MEMORY;
+		goto out_copy;
 	}
 
 	int id = ida_alloc_min(&area_ida, 1, GFP_KERNEL);
@@ -146,14 +161,8 @@ static long nexus_area_clone(struct nexus_area_clone __user *arg)
 		put_unused_fd(fd);
 		kfree(area);
 		mutex_unlock(&area_lock);
-		return B_NO_MEMORY;
-	}
-
-	fd = get_unused_fd_flags(O_RDWR | O_CLOEXEC);
-	if (fd < 0) {
-		kfree(area);
-		mutex_unlock(&area_lock);
-		return B_NO_MEMORY;
+		clone.ret = B_NO_MEMORY;
+		goto out_copy;
 	}
 	kref_init(&area->ref_count);
 	area->id = id;
@@ -174,6 +183,7 @@ static long nexus_area_clone(struct nexus_area_clone __user *arg)
 	clone.area = area->id;
 	clone.fd = fd;
 	clone.size = source_size;
+	clone.ret = B_OK;
 
 	if (copy_to_user(arg, &clone, sizeof(clone))) {
 		put_unused_fd(fd);
@@ -186,8 +196,13 @@ static long nexus_area_clone(struct nexus_area_clone __user *arg)
 	hash_add(area_hashmap, &area->node, area->id);
 	mutex_unlock(&area_lock);
 
-	fd_install(fd, source->file);
-	return B_OK;
+	fd_install(fd, get_file(source->file));
+	return 0;
+
+out_copy:
+	if (copy_to_user(arg, &clone, sizeof(clone)))
+		return -EFAULT;
+	return 0;
 }
 
 static long nexus_area_delete(struct nexus_area_delete __user *arg)
@@ -203,20 +218,21 @@ static long nexus_area_delete(struct nexus_area_delete __user *arg)
 	area = find_area_by_id(del.area);
 	if (!area) {
 		mutex_unlock(&area_lock);
-		return B_BAD_VALUE;
-	}
-
-	if (area->team != current->tgid) {
+		del.ret = B_BAD_VALUE;
+	} else if (area->team != current->tgid) {
 		mutex_unlock(&area_lock);
-		return B_NOT_ALLOWED;
+		del.ret = B_NOT_ALLOWED;
+	} else {
+		hash_del(&area->node);
+		kref_put(&area->ref_count, nexus_area_destroy);
+		mutex_unlock(&area_lock);
+		del.ret = B_OK;
 	}
 
-	hash_del(&area->node);
-	kref_put(&area->ref_count, nexus_area_destroy);
+	if (copy_to_user(arg, &del, sizeof(del)))
+		return -EFAULT;
 
-	mutex_unlock(&area_lock);
-
-	return B_OK;
+	return 0;
 }
 
 static long nexus_area_find(struct nexus_area_find __user *arg)
@@ -233,19 +249,19 @@ static long nexus_area_find(struct nexus_area_find __user *arg)
 
 	area = find_area_by_name(find.name);
 	if (!area) {
-		mutex_unlock(&area_lock);
-		return B_NAME_NOT_FOUND;
+		find.ret = B_NAME_NOT_FOUND;
+	} else {
+		find.area = area->id;
+		find.size = area->size;
+		find.ret = B_OK;
 	}
-
-	find.area = area->id;
-	find.size = area->size;
 
 	mutex_unlock(&area_lock);
 
 	if (copy_to_user(arg, &find, sizeof(find)))
 		return -EFAULT;
 
-	return B_OK;
+	return 0;
 }
 
 static long nexus_area_get_info(struct nexus_area_get_info __user *arg)
@@ -260,22 +276,22 @@ static long nexus_area_get_info(struct nexus_area_get_info __user *arg)
 
 	area = find_area_by_id(info.area);
 	if (!area) {
-		mutex_unlock(&area_lock);
-		return B_BAD_VALUE;
+		info.ret = B_BAD_VALUE;
+	} else {
+		strscpy(info.name, area->name, B_OS_NAME_LENGTH);
+		info.size = area->size;
+		info.lock = area->lock;
+		info.protection = area->protection;
+		info.team = area->team;
+		info.ret = B_OK;
 	}
-
-	strscpy(info.name, area->name, B_OS_NAME_LENGTH);
-	info.size = area->size;
-	info.lock = area->lock;
-	info.protection = area->protection;
-	info.team = area->team;
 
 	mutex_unlock(&area_lock);
 
 	if (copy_to_user(arg, &info, sizeof(info)))
 		return -EFAULT;
 
-	return B_OK;
+	return 0;
 }
 
 static long nexus_area_transfer(struct nexus_area_transfer __user *arg)
@@ -289,8 +305,10 @@ static long nexus_area_transfer(struct nexus_area_transfer __user *arg)
 
 	// Check the target process is alive
 	struct pid *target_pid = find_get_pid(tr.target);
-	if (!target_pid)
-		return B_BAD_TEAM_ID;
+	if (!target_pid) {
+		tr.ret = B_BAD_TEAM_ID;
+		goto out_copy;
+	}
 	put_pid(target_pid);
 
 	mutex_lock(&area_lock);
@@ -298,25 +316,29 @@ static long nexus_area_transfer(struct nexus_area_transfer __user *arg)
 	source = find_area_by_id(tr.area);
 	if (!source) {
 		mutex_unlock(&area_lock);
-		return B_BAD_VALUE;
+		tr.ret = B_BAD_VALUE;
+		goto out_copy;
 	}
 
 	if (source->team != current->tgid) {
 		mutex_unlock(&area_lock);
-		return B_NOT_ALLOWED;
+		tr.ret = B_NOT_ALLOWED;
+		goto out_copy;
 	}
 
 	file = get_file(source->file);
 	if (!file) {
 		mutex_unlock(&area_lock);
-		return B_ERROR;
+		tr.ret = B_ERROR;
+		goto out_copy;
 	}
 
 	target_area = kzalloc(sizeof(*target_area), GFP_KERNEL);
 	if (!target_area) {
 		fput(file);
 		mutex_unlock(&area_lock);
-		return B_NO_MEMORY;
+		tr.ret = B_NO_MEMORY;
+		goto out_copy;
 	}
 
 	int id = ida_alloc_min(&area_ida, 1, GFP_KERNEL);
@@ -324,7 +346,8 @@ static long nexus_area_transfer(struct nexus_area_transfer __user *arg)
 		fput(file);
 		kfree(target_area);
 		mutex_unlock(&area_lock);
-		return B_NO_MEMORY;
+		tr.ret = B_NO_MEMORY;
+		goto out_copy;
 	}
 
 	kref_init(&target_area->ref_count);
@@ -347,11 +370,13 @@ static long nexus_area_transfer(struct nexus_area_transfer __user *arg)
 		tr.area, target_area->id, tr.target);
 
 	tr.new_area = target_area->id;
+	tr.ret = B_OK;
 
+out_copy:
 	if (copy_to_user(arg, &tr, sizeof(tr)))
 		return -EFAULT;
 
-	return B_OK;
+	return 0;
 }
 
 static long nexus_area_resize(struct nexus_area_resize __user *arg)
@@ -366,20 +391,20 @@ static long nexus_area_resize(struct nexus_area_resize __user *arg)
 
 	area = find_area_by_id(resize.area);
 	if (!area) {
-		mutex_unlock(&area_lock);
-		return B_BAD_VALUE;
+		resize.ret = B_BAD_VALUE;
+	} else if (area->team != current->tgid) {
+		resize.ret = B_NOT_ALLOWED;
+	} else {
+		area->size = resize.new_size;
+		resize.ret = B_OK;
 	}
-
-	if (area->team != current->tgid) {
-		mutex_unlock(&area_lock);
-		return B_NOT_ALLOWED;
-	}
-
-	area->size = resize.new_size;
 
 	mutex_unlock(&area_lock);
 
-	return B_OK;
+	if (copy_to_user(arg, &resize, sizeof(resize)))
+		return -EFAULT;
+
+	return 0;
 }
 
 static long nexus_area_set_protection(struct nexus_area_set_protection __user *arg)
@@ -394,20 +419,20 @@ static long nexus_area_set_protection(struct nexus_area_set_protection __user *a
 
 	area = find_area_by_id(prot.area);
 	if (!area) {
-		mutex_unlock(&area_lock);
-		return B_BAD_VALUE;
+		prot.ret = B_BAD_VALUE;
+	} else if (area->team != current->tgid) {
+		prot.ret = B_NOT_ALLOWED;
+	} else {
+		area->protection = prot.protection;
+		prot.ret = B_OK;
 	}
-
-	if (area->team != current->tgid) {
-		mutex_unlock(&area_lock);
-		return B_NOT_ALLOWED;
-	}
-
-	area->protection = prot.protection;
 
 	mutex_unlock(&area_lock);
 
-	return B_OK;
+	if (copy_to_user(arg, &prot, sizeof(prot)))
+		return -EFAULT;
+
+	return 0;
 }
 
 static long area_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
