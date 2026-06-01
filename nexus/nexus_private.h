@@ -41,6 +41,7 @@ struct nexus_thread;
 struct nexus_team {
 	struct hlist_node		node;
 	team_id					id;
+	int						open_count;
 
 	struct rb_root			threads;
 	struct rb_root			ports;
@@ -51,7 +52,7 @@ struct nexus_team {
 struct nexus_thread {
 	struct rb_node			node;
 	struct kref				ref_count;
-	struct callback_head	exit_work;		// passive exit detection via task_work
+	struct callback_head	exit_work;
 
 	thread_id				id;
 
@@ -60,7 +61,7 @@ struct nexus_thread {
 	bool					thread_resumed;
 	bool					thread_wait_newborn;
 	bool					has_thread_exited;
-	bool					has_return_code;	// set by NEXUS_THREAD_SET_RETURN_CODE
+	bool					has_return_code;
 
 	thread_id				child_thread;
 
@@ -145,7 +146,6 @@ struct nexus_sem {
 	struct hlist_node   	team_node;
 };
 
-// nexus_team_sem_list
 struct team_sem_list {
 	team_id             	team;
 
@@ -161,8 +161,8 @@ struct nexus_area {
 	char					name[B_OS_NAME_LENGTH];
 	struct file				*file;
 	size_t					size;
-	s32						lock;
-	s32		              	protection;
+	int32_t					lock;
+	int32_t		            protection;
 	pid_t					team;
 
 	struct kref				ref_count;
