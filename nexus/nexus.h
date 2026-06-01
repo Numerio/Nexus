@@ -15,14 +15,14 @@
 
 #define B_OS_NAME_LENGTH 32
 
-typedef s32 status_t;
-typedef s32 port_id;
-typedef s32 area_id;
-typedef s32 sem_id;
-typedef s32 vref_id;
+typedef int32_t status_t;
+typedef int32_t port_id;
+typedef int32_t area_id;
+typedef int32_t sem_id;
+typedef int32_t vref_id;
 typedef pid_t team_id;
 typedef pid_t thread_id;
-typedef s64 bigtime_t;
+typedef int64_t bigtime_t;
 
 #endif
 
@@ -40,20 +40,20 @@ typedef s64 bigtime_t;
 #define NEXUS_THREAD_SET_RETURN_CODE _IO (NEXUS_MAGIC, 7)
 
 #define NEXUS_PORT_CREATE        _IOWR(NEXUS_MAGIC, 10, struct nexus_port_create)
-#define NEXUS_PORT_CLOSE         _IOW (NEXUS_MAGIC, 11, struct nexus_port_id)
-#define NEXUS_PORT_DELETE        _IOW (NEXUS_MAGIC, 30, struct nexus_port_id)
+#define NEXUS_PORT_CLOSE         _IOWR(NEXUS_MAGIC, 11, struct nexus_port_id)
+#define NEXUS_PORT_DELETE        _IOWR(NEXUS_MAGIC, 30, struct nexus_port_id)
 #define NEXUS_PORT_READ          _IOWR(NEXUS_MAGIC, 31, struct nexus_port_read)
-#define NEXUS_PORT_WRITE         _IOW (NEXUS_MAGIC, 32, struct nexus_port_write)
+#define NEXUS_PORT_WRITE         _IOWR(NEXUS_MAGIC, 32, struct nexus_port_write)
 #define NEXUS_PORT_INFO          _IOWR(NEXUS_MAGIC, 33, struct nexus_port_get_info)
 #define NEXUS_PORT_MESSAGE_INFO  _IOWR(NEXUS_MAGIC, 34, struct nexus_port_get_message_info)
-#define NEXUS_SET_PORT_OWNER     _IOW (NEXUS_MAGIC, 35, struct nexus_port_set_owner)
+#define NEXUS_SET_PORT_OWNER     _IOWR(NEXUS_MAGIC, 35, struct nexus_port_set_owner)
 #define NEXUS_PORT_FIND          _IOWR(NEXUS_MAGIC, 12, struct nexus_port_find_req)
 #define NEXUS_GET_NEXT_PORT_FOR_TEAM	_IOWR(NEXUS_MAGIC, 13, struct nexus_get_next_port)
 
 #define NEXUS_SEM_CREATE   _IOWR(NEXUS_MAGIC, 40, struct nexus_sem_create)
-#define NEXUS_SEM_ACQUIRE  _IOW (NEXUS_MAGIC, 41, struct nexus_sem_op)
-#define NEXUS_SEM_RELEASE  _IOW (NEXUS_MAGIC, 42, struct nexus_sem_op)
-#define NEXUS_SEM_DELETE   _IOW (NEXUS_MAGIC, 43, struct nexus_sem_delete_req)
+#define NEXUS_SEM_ACQUIRE  _IOWR(NEXUS_MAGIC, 41, struct nexus_sem_op)
+#define NEXUS_SEM_RELEASE  _IOWR(NEXUS_MAGIC, 42, struct nexus_sem_op)
+#define NEXUS_SEM_DELETE   _IOWR(NEXUS_MAGIC, 43, struct nexus_sem_delete_req)
 #define NEXUS_SEM_COUNT    _IOWR(NEXUS_MAGIC, 44, struct nexus_sem_count_req)
 #define NEXUS_SEM_INFO     _IOWR(NEXUS_MAGIC, 45, struct nexus_sem_info_req)
 #define NEXUS_SEM_NEXT_INFO _IOWR(NEXUS_MAGIC, 46, struct nexus_sem_next_info)
@@ -67,29 +67,35 @@ typedef s64 bigtime_t;
 #define NEXUS_VREF_RELEASE			_IO(NEXUS_VREF_MAGIC, 5)
 
 #ifdef __KERNEL__
-/* Team-exit notification callbacks — callable from external modules */
 typedef void (*nexus_team_notify_fn)(pid_t team);
 int  nexus_register_team_exit(nexus_team_notify_fn fn);
 void nexus_unregister_team_exit(nexus_team_notify_fn fn);
 #endif
 
+#define NEXUS_VOLUME_MAGIC 'F'
+
+#define NEXUS_QUERY_VOLUME_FLAGS _IOWR(NEXUS_VOLUME_MAGIC, 3, struct nexus_query_volume_flags)
+
+#define NEXUS_ATTR_DIR_OPEN  _IOWR('F', 10, struct nexus_attr_dir_open)
+#define NEXUS_ATTR_READ      _IOWR('F', 11, struct nexus_attr_io)
+#define NEXUS_ATTR_WRITE     _IOWR('F', 12, struct nexus_attr_io)
+#define NEXUS_ATTR_STAT      _IOWR('F', 13, struct nexus_attr_stat)
+#define NEXUS_ATTR_REMOVE    _IOW ('F', 14, struct nexus_attr_remove)
+#define NEXUS_ATTR_RENAME    _IOW ('F', 15, struct nexus_attr_rename)
+
 #define NEXUS_AREA_MAGIC 'A'
 
 #define NEXUS_AREA_CREATE			_IOWR(NEXUS_AREA_MAGIC, 1, struct nexus_area_create)
 #define NEXUS_AREA_CLONE			_IOWR(NEXUS_AREA_MAGIC, 2, struct nexus_area_clone)
-#define NEXUS_AREA_DELETE			_IOW (NEXUS_AREA_MAGIC, 3, struct nexus_area_delete)
+#define NEXUS_AREA_DELETE			_IOWR(NEXUS_AREA_MAGIC, 3, struct nexus_area_delete)
 #define NEXUS_AREA_FIND				_IOWR(NEXUS_AREA_MAGIC, 4, struct nexus_area_find)
 #define NEXUS_AREA_GET_INFO			_IOWR(NEXUS_AREA_MAGIC, 5, struct nexus_area_get_info)
-#define NEXUS_AREA_RESIZE			_IOW (NEXUS_AREA_MAGIC, 6, struct nexus_area_resize)
-#define NEXUS_AREA_SET_PROTECTION	_IOW (NEXUS_AREA_MAGIC, 7, struct nexus_area_set_protection)
+#define NEXUS_AREA_RESIZE			_IOWR(NEXUS_AREA_MAGIC, 6, struct nexus_area_resize)
+#define NEXUS_AREA_SET_PROTECTION	_IOWR(NEXUS_AREA_MAGIC, 7, struct nexus_area_set_protection)
 #define NEXUS_AREA_TRANSFER			_IOWR(NEXUS_AREA_MAGIC, 8, struct nexus_area_transfer)
 #define NEXUS_AREA_GET_NEXT			_IOWR(NEXUS_AREA_MAGIC, 9, struct nexus_area_get_next)
 
-
 /* Thread */
-
-
-
 
 struct nexus_thread_spawn {
 	const char*				name;
@@ -119,31 +125,32 @@ struct nexus_thread_waitfor_req {
 	int32_t		return_code;
 };
 
-
 /* Port */
-
-
-
 
 struct nexus_port_create {
 	const char*		name;
-	size_t			size;		/* length of name string */
+	size_t			size;
 	int32_t			capacity;
 	/* out */
 	int32_t			id;
+	int32_t			ret;
 };
 
 struct nexus_port_id {
 	int32_t			id;
+	/* out */
+	int32_t			ret;
 };
 
 struct nexus_port_read {
 	int32_t			id;
 	int32_t*		code;
 	void*			buffer;
-	size_t			size;		/* in: buf capacity, out: bytes read */
+	size_t			size;
 	uint32_t		flags;
 	int64_t			timeout;
+	/* out */
+	int32_t			ret;
 };
 
 struct nexus_port_write {
@@ -153,12 +160,15 @@ struct nexus_port_write {
 	size_t			size;
 	uint32_t		flags;
 	int64_t			timeout;
+	/* out */
+	int32_t			ret;
 };
 
 struct nexus_port_get_info {
 	int32_t			id;
-	/* out via nexus_port_info pointer */
+	/* out */
 	struct nexus_port_info* info;
+	int32_t			ret;
 };
 
 struct nexus_port_get_message_info {
@@ -166,20 +176,24 @@ struct nexus_port_get_message_info {
 	size_t			size;
 	uint32_t		flags;
 	int64_t			timeout;
-	/* out via nexus_port_message_info pointer */
+	/* out */
 	struct nexus_port_message_info* info;
+	int32_t			ret;
 };
 
 struct nexus_port_set_owner {
 	int32_t			id;
 	int32_t			team;
+	/* out */
+	int32_t			ret;
 };
 
 struct nexus_port_find_req {
 	const char*		name;
-	size_t			size;		/* length of name string */
+	size_t			size;
 	/* out */
 	int32_t			id;
+	int32_t			ret;
 };
 
 struct nexus_port_message_info {
@@ -201,9 +215,10 @@ struct nexus_port_info {
 
 struct nexus_get_next_port {
 	pid_t					team;
-	int32_t					cookie;		/* in: last seen port id (0 = start) */
+	int32_t					cookie;
 	/* out */
 	struct nexus_port_info	info;
+	int32_t					ret;
 };
 
 
@@ -215,6 +230,7 @@ struct nexus_sem_create {
 	int32_t		count;
 	/* out */
 	sem_id		id;
+	int32_t		ret;
 };
 
 struct nexus_sem_op {
@@ -222,16 +238,21 @@ struct nexus_sem_op {
 	int32_t		count;
 	uint32_t	flags;
 	bigtime_t	timeout;
+	/* out */
+	int32_t		ret;
 };
 
 struct nexus_sem_delete_req {
 	sem_id		id;
+	/* out */
+	int32_t		ret;
 };
 
 struct nexus_sem_count_req {
 	sem_id		id;
 	/* out */
 	int32_t		count;
+	int32_t		ret;
 };
 
 struct nexus_sem_info {
@@ -248,13 +269,15 @@ struct nexus_sem_info_req {
 	team_id		team;
 	/* out */
 	struct nexus_sem_info info;
+	int32_t		ret;
 };
 
 struct nexus_sem_next_info {
 	team_id   	team;
 	int32_t   	cookie;
-	//
+	/* out */
 	struct nexus_sem_info info;
+	int32_t		ret;
 };
 
 
@@ -267,69 +290,173 @@ struct nexus_area_create {
 	uint64_t    size;
 	uint32_t    lock;
 	uint32_t    protection;
-	//
+	/* out */
 	area_id     area;
+	int32_t     ret;
 };
 
 struct nexus_area_clone {
 	area_id     source;
 	char        name[B_OS_NAME_LENGTH];
 	uint32_t    protection;
-	//
+	/* out */
 	area_id     area;
 	int         fd;
 	uint64_t    size;
+	int32_t     ret;
 };
 
 struct nexus_area_delete {
 	area_id     area;
+	/* out */
+	int32_t     ret;
 };
 
 struct nexus_area_find {
 	char        name[B_OS_NAME_LENGTH];
-	//
+	/* out */
 	area_id     area;
 	uint64_t    size;
+	int32_t     ret;
 };
 
 struct nexus_area_get_info {
 	area_id     area;
-	//
+	/* out */
 	char        name[B_OS_NAME_LENGTH];
 	uint64_t    size;
 	uint32_t    lock;
 	uint32_t    protection;
 	int32_t     team;
+	int32_t     ret;
 };
 
 struct nexus_area_resize {
 	area_id     area;
 	uint64_t    new_size;
+	/* out */
+	int32_t     ret;
 };
 
 struct nexus_area_set_protection {
 	area_id     area;
 	uint32_t    protection;
+	/* out */
+	int32_t     ret;
 };
 
 struct nexus_area_transfer {
 	area_id     area;
 	int32_t     target;
-	//
+	/* out */
 	area_id     new_area;
 	int         fd;
+	int32_t     ret;
 };
 
 struct nexus_area_get_next {
 	int32_t     team;
 	int32_t     cookie;
-	//
+	/* out */
 	area_id     area;
 	char        name[B_OS_NAME_LENGTH];
 	uint64_t    size;
 	uint32_t    lock;
 	uint32_t    protection;
 	int32_t     next_cookie;
+	int32_t     ret;
+};
+
+
+/* Volume flags query */
+
+
+struct nexus_query_volume_flags {
+	int32_t    target_fd;
+	uint32_t   flags;
+};
+
+
+/* Attribute ioctl structs */
+
+
+struct nexus_attr_dir_open {
+	int32_t   target_fd;
+	uint32_t  flags;
+};
+
+struct nexus_attr_io {
+	int32_t   target_fd;
+	char      name[256];
+	uint32_t  type;
+	int64_t   pos;
+	uint64_t  buf_addr;
+	uint64_t  buf_len;
+};
+
+struct nexus_attr_stat {
+	int32_t  target_fd;
+	char     name[256];
+	uint32_t type_out;
+	uint64_t size_out;
+};
+
+struct nexus_attr_remove {
+	int32_t target_fd;
+	char  name[256];
+};
+
+struct nexus_attr_rename {
+	int32_t from_fd;
+	char  from_name[256];
+	int32_t to_fd;
+	char  to_name[256];
+};
+
+#define NEXUS_ATTR_NAME_MAX 245
+
+#define NEXUS_QUERY_OPEN  _IOWR('F', 30, struct nexus_query_open)
+
+struct nexus_query_open {
+	int32_t  target_fd;
+	uint32_t  predicate_len;
+	uint64_t  predicate_addr;
+	uint32_t  flags;
+	int32_t  port;
+	int32_t  token;
+};
+
+#define NEXUS_INDEX_DIR_OPEN  _IOWR('F', 20, struct nexus_index_dir_open)
+#define NEXUS_INDEX_CREATE    _IOW ('F', 21, struct nexus_index_create)
+#define NEXUS_INDEX_REMOVE    _IOW ('F', 22, struct nexus_index_remove)
+#define NEXUS_INDEX_STAT      _IOWR('F', 23, struct nexus_index_stat)
+
+struct nexus_index_dir_open {
+	int32_t target_fd;
+};
+
+struct nexus_index_create {
+	int32_t target_fd;
+	char  name[256];
+	uint32_t type;
+	uint32_t flags;
+};
+
+struct nexus_index_remove {
+	int32_t target_fd;
+	char  name[256];
+};
+
+struct nexus_index_stat {
+	int32_t target_fd;
+	char  name[256];
+	uint32_t type;
+	uint32_t flags;
+	uint64_t size;
+	int64_t  modification_time;
+	int64_t  creation_time;
+	uint32_t uid;
+	uint32_t gid;
 };
 
 
