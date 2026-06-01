@@ -31,7 +31,7 @@ typedef int64_t bigtime_t;
 #define NEXUS_THREAD_SPAWN			_IO (NEXUS_MAGIC, 1)
 #define NEXUS_THREAD_SET_NAME      _IOW (NEXUS_MAGIC, 3,  struct nexus_thread_set_name_req)
 #define NEXUS_THREAD_READ          _IOWR(NEXUS_MAGIC, 20, struct nexus_thread_rw)
-#define NEXUS_THREAD_WRITE         _IOW (NEXUS_MAGIC, 21, struct nexus_thread_rw)
+#define NEXUS_THREAD_WRITE         _IOWR(NEXUS_MAGIC, 21, struct nexus_thread_rw)
 #define NEXUS_THREAD_HAS_DATA      _IOWR(NEXUS_MAGIC, 22, struct nexus_thread_rw)
 #define NEXUS_THREAD_WAITFOR       _IOWR(NEXUS_MAGIC, 23, struct nexus_thread_waitfor_req)
 #define NEXUS_THREAD_WAIT_NEWBORN	_IO (NEXUS_MAGIC, 4)
@@ -115,14 +115,15 @@ struct nexus_thread_rw {
 	uint32_t	flags;
 	int64_t		timeout;
 	int32_t		return_code;
+	int32_t		ret;
 };
 
 struct nexus_thread_waitfor_req {
 	int32_t		receiver;
 	uint32_t	flags;
 	int64_t		timeout;
-	/* out */
 	int32_t		return_code;
+	int32_t		ret;
 };
 
 /* Port */
