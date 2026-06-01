@@ -117,9 +117,21 @@ EXPORT_SYMBOL(nexus_unregister_team_exit);
 
 struct nexus_team* nexus_team_init()
 {
+	struct nexus_team *t;
+
+	hlist_for_each_entry(t, &nexus_teams, node) {
+		if (t->id == current->tgid) {
+			t->open_count++;
+			pr_debug("nexus: tgid=%d open_count=%d (reuse)\n",
+				current->tgid, t->open_count);
+			return t;
+		}
+	}
+
 	struct nexus_team* team = kzalloc(sizeof(struct nexus_team), GFP_KERNEL);
 	if (team != NULL) {
 		team->id = current->group_leader->pid;
+		team->open_count = 1;
 		team->main_thread = nexus_thread_init(team, team->id, NULL);
 
 		if (team->main_thread == NULL) {
@@ -132,12 +144,21 @@ struct nexus_team* nexus_team_init()
 		team->threads = RB_ROOT;
 
 		hlist_add_head(&team->node, &nexus_teams);
+		pr_debug("nexus: tgid=%d new team\n", current->tgid);
 	}
 	return team;
 }
 
 void nexus_team_destroy(struct nexus_team *team)
 {
+	if (--team->open_count > 0) {
+		pr_debug("nexus: team %d release, open_count=%d (still alive)\n",
+			team->id, team->open_count);
+		return;
+	}
+
+	hlist_del(&team->node);
+
 	nexus_sem_team_exit(team->id);
 
 	int _i;
@@ -181,7 +202,6 @@ void nexus_team_destroy(struct nexus_team *team)
 	team->main_thread->team = NULL;
 	kref_put(&team->main_thread->ref_count, nexus_thread_destroy);
 	team->main_thread = NULL;
-	hlist_del(&team->node);
 	kfree(team);
 }
 
@@ -494,8 +514,9 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				ret = B_BAD_VALUE;
 				break;
 			}
-			struct task_struct *task = get_pid_task(find_get_pid(
-				(pid_t)user_data.receiver), PIDTYPE_PID);
+			struct pid *_pid_ref = find_get_pid((pid_t)user_data.receiver);
+			struct task_struct *task = get_pid_task(_pid_ref, PIDTYPE_PID);
+			put_pid(_pid_ref);
 			if (task == NULL) { ret = B_BAD_THREAD_ID; break; }
 			hlist_for_each_entry(iter_team, &nexus_teams, node) {
 				if (task->pid == iter_team->id) {
@@ -548,8 +569,9 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				ret = B_BAD_VALUE;
 				break;
 			}
-			struct task_struct *task = get_pid_task(find_get_pid(
-				(pid_t)user_data.receiver), PIDTYPE_PID);
+			struct pid *_pid_ref = find_get_pid((pid_t)user_data.receiver);
+			struct task_struct *task = get_pid_task(_pid_ref, PIDTYPE_PID);
+			put_pid(_pid_ref);
 			if (task == NULL) { ret = B_BAD_THREAD_ID; break; }
 			hlist_for_each_entry(iter_team, &nexus_teams, node) {
 				if (task->pid == iter_team->id) {
@@ -581,8 +603,9 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			}
 			struct nexus_team *wf_team;
 			struct nexus_thread *dest_thread = NULL;
-			struct task_struct *task = get_pid_task(find_get_pid(
-				(pid_t)user_data.receiver), PIDTYPE_PID);
+			struct pid *_pid_ref = find_get_pid((pid_t)user_data.receiver);
+			struct task_struct *task = get_pid_task(_pid_ref, PIDTYPE_PID);
+			put_pid(_pid_ref);
 			if (task == NULL) { ret = B_BAD_THREAD_ID; break; }
 			if (task->mm != current->mm) { put_task_struct(task); ret = B_BAD_THREAD_ID; break; }
 			hlist_for_each_entry(wf_team, &nexus_teams, node) {
@@ -691,8 +714,11 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				break;
 			}
 
-			task = get_pid_task(find_get_pid((pid_t)tid),
-													PIDTYPE_PID);
+			{
+			struct pid *_pid_ref = find_get_pid((pid_t)tid);
+			task = get_pid_task(_pid_ref, PIDTYPE_PID);
+			put_pid(_pid_ref);
+			}
 
 			if (task == NULL) {
 				ret = B_BAD_THREAD_ID;
@@ -791,21 +817,31 @@ static int nexus_open(struct inode *nodp, struct file *filp)
 	}
 	mutex_unlock(&nexus_main_lock);
 
-	kref_get(&team->main_thread->ref_count);
-	init_task_work(&team->main_thread->exit_work, nexus_thread_exit_work);
-	if (task_work_add(current, &team->main_thread->exit_work, TWA_NONE) != 0) {
-		kref_put(&team->main_thread->ref_count, nexus_thread_destroy);
+	if (team->open_count == 1) {
+		kref_get(&team->main_thread->ref_count);
+		init_task_work(&team->main_thread->exit_work, nexus_thread_exit_work);
+		if (task_work_add(current, &team->main_thread->exit_work, TWA_NONE) != 0) {
+			kref_put(&team->main_thread->ref_count, nexus_thread_destroy);
+		}
 	}
 
 	filp->private_data = (void*)team;
+
+	pr_debug("nexus: open team=%d by tgid=%d pid=%d\n",
+		team->id, current->tgid, current->pid);
 
 	return 0;
 }
 
 static int nexus_release(struct inode *nodp, struct file *filp)
 {
+	struct nexus_team *team = (struct nexus_team *)filp->private_data;
+
+	pr_debug("nexus: release team=%d by tgid=%d pid=%d\n",
+		team->id, current->tgid, current->pid);
+
 	mutex_lock(&nexus_main_lock);
-	nexus_team_destroy((struct nexus_team*)filp->private_data);
+	nexus_team_destroy(team);
 	mutex_unlock(&nexus_main_lock);
 
 	filp->private_data = NULL;
