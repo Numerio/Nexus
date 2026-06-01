@@ -366,8 +366,9 @@ long nexus_port_read(struct nexus_port* port, int32_t* code, void* buffer,
 	return B_OK;
 }
 
-long nexus_port_write(struct nexus_port* port, int32_t* msg_code,
-	const void* buffer, size_t size, uint32_t flags, int64_t timeout)
+static long _nexus_port_write(struct nexus_port* port, int32_t* msg_code,
+	const void* buffer, size_t size, uint32_t flags, int64_t timeout,
+	bool from_user)
 {
 	struct nexus_buffer* buf = 0;
 	int ret = 0;
@@ -448,22 +449,29 @@ goahead:
 			port->write_count++;
 			return B_NO_MEMORY;
 		}
-		if (copy_from_user(buf->buffer, buffer, size)) {
-			kfree(buf->buffer);
-			kfree(buf);
-			port->write_count++;
-			return B_BAD_VALUE;
+		if (from_user) {
+			if (copy_from_user(buf->buffer, buffer, size)) {
+				kfree(buf->buffer);
+				kfree(buf);
+				port->write_count++;
+				return B_BAD_VALUE;
+			}
+		} else {
+			memcpy(buf->buffer, buffer, size);
 		}
 		buf->size = size;
 	} else
 		buf->buffer = NULL;
 
-	if (copy_from_user(&buf->code, msg_code, sizeof(*msg_code))) {
-		kfree(buf->buffer);
-		kfree(buf);
-
-		port->write_count++;
-		return B_BAD_VALUE;
+	if (from_user) {
+		if (copy_from_user(&buf->code, msg_code, sizeof(*msg_code))) {
+			kfree(buf->buffer);
+			kfree(buf);
+			port->write_count++;
+			return B_BAD_VALUE;
+		}
+	} else {
+		buf->code = *msg_code;
 	}
 
 	list_add_tail(&buf->node, &port->queue);
@@ -472,6 +480,20 @@ goahead:
 	wake_up_interruptible(&port->buffer_read);
 
 	return B_OK;
+}
+
+long nexus_port_write(struct nexus_port* port, int32_t* msg_code,
+	const void* buffer, size_t size, uint32_t flags, int64_t timeout)
+{
+	return _nexus_port_write(port, msg_code, buffer, size, flags, timeout,
+		true);
+}
+
+static long nexus_port_write_kernel(struct nexus_port* port, int32_t* msg_code,
+	const void* buffer, size_t size)
+{
+	return _nexus_port_write(port, msg_code, buffer, size,
+		B_RELATIVE_TIMEOUT, 0, false);
 }
 
 status_t nexus_write_port(uint32_t id, int32_t code, const void *buffer,
@@ -485,7 +507,7 @@ status_t nexus_write_port(uint32_t id, int32_t code, const void *buffer,
 		return B_BAD_PORT_ID;
 	}
 
-	long ret = nexus_port_write(port, &code, buffer, buffer_size, 0, B_INFINITE_TIMEOUT);
+	long ret = nexus_port_write_kernel(port, &code, buffer, buffer_size);
 	mutex_unlock(&nexus_main_lock);
 	return ret;
 }
