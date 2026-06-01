@@ -31,21 +31,13 @@ static void nexus_vref_destroy(struct kref *kref) {
 	kfree(entry);
 }
 
-static int32_t nexus_vref_create(int fd) {
-	struct file *file = fget(fd);
-	if (!file) {
-		return -EBADF;
-	}
-
+int32_t nexus_vref_create_from_file(struct file *file) {
 	struct nexus_vref *entry = kzalloc(sizeof(struct nexus_vref), GFP_KERNEL);
-	if (!entry) {
-		fput(file);
+	if (!entry)
 		return -ENOMEM;
-	}
 
 	int id = ida_alloc_min(&vref_ida, 1, GFP_KERNEL);
 	if (id < 0) {
-		fput(file);
 		kfree(entry);
 		return -ENOMEM;
 	}
@@ -56,10 +48,19 @@ static int32_t nexus_vref_create(int fd) {
 	entry->file = get_file(file);
 	entry->team = current->tgid;
 	hash_add(fd_hashmap, &entry->node, entry->id);
-	fput(file);
 	mutex_unlock(&fd_map_lock);
 
 	return entry->id;
+}
+
+static int32_t nexus_vref_create_from_user_fd(int fd) {
+	struct file *file = fget(fd);
+	if (!file)
+		return -EBADF;
+
+	int32_t id = nexus_vref_create_from_file(file);
+	fput(file);
+	return id;
 }
 
 static int nexus_vref_acquire(int32_t id) {
@@ -68,7 +69,6 @@ static int nexus_vref_acquire(int32_t id) {
 	mutex_lock(&fd_map_lock);
 	hash_for_each_possible(fd_hashmap, entry, node, id) {
 		if (entry->id == id) {
-			/* Bumps refcount; matched by nexus_vref_release. */
 			kref_get(&entry->ref_count);
 			entry->team = current->tgid;
 			mutex_unlock(&fd_map_lock);
@@ -124,10 +124,28 @@ static int nexus_vref_open(int32_t id) {
 	return B_ENTRY_NOT_FOUND;
 }
 
-static long nexus_vref_release(int32_t id) {
-
+void nexus_vref_drop_kernel_ref(int32_t id) {
 	struct nexus_vref *entry = NULL;
 	struct hlist_node *tmp = NULL;
+	bool found = false;
+
+	mutex_lock(&fd_map_lock);
+	hash_for_each_possible_safe(fd_hashmap, entry, tmp, node, id) {
+		if (entry->id == id) {
+			found = true;
+			break;
+		}
+	}
+	mutex_unlock(&fd_map_lock);
+
+	if (found)
+		kref_put(&entry->ref_count, nexus_vref_destroy);
+}
+
+static long nexus_vref_release(int32_t id) {
+	struct nexus_vref *entry = NULL;
+	struct hlist_node *tmp = NULL;
+	bool do_put = false;
 
 	mutex_lock(&fd_map_lock);
 	hash_for_each_possible_safe(fd_hashmap, entry, tmp, node, id) {
@@ -136,13 +154,17 @@ static long nexus_vref_release(int32_t id) {
 				mutex_unlock(&fd_map_lock);
 				return 0;
 			}
-			kref_put(&entry->ref_count, nexus_vref_destroy);
-			mutex_unlock(&fd_map_lock);
-			return 0;
+			do_put = true;
+			break;
 		}
 	}
 	mutex_unlock(&fd_map_lock);
-	return -EINVAL;
+
+	if (!do_put)
+		return -EINVAL;
+
+	kref_put(&entry->ref_count, nexus_vref_destroy);
+	return 0;
 }
 
 long nexus_vref_ioctl(unsigned int cmd, unsigned long arg) {
@@ -153,7 +175,7 @@ long nexus_vref_ioctl(unsigned int cmd, unsigned long arg) {
 		case NEXUS_VREF_CREATE:
 			if (copy_from_user(&fd, (int __user *)arg, sizeof(fd)))
 				return -EFAULT;
-			return nexus_vref_create(fd);
+			return nexus_vref_create_from_user_fd(fd);
 
 		case NEXUS_VREF_ACQUIRE_FD:
 			if (copy_from_user(&id, (int __user *)arg, sizeof(id)))
