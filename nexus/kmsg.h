@@ -11,10 +11,12 @@
 
 #ifdef __KERNEL__
 
-#define B_INT32_TYPE   0x4C4F4E47
-#define B_INT64_TYPE   0x4C4C4E47
-#define B_STRING_TYPE  0x43535452
-#define B_UINT64_TYPE  0x554C4C47
+#define B_INT32_TYPE    0x4C4F4E47
+#define B_INT64_TYPE    0x4C4C4E47
+#define B_STRING_TYPE   0x43535452
+#define B_UINT64_TYPE   0x554C4C47
+#define B_REF_TYPE      0x52524546
+#define B_NODE_REF_TYPE 0x4E524546
 
 #endif
 
@@ -154,6 +156,28 @@ static inline void kmsg_add_string(struct kmsg_builder *msg, const char *name,
 {
     size_t len = strlen(val) + 1;
     kmsg_add_data(msg, name, B_STRING_TYPE, val, len);
+}
+
+static inline void kmsg_add_noderef(struct kmsg_builder *msg, const char *name,
+	int64_t device, int64_t node)
+{
+	char buf[16];
+	memcpy(buf,     &device, 8);
+	memcpy(buf + 8, &node,   8);
+	kmsg_add_data(msg, name, B_NODE_REF_TYPE, buf, 16);
+}
+
+static inline void kmsg_add_entryref(struct kmsg_builder *msg, const char *name,
+	int64_t device, int64_t directory, const char *entry)
+{
+	size_t name_len = entry ? strlen(entry) + 1 : 0;
+	size_t total = 16 + name_len;
+	char buf[NAME_MAX + 16];
+	memcpy(buf,      &device,    8);
+	memcpy(buf + 8,  &directory, 8);
+	if (name_len)
+		memcpy(buf + 16, entry, name_len);
+	kmsg_add_data(msg, name, B_REF_TYPE, buf, total);
 }
 
 static inline void kmsg_finalize(struct kmsg_builder *msg, port_id port, uint32_t token)
