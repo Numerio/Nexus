@@ -34,6 +34,13 @@ DEFINE_MUTEX(nexus_main_lock);
 HLIST_HEAD(nexus_teams);
 
 DEFINE_IDR(nexus_port_idr);
+static DEFINE_IDR(nexus_teams_idr);
+
+struct nexus_team* nexus_find_team(int32_t id)
+{
+	return idr_find(&nexus_teams_idr, id);
+}
+EXPORT_SYMBOL(nexus_find_team);
 
 // TODO make non-exported functions static
 // TODO fine-grained locking through spinlocks
@@ -117,15 +124,12 @@ EXPORT_SYMBOL(nexus_unregister_team_exit);
 
 struct nexus_team* nexus_team_init()
 {
-	struct nexus_team *t;
-
-	hlist_for_each_entry(t, &nexus_teams, node) {
-		if (t->id == current->tgid) {
-			t->open_count++;
-			pr_debug("nexus: tgid=%d open_count=%d (reuse)\n",
-				current->tgid, t->open_count);
-			return t;
-		}
+	struct nexus_team *t = idr_find(&nexus_teams_idr, current->tgid);
+	if (t != NULL) {
+		t->open_count++;
+		pr_debug("nexus: tgid=%d open_count=%d (reuse)\n",
+			current->tgid, t->open_count);
+		return t;
 	}
 
 	struct nexus_team* team = kzalloc(sizeof(struct nexus_team), GFP_KERNEL);
@@ -144,6 +148,10 @@ struct nexus_team* nexus_team_init()
 		team->threads = RB_ROOT;
 
 		hlist_add_head(&team->node, &nexus_teams);
+		if (idr_alloc(&nexus_teams_idr, team, team->id, team->id + 1,
+				GFP_KERNEL) < 0) {
+			pr_warn("nexus: idr_alloc failed for team %d\n", team->id);
+		}
 		pr_debug("nexus: tgid=%d new team\n", current->tgid);
 	}
 	return team;
@@ -158,6 +166,7 @@ void nexus_team_destroy(struct nexus_team *team)
 	}
 
 	hlist_del(&team->node);
+	idr_remove(&nexus_teams_idr, team->id);
 
 	nexus_sem_team_exit(team->id);
 
@@ -322,10 +331,10 @@ static struct nexus_thread* find_thread_by_id(struct nexus_team *team, int32_t p
 	return NULL;
 }
 
-static long nexus_thread_spawn(struct nexus_team *team, const char* name)
+static struct nexus_thread* nexus_thread_spawn(struct nexus_team *team,
+	const char* name)
 {
-	find_thread(team, name);
-	return 0;
+	return find_thread(team, name);
 }
 
 static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
@@ -374,10 +383,9 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 					return -EFAULT;
 				}
 
-				ret = nexus_thread_spawn(team, spawn_data.name);
-
 				struct nexus_thread *self_new =
-					find_thread_by_id(team, current->pid);
+					nexus_thread_spawn(team, spawn_data.name);
+				ret = (self_new != NULL) ? 0 : -ENOMEM;
 				if (self_new != NULL) {
 					kref_get(&self_new->ref_count);
 					init_task_work(&self_new->exit_work,
@@ -397,11 +405,11 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 					return B_BAD_THREAD_ID;
 				}
 
-				hlist_for_each_entry(iter_team, &nexus_teams, node) {
+				iter_team = idr_find(&nexus_teams_idr, task->tgid);
+				if (iter_team != NULL) {
 					if (task->pid == iter_team->id) {
 						dest_thread = iter_team->main_thread;
-						break;
-					} else if (task->tgid == iter_team->id) {
+					} else {
 						dest_thread = find_thread_by_id(iter_team,
 							 spawn_data.father);
 						if (dest_thread == NULL) {
@@ -409,7 +417,6 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 							mutex_unlock(&nexus_main_lock);
 							return B_BAD_THREAD_ID;
 						}
-						break;
 					}
 				}
 
@@ -532,14 +539,13 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				task = get_pid_task(_pid_ref, PIDTYPE_PID);
 				put_pid(_pid_ref);
 				if (task == NULL) { status = B_BAD_THREAD_ID; break; }
-				hlist_for_each_entry(iter_team, &nexus_teams, node) {
-					if (task->pid == iter_team->id) {
-						dest_thread = iter_team->main_thread; break;
-					} else if (task->tgid == iter_team->id) {
+				iter_team = idr_find(&nexus_teams_idr, task->tgid);
+				if (iter_team != NULL) {
+					if (task->pid == iter_team->id)
+						dest_thread = iter_team->main_thread;
+					else
 						dest_thread = find_thread_by_id(iter_team,
 							user_data.receiver);
-						break;
-					}
 				}
 				if (dest_thread == NULL) {
 					put_task_struct(task);
@@ -610,14 +616,13 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				task = get_pid_task(_pid_ref, PIDTYPE_PID);
 				put_pid(_pid_ref);
 				if (task == NULL) { status = B_BAD_THREAD_ID; break; }
-				hlist_for_each_entry(iter_team, &nexus_teams, node) {
-					if (task->pid == iter_team->id) {
-						dest_thread = iter_team->main_thread; break;
-					} else if (task->tgid == iter_team->id) {
+				iter_team = idr_find(&nexus_teams_idr, task->tgid);
+				if (iter_team != NULL) {
+					if (task->pid == iter_team->id)
+						dest_thread = iter_team->main_thread;
+					else
 						dest_thread = find_thread_by_id(iter_team,
 							user_data.receiver);
-						break;
-					}
 				}
 				put_task_struct(task);
 				if (dest_thread == NULL) {
@@ -665,14 +670,13 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 					status = B_BAD_THREAD_ID;
 					break;
 				}
-				hlist_for_each_entry(wf_team, &nexus_teams, node) {
-					if (task->pid == wf_team->id) {
-						dest_thread = wf_team->main_thread; break;
-					} else if (task->tgid == wf_team->id) {
+				wf_team = idr_find(&nexus_teams_idr, task->tgid);
+				if (wf_team != NULL) {
+					if (task->pid == wf_team->id)
+						dest_thread = wf_team->main_thread;
+					else
 						dest_thread = find_thread_by_id(wf_team,
 							user_data.receiver);
-						break;
-					}
 				}
 				put_task_struct(task);
 				if (dest_thread == NULL) {
@@ -735,14 +739,11 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			pid_t parent_tgid = task_tgid_vnr(task);
 			rcu_read_unlock();
 
-			hlist_for_each_entry(iter_team, &nexus_teams, node) {
-				if (parent_tgid == iter_team->id) {
-					dest_thread = find_thread_by_id(iter_team, parent_tid);
-					if (dest_thread == NULL)
-						dest_thread = iter_team->main_thread;
-
-					break;
-				}
+			iter_team = idr_find(&nexus_teams_idr, parent_tgid);
+			if (iter_team != NULL) {
+				dest_thread = find_thread_by_id(iter_team, parent_tid);
+				if (dest_thread == NULL)
+					dest_thread = iter_team->main_thread;
 			}
 
 			if (dest_thread == NULL) {
@@ -790,17 +791,14 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				break;
 			}
 
-			hlist_for_each_entry(iter_team, &nexus_teams, node) {
+			iter_team = idr_find(&nexus_teams_idr, task->tgid);
+			if (iter_team != NULL) {
 				if (task->pid == iter_team->id) {
 					dest_thread = iter_team->main_thread;
-					break;
-				} else if (task->tgid == iter_team->id) {
+				} else {
 					dest_thread = find_thread_by_id(iter_team, tid);
-					if (dest_thread == NULL) {
+					if (dest_thread == NULL)
 						ret = B_BAD_THREAD_ID;
-						break;
-					}
-					break;
 				}
 			}
 

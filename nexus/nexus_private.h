@@ -204,6 +204,7 @@ long nexus_sem_ioctl(unsigned int cmd, unsigned long arg);
 
 struct nexus_team*		nexus_team_init(void);
 void					nexus_team_destroy(struct nexus_team *team);
+struct nexus_team*		nexus_find_team(int32_t id);
 
 struct nexus_thread*	nexus_thread_init(struct nexus_team *team, pid_t thread, const char *name);
 void 					nexus_thread_destroy(struct kref* ref);
