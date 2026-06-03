@@ -122,7 +122,7 @@ static int nexus_acquire_sem(sem_id id, int32_t count, uint32_t flags,
 	sem = idr_find(&nexus_sem_idr, id);
 	if (!sem) {
 		spin_unlock_irqrestore(&sem_idr_lock, iflags);
-		pr_err("nexus: acquire_sem: id=%d not in IDR (tgid=%d pid=%d)\n",
+		pr_err_ratelimited("nexus: acquire_sem: id=%d not in IDR (tgid=%d pid=%d)\n",
 		       id, current->tgid, current->pid);
 		return B_BAD_SEM_ID;
 	}
@@ -132,7 +132,7 @@ static int nexus_acquire_sem(sem_id id, int32_t count, uint32_t flags,
 	spin_lock_irqsave(&sem->lock, iflags);
 
 	if (sem->deleted) {
-		pr_err("nexus: acquire_sem: id=%d is deleted (tgid=%d pid=%d)\n",
+		pr_err_ratelimited("nexus: acquire_sem: id=%d is deleted (tgid=%d pid=%d)\n",
 		       id, current->tgid, current->pid);
 		ret = B_BAD_SEM_ID;
 		goto out_unlock;
