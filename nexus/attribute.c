@@ -558,12 +558,13 @@ long nexus_attr_ioctl_write(unsigned long arg)
 	}
 
 #ifdef NEXUS_ATTR_PROBE_SUPPRESS
-	nexus_probe_suppress_enter();
+	struct nexus_probe_suppress ps;
+	nexus_probe_suppress_enter(&ps);
 #endif
 	ret = vfs_setxattr(&nop_mnt_idmap, target_file->f_path.dentry,
 			   xattr_name, new_payload, new_payload_len, 0);
 #ifdef NEXUS_ATTR_PROBE_SUPPRESS
-	nexus_probe_suppress_exit();
+	nexus_probe_suppress_exit(&ps);
 #endif
 
 	if (ret == 0) {
@@ -696,12 +697,13 @@ long nexus_attr_ioctl_remove(unsigned long arg)
 	}
 
 #ifdef NEXUS_ATTR_PROBE_SUPPRESS
-	nexus_probe_suppress_enter();
+	struct nexus_probe_suppress ps;
+	nexus_probe_suppress_enter(&ps);
 #endif
 	ret = vfs_removexattr(&nop_mnt_idmap, target_file->f_path.dentry,
 			      xattr_name);
 #ifdef NEXUS_ATTR_PROBE_SUPPRESS
-	nexus_probe_suppress_exit();
+	nexus_probe_suppress_exit(&ps);
 	if (ret == 0)
 		nexus_emit_attr_changed(target_file, req.name,
 					B_ATTR_CAUSE_REMOVED);
@@ -811,34 +813,37 @@ long nexus_attr_ioctl_rename(unsigned long arg)
 		goto out_payload;
 
 #ifdef NEXUS_ATTR_PROBE_SUPPRESS
-	nexus_probe_suppress_enter();
+	struct nexus_probe_suppress ps;
+	nexus_probe_suppress_enter(&ps);
 #endif
 	ret = vfs_setxattr(&nop_mnt_idmap, to_file->f_path.dentry,
 			   to_xattr, payload, payload_len, 0);
 #ifdef NEXUS_ATTR_PROBE_SUPPRESS
-	nexus_probe_suppress_exit();
+	nexus_probe_suppress_exit(&ps);
 #endif
 
 	if (ret)
 		goto out_payload;
 
 #ifdef NEXUS_ATTR_PROBE_SUPPRESS
-	nexus_probe_suppress_enter();
+	struct nexus_probe_suppress ps;
+	nexus_probe_suppress_enter(&ps);
 #endif
 	ret = vfs_removexattr(&nop_mnt_idmap, from_file->f_path.dentry,
 			      from_xattr);
 #ifdef NEXUS_ATTR_PROBE_SUPPRESS
-	nexus_probe_suppress_exit();
+	nexus_probe_suppress_exit(&ps);
 #endif
 
 	if (ret) {
 #ifdef NEXUS_ATTR_PROBE_SUPPRESS
-		nexus_probe_suppress_enter();
+		struct nexus_probe_suppress ps;
+		nexus_probe_suppress_enter(&ps);
 #endif
 		vfs_removexattr(&nop_mnt_idmap, to_file->f_path.dentry,
 				to_xattr);
 #ifdef NEXUS_ATTR_PROBE_SUPPRESS
-		nexus_probe_suppress_exit();
+		nexus_probe_suppress_exit(&ps);
 #endif
 		goto out_payload;
 	}

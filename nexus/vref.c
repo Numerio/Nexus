@@ -127,44 +127,36 @@ static int nexus_vref_open(int32_t id) {
 void nexus_vref_drop_kernel_ref(int32_t id) {
 	struct nexus_vref *entry = NULL;
 	struct hlist_node *tmp = NULL;
-	bool found = false;
 
 	mutex_lock(&fd_map_lock);
 	hash_for_each_possible_safe(fd_hashmap, entry, tmp, node, id) {
 		if (entry->id == id) {
-			found = true;
+			kref_put(&entry->ref_count, nexus_vref_destroy);
 			break;
 		}
 	}
 	mutex_unlock(&fd_map_lock);
-
-	if (found)
-		kref_put(&entry->ref_count, nexus_vref_destroy);
 }
 
 static long nexus_vref_release(int32_t id) {
 	struct nexus_vref *entry = NULL;
 	struct hlist_node *tmp = NULL;
-	bool do_put = false;
+	long ret = -EINVAL;
 
 	mutex_lock(&fd_map_lock);
 	hash_for_each_possible_safe(fd_hashmap, entry, tmp, node, id) {
 		if (entry->id == id) {
 			if (entry->team != current->tgid) {
-				mutex_unlock(&fd_map_lock);
-				return 0;
+				ret = 0;
+			} else {
+				kref_put(&entry->ref_count, nexus_vref_destroy);
+				ret = 0;
 			}
-			do_put = true;
 			break;
 		}
 	}
 	mutex_unlock(&fd_map_lock);
-
-	if (!do_put)
-		return -EINVAL;
-
-	kref_put(&entry->ref_count, nexus_vref_destroy);
-	return 0;
+	return ret;
 }
 
 long nexus_vref_ioctl(unsigned int cmd, unsigned long arg) {

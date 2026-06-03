@@ -167,17 +167,12 @@ static DEFINE_SPINLOCK(marks_hash_lock);
 
 #define PROBE_SUPPRESS_BITS 6
 
-struct probe_suppress_entry {
-	struct hlist_node  node;
-	struct task_struct *task;
-};
-
 static DEFINE_HASHTABLE(probe_suppress, PROBE_SUPPRESS_BITS);
 static DEFINE_SPINLOCK(probe_suppress_lock);
 
 bool nexus_probe_is_suppressed(void)
 {
-	struct probe_suppress_entry *e;
+	struct nexus_probe_suppress *e;
 	unsigned long flags;
 	bool found = false;
 
@@ -193,38 +188,22 @@ bool nexus_probe_is_suppressed(void)
 	return found;
 }
 
-void nexus_probe_suppress_enter(void)
+void nexus_probe_suppress_enter(struct nexus_probe_suppress *e)
 {
-	struct probe_suppress_entry *e;
 	unsigned long flags;
 
-	e = kmalloc(sizeof(*e), GFP_KERNEL);
-	if (!e) {
-		nm_warn("probe_suppress_enter: alloc failed for task %d\n",
-			task_pid_nr(current));
-		return;
-	}
 	e->task = current;
-
 	spin_lock_irqsave(&probe_suppress_lock, flags);
 	hash_add(probe_suppress, &e->node, (unsigned long)current);
 	spin_unlock_irqrestore(&probe_suppress_lock, flags);
 }
 
-void nexus_probe_suppress_exit(void)
+void nexus_probe_suppress_exit(struct nexus_probe_suppress *e)
 {
-	struct probe_suppress_entry *e;
 	unsigned long flags;
 
 	spin_lock_irqsave(&probe_suppress_lock, flags);
-	hash_for_each_possible(probe_suppress, e, node,
-		(unsigned long)current) {
-		if (e->task == current) {
-			hash_del(&e->node);
-			kfree(e);
-			break;
-		}
-	}
+	hash_del(&e->node);
 	spin_unlock_irqrestore(&probe_suppress_lock, flags);
 }
 
