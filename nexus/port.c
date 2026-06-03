@@ -274,9 +274,8 @@ long nexus_port_read(struct nexus_port* port, int32_t* code, void* buffer,
 		return B_BAD_VALUE;
 	}
 
-	if (idr_find(&nexus_port_idr, port->id) == NULL || (!port->is_open && port->read_count == 0)) {
+	if (!port->is_open && port->read_count == 0)
 		return B_BAD_PORT_ID;
-	}
 
 	// TODO we are not really supporting absolute timeout
 	// even if not documented it is probably required
@@ -520,10 +519,8 @@ long nexus_port_info(struct nexus_port* port, struct nexus_port_info* info)
 		return B_BAD_VALUE;
 	}
 
-	if (idr_find(&nexus_port_idr, port->id) == NULL
-			|| (!port->is_open && port->read_count == 0)) {
+	if (!port->is_open && port->read_count == 0)
 		return B_BAD_PORT_ID;
-	}
 
 	read_lock(&port->rw_lock);
 	if (port->team == NULL) {
@@ -560,10 +557,8 @@ long nexus_port_message_info(struct nexus_port* port,
 		return B_BAD_VALUE;
 	}
 
-	if (idr_find(&nexus_port_idr, port->id) == NULL
-			|| (!port->is_open && port->read_count == 0)) {
+	if (!port->is_open && port->read_count == 0)
 		return B_BAD_PORT_ID;
-	}
 
 	flags &= B_RELATIVE_TIMEOUT | B_ABSOLUTE_TIMEOUT;
 
