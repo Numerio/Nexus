@@ -195,14 +195,10 @@ long nexus_get_next_port_for_team(unsigned long arg)
 		return -EFAULT;
 
 	req.ret = B_BAD_TEAM_ID;
-	team = NULL;
-	hlist_for_each_entry(team, &nexus_teams, node) {
-		if (team->id == req.team)
-			goto found;
-	}
-	goto out_copy;
+	team = nexus_find_team(req.team);
+	if (team == NULL)
+		goto out_copy;
 
-found:
 	req.ret = B_BAD_PORT_ID;
 	for (node = rb_first(&team->ports); node != NULL; node = rb_next(node)) {
 		struct nexus_port *p = rb_entry(node, struct nexus_port, node);
@@ -237,33 +233,33 @@ long nexus_set_port_owner(struct nexus_port* port, pid_t target_team)
 	if (port->team == NULL)
 		return B_ERROR;
 
-	hlist_for_each_entry(dest_team, &nexus_teams, node) {
-		if (dest_team->id == target_team) {
-			write_lock(&port->rw_lock);
-			rb_erase(&port->node, &port->team->ports);
+	dest_team = nexus_find_team(target_team);
+	if (dest_team == NULL)
+		return B_ERROR;
 
-			p = &dest_team->ports.rb_node;
-			while (*p) {
-				parent = *p;
-				next_port = rb_entry(parent, struct nexus_port, node);
+	write_lock(&port->rw_lock);
+	rb_erase(&port->node, &port->team->ports);
 
-				if (port->id > next_port->id)
-					p = &(*p)->rb_right;
-				else if (port->id < next_port->id)
-					p = &(*p)->rb_left;
-				else
-					break;
-			}
-			if (*p == NULL) {
-				rb_link_node(&port->node, parent, p);
-				rb_insert_color(&port->node, &dest_team->ports);
-				port->team = dest_team;
-				write_unlock(&port->rw_lock);
-				return B_OK;
-			}
-			write_unlock(&port->rw_lock);
-		}
+	p = &dest_team->ports.rb_node;
+	while (*p) {
+		parent = *p;
+		next_port = rb_entry(parent, struct nexus_port, node);
+
+		if (port->id > next_port->id)
+			p = &(*p)->rb_right;
+		else if (port->id < next_port->id)
+			p = &(*p)->rb_left;
+		else
+			break;
 	}
+	if (*p == NULL) {
+		rb_link_node(&port->node, parent, p);
+		rb_insert_color(&port->node, &dest_team->ports);
+		port->team = dest_team;
+		write_unlock(&port->rw_lock);
+		return B_OK;
+	}
+	write_unlock(&port->rw_lock);
 	return B_ERROR;
 }
 
