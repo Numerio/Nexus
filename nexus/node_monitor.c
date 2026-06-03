@@ -321,7 +321,7 @@ static void notify_attr_changed(struct nexus_listener *listener, dev_t device,
 
 	kmsg_init(&msg, buf, sizeof(buf), B_NODE_MONITOR);
 	kmsg_add_int32(&msg, "opcode", B_ATTR_CHANGED);
-	kmsg_add_int64(&msg, "device", (int64_t)device);
+	kmsg_add_uint64(&msg, "device", (uint64_t)device);
 	kmsg_add_noderef(&msg, "virtual:node", sentinel, (int64_t)node_vref_id);
 
 	if (dir_vref_id >= 0)
@@ -686,7 +686,7 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 
 				kmsg_init(&msg, buf, sizeof(buf), B_NODE_MONITOR);
 				kmsg_add_int32(&msg, "opcode", B_ENTRY_CREATED);
-				kmsg_add_int64(&msg, "device", (int64_t)device);
+				kmsg_add_uint64(&msg, "device", (uint64_t)device);
 
 				if (dir_vref_id >= 0)
 					kmsg_add_entryref(&msg, "virtual:directory",
@@ -719,7 +719,7 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 
 				kmsg_init(&msg, buf, sizeof(buf), B_NODE_MONITOR);
 				kmsg_add_int32(&msg, "opcode", B_ENTRY_REMOVED);
-				kmsg_add_int64(&msg, "device", (int64_t)device);
+				kmsg_add_uint64(&msg, "device", (uint64_t)device);
 				if (dir_vref_id >= 0)
 					kmsg_add_entryref(&msg, "virtual:directory",
 						sentinel, (int64_t)dir_vref_id, name);
@@ -792,7 +792,7 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 
 				kmsg_init(&msg, buf, sizeof(buf), B_NODE_MONITOR);
 				kmsg_add_int32(&msg, "opcode", B_ENTRY_MOVED);
-				kmsg_add_int64(&msg, "device", (int64_t)device);
+				kmsg_add_uint64(&msg, "device", (uint64_t)device);
 
 				kmsg_add_int64(&msg, "node device", (int64_t)device);
 				kmsg_add_entryref(&msg, "virtual:from directory",
@@ -819,7 +819,7 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 					nm_node_vref_for_event(mark, inode);
 				kmsg_init(&msg, buf, sizeof(buf), B_NODE_MONITOR);
 				kmsg_add_int32(&msg, "opcode", B_STAT_CHANGED);
-				kmsg_add_int64(&msg, "device", (int64_t)device);
+				kmsg_add_uint64(&msg, "device", (uint64_t)device);
 				if (target_vref >= 0)
 					kmsg_add_noderef(&msg, "virtual:node",
 						sentinel, (int64_t)target_vref);
@@ -837,7 +837,7 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 					nm_node_vref_for_event(mark, inode);
 				kmsg_init(&msg, buf, sizeof(buf), B_NODE_MONITOR);
 				kmsg_add_int32(&msg, "opcode", B_STAT_CHANGED);
-				kmsg_add_int64(&msg, "device", (int64_t)device);
+				kmsg_add_uint64(&msg, "device", (uint64_t)device);
 				if (target_vref >= 0)
 					kmsg_add_noderef(&msg, "virtual:node",
 						sentinel, (int64_t)target_vref);
@@ -864,7 +864,7 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 
 				kmsg_init(&msg, buf, sizeof(buf), B_NODE_MONITOR);
 				kmsg_add_int32(&msg, "opcode", B_ATTR_CHANGED);
-				kmsg_add_int64(&msg, "device", (int64_t)device);
+				kmsg_add_uint64(&msg, "device", (uint64_t)device);
 				if (target_vref >= 0)
 					kmsg_add_noderef(&msg, "virtual:node",
 						sentinel, (int64_t)target_vref);
@@ -948,8 +948,8 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 							sizeof(buf2), B_NODE_MONITOR);
 						kmsg_add_int32(&msg2, "opcode",
 							B_ENTRY_CREATED);
-						kmsg_add_int64(&msg2, "device",
-							(int64_t)device);
+						kmsg_add_uint64(&msg2, "device",
+							(uint64_t)device);
 						if (pdvref >= 0)
 							kmsg_add_entryref(&msg2,
 								"virtual:directory",
@@ -987,8 +987,8 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 							sizeof(buf2), B_NODE_MONITOR);
 						kmsg_add_int32(&msg2, "opcode",
 							B_ENTRY_REMOVED);
-						kmsg_add_int64(&msg2, "device",
-							(int64_t)device);
+						kmsg_add_uint64(&msg2, "device",
+							(uint64_t)device);
 						if (pdvref >= 0)
 							kmsg_add_entryref(&msg2,
 								"virtual:directory",

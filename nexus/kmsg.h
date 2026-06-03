@@ -184,9 +184,10 @@ static inline void kmsg_finalize(struct kmsg_builder *msg, port_id port, uint32_
 {
 	// Header size
     *(int32_t *)(msg->buffer + 4) = (int32_t)msg->size;
-    // Delivery info
+    // Delivery info: targetToken identifies handler; replyPort is N/A for notifications
     *(int32_t *)(msg->buffer + 16) = (int32_t)token;
-    *(int32_t *)(msg->buffer + 20) = port;
+    *(int32_t *)(msg->buffer + 20) = -1;
+    (void)port;
 }
 
 #endif /* __VOS_NEXUS_KMSG */
