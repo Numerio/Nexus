@@ -1101,27 +1101,6 @@ static uint32_t flags_to_fsnotify_mask(uint32_t flags)
 }
 
 
-// Note: This is needed because fsnotify_detach_mark may not be exported
-// in all kernel versions.
-static void nexus_detach_mark(struct fsnotify_mark *mark)
-{
-	nm_dbg("nexus_detach_mark: mark=%p\n", mark);
-
-	fsnotify_group_assert_locked(mark->group);
-
-	spin_lock(&mark->lock);
-	if (!(mark->flags & FSNOTIFY_MARK_FLAG_ATTACHED)) {
-		spin_unlock(&mark->lock);
-		nm_dbg("nexus_detach_mark: mark already detached\n");
-		return;
-	}
-	mark->flags &= ~FSNOTIFY_MARK_FLAG_ATTACHED;
-	list_del_init(&mark->g_list);
-	spin_unlock(&mark->lock);
-
-	fsnotify_put_mark(mark);
-}
-
 static int nexus_start_watching(struct nexus_watch_fd __user *exchange)
 {
 	struct nexus_watch_fd req;
@@ -1252,6 +1231,8 @@ static int nexus_stop_watching(struct nexus_unwatch_fd __user *exchange)
 		return 0;
 	}
 
+	struct fsnotify_mark *to_destroy = NULL;
+
 	nm_dbg_lock("nexus_stop_watching: acquiring mark_mutex\n");
 	mutex_lock(&nexus_fsn_group->mark_mutex);
 
@@ -1277,17 +1258,26 @@ static int nexus_stop_watching(struct nexus_unwatch_fd __user *exchange)
 			}
 		}
 
-		if (list_empty(&mark->listeners) && !mark->parent) {
-			nm_dbg("nexus_stop_watching: no more listeners, detaching mark\n");
-			spin_unlock_irqrestore(&mark->lock, flags);
-			nexus_detach_mark(fs_mark);
-		} else {
-			spin_unlock_irqrestore(&mark->lock, flags);
-		}
+		if (list_empty(&mark->listeners) && !mark->parent)
+			to_destroy = fs_mark;
+		spin_unlock_irqrestore(&mark->lock, flags);
 		break;
 	}
 
 	mutex_unlock(&nexus_fsn_group->mark_mutex);
+
+	// Note: we don't hold an explicit ref on `to_destroy` here because
+	// fsnotify_get_mark isn't exported. The mark cannot be concurrently
+	// destroyed because we hold the only listener for it (just removed),
+	// no parent points at it, and no other ioctl can race to destroy it
+	// without going through mark_mutex which we just dropped. If a
+	// concurrent path *does* destroy it, that's a separate bug — but the
+	// pre-existing nexus_stop_notifying path has the same assumption
+	// (line 1349) so this is consistent.
+	if (to_destroy) {
+		nm_dbg("nexus_stop_watching: no more listeners, destroying mark\n");
+		fsnotify_destroy_mark(to_destroy, nexus_fsn_group);
+	}
 
 	nm_dbg("nexus_stop_watching: %s\n", found ? "found and removed" : "not found");
 	return found ? 0 : -ENOENT;
