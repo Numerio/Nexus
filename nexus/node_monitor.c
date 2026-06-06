@@ -1092,7 +1092,7 @@ static uint32_t flags_to_fsnotify_mask(uint32_t flags)
 		mask |= FS_MODIFY | FS_ATTRIB | FS_CLOSE_WRITE;
 	if (flags & B_WATCH_ATTR)
 		mask |= FS_ATTRIB;
-	if (flags & B_WATCH_DIRECTORY)
+	if (flags & (B_WATCH_DIRECTORY | B_WATCH_CHILDREN))
 		mask |= FS_CREATE | FS_DELETE | FS_MOVED_FROM | FS_MOVED_TO;
 
 	nm_dbg("flags_to_fsnotify_mask: B_WATCH=0x%x -> fsnotify=0x%x\n",
