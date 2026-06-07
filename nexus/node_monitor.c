@@ -1346,8 +1346,10 @@ static int nexus_stop_notifying(struct nexus_stop_notifying __user *exchange)
 			}
 
 			if (marks_count < marks_capacity) {
-				// TODO kernel doesn't seem to export that
-				//fsnotify_get_mark(&mark->fs_mark);
+				// fsnotify_get_mark isn't exported; pre-existing
+				// pattern relies on the assumption that no other
+				// path can destroy this mark between mutex unlock
+				// and our destroy call below.
 				marks_to_remove[marks_count++] = mark;
 			}
 		}

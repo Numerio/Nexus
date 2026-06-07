@@ -6,6 +6,11 @@
 #ifndef __VOS_NEXUS_PRIVATE
 #define __VOS_NEXUS_PRIVATE
 
+#include <linux/fs.h>
+#include <linux/hashtable.h>
+#include <linux/kref.h>
+#include <linux/path.h>
+
 
 #define B_INFINITE_TIMEOUT	(9223372036854775807LL)
 // NOTE: not sure if we want that stuff to be configurable
@@ -183,14 +188,34 @@ typedef struct area_info {
 	void*					address;
 } area_info;
 
+#define NEXUS_FH_MAX 32
+
+enum nexus_vref_kind {
+	VREF_FH,
+	VREF_PATH,
+};
+
 struct nexus_vref {
 	struct hlist_node		node;
 	struct kref				ref_count;
 
 	int32_t					id;
-	struct file*			file;
-
 	pid_t					team;
+
+	enum nexus_vref_kind	kind;
+	union {
+		struct {
+			struct vfsmount	*mnt;
+			fmode_t			mode;
+			u8				fh[NEXUS_FH_MAX];
+			u8				fh_len;
+			int				fh_type;
+		} fh;
+		struct {
+			struct path		path;
+			fmode_t			mode;
+		} pth;
+	};
 };
 
 

@@ -38,17 +38,15 @@ long nexus_port_find(unsigned long arg)
 		return -EFAULT;
 	}
 
-	{
-		struct nexus_port *p;
-		int pid;
-		in_data.id = B_ERROR;
-		in_data.ret = B_NAME_NOT_FOUND;
-		idr_for_each_entry(&nexus_port_idr, p, pid) {
-			if (strcmp(p->name, name) == 0) {
-				in_data.id = p->id;
-				in_data.ret = B_OK;
-				break;
-			}
+	struct nexus_port *p;
+	int pid;
+	in_data.id = B_ERROR;
+	in_data.ret = B_NAME_NOT_FOUND;
+	idr_for_each_entry(&nexus_port_idr, p, pid) {
+		if (strcmp(p->name, name) == 0) {
+			in_data.id = p->id;
+			in_data.ret = B_OK;
+			break;
 		}
 	}
 
@@ -128,16 +126,14 @@ long nexus_port_create(struct nexus_team* team, unsigned long arg)
 
 	rwlock_init(&port->rw_lock);
 
-	{
-		int id = idr_alloc(&nexus_port_idr, port, 1, 0, GFP_KERNEL);
-		if (id < 0) {
-			kfree(port);
-			in_data.ret = B_NO_MORE_PORTS;
-			goto out_copy;
-		}
-		port->id = id;
-		in_data.id = id;
+	int id = idr_alloc(&nexus_port_idr, port, 1, 0, GFP_KERNEL);
+	if (id < 0) {
+		kfree(port);
+		in_data.ret = B_NO_MORE_PORTS;
+		goto out_copy;
 	}
+	port->id = id;
+	in_data.id = id;
 	in_data.ret = B_OK;
 
 out_copy:
