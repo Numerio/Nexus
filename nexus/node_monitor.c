@@ -106,6 +106,48 @@ typedef int32_t port_id;
 
 extern uint32_t nexus_write_port(uint32_t port, int32_t code,
 	const void *buffer, size_t buffer_size);
+extern pid_t nexus_port_team_of(uint32_t id);
+extern int nexus_vref_grant_slot_for_id(int32_t id, pid_t target_team);
+
+/* For each B_NODE_REF_TYPE / B_REF_TYPE field in a finalized KMessage
+ * buffer, ensure target_team has a kernel slot for the embedded vref id.
+ * Kernel ships these KMessages via plain port write (no cap-transport),
+ * so without a pre-minted slot the receiver's acquire would EPERM. */
+static void
+nm_grant_vrefs_in_kmsg(const char *buffer, size_t size, pid_t target_team)
+{
+	size_t off;
+
+	if (target_team <= 0 || buffer == NULL || size < KMSG_HEADER_SIZE)
+		return;
+
+	off = KMSG_HEADER_SIZE;
+	while (off + 18 <= size) {
+		const char *fp = buffer + off;
+		uint32_t type = *(const uint32_t *)(fp + 0);
+		int32_t field_size = *(const int32_t *)(fp + 12);
+		int16_t header_size = *(const int16_t *)(fp + 16);
+
+		if (field_size <= 0 || (size_t)field_size > size - off)
+			break;
+		if (header_size <= 0
+				|| (size_t)header_size > (size_t)field_size)
+			break;
+
+		if ((type == B_NODE_REF_TYPE || type == B_REF_TYPE)
+				&& (size_t)header_size + 16 <= (size_t)field_size) {
+			/* Field value: [4-byte length][dev:8][id:8]. */
+			const char *vp = fp + header_size;
+			int64_t id = *(const int64_t *)(vp + 4 + 8);
+
+			if (id >= 0 && id <= S32_MAX)
+				nexus_vref_grant_slot_for_id((int32_t)id,
+					target_team);
+		}
+
+		off += (size_t)((field_size + 3) & ~3);
+	}
+}
 
 struct nexus_listener {
 	struct list_head list;
@@ -270,6 +312,8 @@ static void send_queued_notifications(struct list_head *queue)
 		nm_dbg_msg("sending queued notification: port=%d token=%u\n",
 			notif->port, notif->token);
 
+		nm_grant_vrefs_in_kmsg(notif->buffer, notif->size,
+			nexus_port_team_of(notif->port));
 		nexus_write_port(notif->port, B_NODE_MONITOR,
 			notif->buffer, notif->size);
 
@@ -304,6 +348,8 @@ static void send_to_listener(struct nexus_listener *listener,
 	atomic_inc(&stat_messages);
 #endif
 
+	nm_grant_vrefs_in_kmsg(msg->buffer, msg->size,
+		nexus_port_team_of(listener->port));
 	nexus_write_port(listener->port, B_NODE_MONITOR, msg->buffer, msg->size);
 }
 
@@ -1399,9 +1445,8 @@ static long nexus_nm_ioctl(struct file *file, unsigned int cmd, unsigned long ar
 		return nexus_stop_notifying((void __user *)arg);
 	case NEXUS_VREF_CREATE:
 	case NEXUS_VREF_ACQUIRE:
-	case NEXUS_VREF_ACQUIRE_FD:
-	case NEXUS_VREF_OPEN:
 	case NEXUS_VREF_RELEASE:
+	case NEXUS_VREF_OPEN:
 		return nexus_vref_ioctl(cmd, arg);
 	case NEXUS_QUERY_VOLUME_FLAGS:
 		return nexus_volume_ioctl_query_flags(arg);
@@ -1789,8 +1834,6 @@ static int __init nexus_node_monitor_init(void)
 		nm_warn("xattr tracking disabled (kprobes failed)\n");
 
 	nexus_volume_init();
-	nexus_vref_init();
-	nexus_register_team_exit(nexus_vref_team_exit);
 	nexus_query_init();
 	nexus_attr_init();
 	nexus_index_init();
@@ -1815,8 +1858,6 @@ static void __exit nexus_node_monitor_exit(void)
 		nexus_index_exit();
 	nexus_attr_exit();
 	nexus_query_exit();
-	nexus_unregister_team_exit(nexus_vref_team_exit);
-	nexus_vref_exit();
 	nexus_volume_exit();
 
 	unregister_xattr_kprobes();

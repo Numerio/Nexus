@@ -4,6 +4,7 @@
  */
 
 #include "nexus.h"
+#include "vref.h"
 
 #include <linux/cdev.h>
 #include <linux/fs.h>
@@ -850,6 +851,12 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		case NEXUS_SET_PORT_OWNER:
 			ret = nexus_port_io_set_owner(team, arg);
 			break;
+		case NEXUS_PORT_WRITE_CAPS:
+			ret = nexus_port_io_write_caps(team, arg);
+			break;
+		case NEXUS_PORT_READ_CAPS:
+			ret = nexus_port_io_read_caps(team, arg);
+			break;
 
 		case NEXUS_PORT_FIND:
 			ret = nexus_port_find(arg);
@@ -963,6 +970,13 @@ static int nexus_init(void)
 		goto error;
 	}
 
+	ret = nexus_vref_init();
+	if (ret < 0) {
+		pr_err("nexus: failed to init vref: %d\n", ret);
+		nexus_sem_exit();
+		goto error;
+	}
+
 	printk(KERN_INFO "nexus: loaded\n");
 	return 0;
 
@@ -973,6 +987,7 @@ error:
 
 static void nexus_exit(void)
 {
+	nexus_vref_exit();
 	nexus_sem_exit();
 	nexus_cleanup_dev(1);
 	printk(KERN_INFO "nexus: unloaded\n");

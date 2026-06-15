@@ -1,22 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  * Copyright (C) 2025-2026. Dario Casalinuovo
- *
- * vref: virtual reference handle for an inode-identity token.
- *
- * Two arms:
- *   VREF_FH   — exportfs file handle + vfsmount. Used for any filesystem
- *               with export_ops. No struct file or inode pin: rename and
- *               unlink-with-other-link semantics match BeOS node_ref.
- *               Re-open uses exportfs_decode_fh(); returns ESTALE → mapped
- *               to B_ENTRY_NOT_FOUND when the inode is gone.
- *
- *   VREF_PATH — pinned struct path. Fallback for synthetic filesystems
- *               (proc, sys, debugfs, cgroup) that lack export_ops. The
- *               pin is harmless on RAM-only fs.
- *
- * Sockets, anon_inodes, pipes are rejected at create: they have no useful
- * inode identity and are outside the entry_ref/node_ref API surface.
  */
 
 #include <linux/dcache.h>
@@ -30,6 +14,7 @@
 #include <linux/mount.h>
 #include <linux/mutex.h>
 #include <linux/path.h>
+#include <linux/random.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 
@@ -62,8 +47,15 @@ nexus_vref_destroy(struct kref *kref)
 {
 	struct nexus_vref *entry
 		= container_of(kref, struct nexus_vref, ref_count);
+	struct nexus_vref_slot *slot, *tmp;
 
 	hash_del(&entry->node);
+
+	list_for_each_entry_safe(slot, tmp, &entry->slots, node) {
+		list_del(&slot->node);
+		kfree(slot);
+	}
+
 	if (entry->kind == VREF_FH)
 		mntput(entry->fh.mnt);
 	else
@@ -106,7 +98,6 @@ nexus_vref_create_from_file(struct file *file)
 			entry->fh.fh_type = type;
 			entry->fh.mode    = file->f_mode;
 		} else {
-			/* fall through to PATH arm */
 			entry->kind = VREF_PATH;
 		}
 	} else {
@@ -132,125 +123,384 @@ nexus_vref_create_from_file(struct file *file)
 	mutex_lock(&fd_map_lock);
 	kref_init(&entry->ref_count);
 	entry->id = id;
-	entry->team = current->tgid;
+	INIT_LIST_HEAD(&entry->slots);
+	mutex_init(&entry->slots_lock);
 	hash_add(fd_hashmap, &entry->node, entry->id);
 	mutex_unlock(&fd_map_lock);
 
 	return entry->id;
 }
 
-
-static int32_t
-nexus_vref_create_from_user_fd(int fd)
+static fmode_t
+nexus_vref_backing_mode(const struct nexus_vref *entry)
 {
-	struct file *file = fget(fd);
-	int32_t id;
+	return entry->kind == VREF_FH ? entry->fh.mode : entry->pth.mode;
+}
 
+static int
+nexus_vref_add_slot_for(struct nexus_vref *entry, pid_t target_team,
+	fmode_t allowed_mode, vref_key *out_key)
+{
+	struct nexus_vref_slot *slot;
+	uint64_t key;
+
+	slot = kzalloc(sizeof(*slot), GFP_KERNEL);
+	if (!slot)
+		return -ENOMEM;
+
+	do {
+		key = get_random_u64();
+	} while (key == 0);
+
+	slot->key = key;
+	slot->owner_team = target_team;
+	slot->allowed_mode = allowed_mode;
+
+	mutex_lock(&entry->slots_lock);
+	list_add(&slot->node, &entry->slots);
+	mutex_unlock(&entry->slots_lock);
+
+	kref_get(&entry->ref_count);
+	*out_key = key;
+	return B_OK;
+}
+
+static int
+nexus_vref_add_slot(struct nexus_vref *entry, vref_key *out_key)
+{
+	return nexus_vref_add_slot_for(entry, current->tgid,
+		nexus_vref_backing_mode(entry), out_key);
+}
+
+static bool
+nexus_vref_caller_owns(struct nexus_vref *entry)
+{
+	struct nexus_vref_slot *s;
+	bool owns = false;
+	mutex_lock(&entry->slots_lock);
+	list_for_each_entry(s, &entry->slots, node) {
+		if (s->owner_team == current->tgid) {
+			owns = true;
+			break;
+		}
+	}
+	mutex_unlock(&entry->slots_lock);
+	return owns;
+}
+
+static int
+nexus_vref_drop_slot(struct nexus_vref *entry, vref_key key)
+{
+	struct nexus_vref_slot *slot, *tmp;
+	int ret = -EINVAL;
+
+	mutex_lock(&entry->slots_lock);
+	list_for_each_entry_safe(slot, tmp, &entry->slots, node) {
+		if (slot->key != key || slot->owner_team != current->tgid)
+			continue;
+		list_del(&slot->node);
+		kfree(slot);
+		ret = B_OK;
+		break;
+	}
+	mutex_unlock(&entry->slots_lock);
+
+	if (ret == B_OK)
+		kref_put(&entry->ref_count, nexus_vref_destroy);
+	return ret;
+}
+
+
+static long
+nexus_vref_create(struct nexus_vref_create __user *uarg)
+{
+	struct nexus_vref_create k;
+	struct file *file;
+	struct nexus_vref *entry = NULL;
+	int32_t id;
+	int ret;
+
+	if (copy_from_user(&k, uarg, sizeof(k)))
+		return -EFAULT;
+
+	file = fget(k.fd);
 	if (!file)
 		return -EBADF;
 
 	id = nexus_vref_create_from_file(file);
 	fput(file);
-	return id;
+	if (id < 0)
+		return id;
+
+	mutex_lock(&fd_map_lock);
+	hash_for_each_possible(fd_hashmap, entry, node, id) {
+		if (entry->id == id)
+			break;
+	}
+	if (!entry || entry->id != id) {
+		mutex_unlock(&fd_map_lock);
+		return -ENOENT;
+	}
+	ret = nexus_vref_add_slot(entry, &k.key);
+	mutex_unlock(&fd_map_lock);
+	if (ret != B_OK)
+		return ret;
+
+	k.id = id;
+	if (copy_to_user(uarg, &k, sizeof(k)))
+		return -EFAULT;
+	return 0;
 }
 
 
-static int
-nexus_vref_acquire(int32_t id)
+static long
+nexus_vref_acquire(struct nexus_vref_op __user *uarg)
 {
+	struct nexus_vref_op k;
 	struct nexus_vref *entry = NULL;
+	int ret = -EINVAL;
+
+	if (copy_from_user(&k, uarg, sizeof(k)))
+		return -EFAULT;
+
+	mutex_lock(&fd_map_lock);
+	hash_for_each_possible(fd_hashmap, entry, node, k.id) {
+		if (entry->id != k.id)
+			continue;
+		if (!nexus_vref_caller_owns(entry)) {
+			pid_t first_owner = -1;
+			struct nexus_vref_slot *s;
+			mutex_lock(&entry->slots_lock);
+			s = list_first_entry_or_null(&entry->slots,
+				struct nexus_vref_slot, node);
+			if (s) first_owner = s->owner_team;
+			mutex_unlock(&entry->slots_lock);
+			pr_warn_ratelimited("nexus_vref: ACQUIRE EPERM "
+				"id=%d caller=%d(%s) owner=%d\n",
+				k.id, current->tgid, current->comm, first_owner);
+			ret = -EPERM;
+			break;
+		}
+		ret = nexus_vref_add_slot(entry, &k.key);
+		break;
+	}
+	mutex_unlock(&fd_map_lock);
+	if (ret != B_OK)
+		return ret;
+
+	if (copy_to_user(uarg, &k, sizeof(k)))
+		return -EFAULT;
+	return 0;
+}
+
+static long
+nexus_vref_open(struct nexus_vref_open __user *uarg)
+{
+	struct nexus_vref_open k;
+	struct nexus_vref *entry = NULL;
+	struct nexus_vref_slot *slot;
+	struct file *file;
+	int fd, ret = -EINVAL;
+
+	enum nexus_vref_kind kind;
+	struct vfsmount *mnt = NULL;
+	struct path path = { .mnt = NULL, .dentry = NULL };
+	u8 fh[NEXUS_FH_MAX];
+	u8 fh_len = 0;
+	int fh_type = 0;
+	fmode_t open_mode = 0;
+	bool held_kref = false;
+
+	if (copy_from_user(&k, uarg, sizeof(k)))
+		return -EFAULT;
+
+	mutex_lock(&fd_map_lock);
+	hash_for_each_possible(fd_hashmap, entry, node, k.id) {
+		if (entry->id != k.id)
+			continue;
+		mutex_lock(&entry->slots_lock);
+		list_for_each_entry(slot, &entry->slots, node) {
+			if (slot->key != k.key
+					|| slot->owner_team != current->tgid)
+				continue;
+			open_mode = k.requested_mode == 0
+				? slot->allowed_mode
+				: ((fmode_t)k.requested_mode & slot->allowed_mode);
+			ret = open_mode == 0 ? -EACCES : B_OK;
+			break;
+		}
+		mutex_unlock(&entry->slots_lock);
+		if (ret == B_OK) {
+			kind = entry->kind;
+			if (kind == VREF_FH) {
+				mnt = mntget(entry->fh.mnt);
+				fh_len = entry->fh.fh_len;
+				fh_type = entry->fh.fh_type;
+				memcpy(fh, entry->fh.fh, fh_len);
+			} else {
+				path = entry->pth.path;
+				path_get(&path);
+			}
+			kref_get(&entry->ref_count);
+			held_kref = true;
+		}
+		break;
+	}
+	mutex_unlock(&fd_map_lock);
+
+	if (ret != B_OK)
+		return ret;
+
+	if (kind == VREF_FH) {
+		struct dentry *dec = exportfs_decode_fh(mnt,
+			(struct fid *)fh, fh_len / 4, fh_type, NULL, NULL);
+		struct path p;
+		if (IS_ERR(dec)) {
+			ret = PTR_ERR(dec) == -ESTALE
+				? B_ENTRY_NOT_FOUND : B_ERROR;
+			goto out;
+		}
+		p.mnt = mnt;
+		p.dentry = dec;
+		file = dentry_open(&p, open_mode, current_cred());
+		dput(dec);
+	} else
+		file = dentry_open(&path, open_mode, current_cred());
+
+	if (IS_ERR(file)) {
+		ret = B_NOT_ALLOWED;
+		goto out;
+	}
+	fd = get_unused_fd_flags(O_CLOEXEC);
+	if (fd < 0) {
+		fput(file);
+		ret = B_NO_MEMORY;
+		goto out;
+	}
+	fd_install(fd, file);
+	k.fd_out = fd;
+	ret = B_OK;
+
+out:
+	if (kind == VREF_FH)
+		mntput(mnt);
+	else
+		path_put(&path);
+	if (held_kref) {
+		mutex_lock(&fd_map_lock);
+		kref_put(&entry->ref_count, nexus_vref_destroy);
+		mutex_unlock(&fd_map_lock);
+	}
+	if (ret != B_OK)
+		return ret;
+	if (copy_to_user(uarg, &k, sizeof(k)))
+		return -EFAULT;
+	return 0;
+}
+
+
+static long
+nexus_vref_release(struct nexus_vref_op __user *uarg)
+{
+	struct nexus_vref_op k;
+	struct nexus_vref *entry = NULL;
+	int ret = -EINVAL;
+
+	if (copy_from_user(&k, uarg, sizeof(k)))
+		return -EFAULT;
+
+	mutex_lock(&fd_map_lock);
+	hash_for_each_possible(fd_hashmap, entry, node, k.id) {
+		if (entry->id == k.id) {
+			ret = nexus_vref_drop_slot(entry, k.key);
+			break;
+		}
+	}
+	mutex_unlock(&fd_map_lock);
+
+	return ret;
+}
+
+struct nexus_vref *
+nexus_vref_kref_acquire(int32_t id)
+{
+	struct nexus_vref *entry = NULL, *found = NULL;
 
 	mutex_lock(&fd_map_lock);
 	hash_for_each_possible(fd_hashmap, entry, node, id) {
 		if (entry->id == id) {
 			kref_get(&entry->ref_count);
-			entry->team = current->tgid;
-			mutex_unlock(&fd_map_lock);
-			return B_OK;
-		}
-	}
-	mutex_unlock(&fd_map_lock);
-	return -EINVAL;
-}
-
-
-/* Re-open the inode identified by the vref. Returns a new fd or a Haiku
- * status code. Caller takes ownership of the fd.
- */
-static int
-nexus_vref_reopen(struct nexus_vref *entry)
-{
-	struct file *file;
-	int fd;
-
-	if (entry->kind == VREF_FH) {
-		struct dentry *dec = exportfs_decode_fh(entry->fh.mnt,
-			(struct fid *)entry->fh.fh,
-			entry->fh.fh_len / 4,
-			entry->fh.fh_type,
-			NULL, NULL);
-		struct path p;
-
-		if (IS_ERR(dec)) {
-			long err = PTR_ERR(dec);
-			return (err == -ESTALE) ? B_ENTRY_NOT_FOUND : B_ERROR;
-		}
-		p.mnt = entry->fh.mnt;
-		p.dentry = dec;
-		file = dentry_open(&p, entry->fh.mode, current_cred());
-		dput(dec);
-	} else {
-		file = dentry_open(&entry->pth.path, entry->pth.mode,
-			current_cred());
-	}
-
-	if (IS_ERR(file))
-		return B_NOT_ALLOWED;
-
-	fd = get_unused_fd_flags(O_CLOEXEC);
-	if (fd < 0) {
-		fput(file);
-		return B_NO_MEMORY;
-	}
-	fd_install(fd, file);
-	return fd;
-}
-
-
-static int
-nexus_vref_acquire_fd(int32_t id)
-{
-	struct nexus_vref *entry = NULL;
-	int fd = -EINVAL;
-
-	mutex_lock(&fd_map_lock);
-	hash_for_each_possible(fd_hashmap, entry, node, id) {
-		if (entry->id == id) {
-			fd = nexus_vref_reopen(entry);
+			found = entry;
 			break;
 		}
 	}
 	mutex_unlock(&fd_map_lock);
-	return fd;
+	return found;
 }
 
-
-static int
-nexus_vref_open(int32_t id)
+void
+nexus_vref_kref_release(struct nexus_vref *entry)
 {
-	struct nexus_vref *entry = NULL;
-	int fd = B_ENTRY_NOT_FOUND;
-
+	if (entry == NULL)
+		return;
 	mutex_lock(&fd_map_lock);
-	hash_for_each_possible(fd_hashmap, entry, node, id) {
-		if (entry->id == id) {
-			fd = nexus_vref_reopen(entry);
+	kref_put(&entry->ref_count, nexus_vref_destroy);
+	mutex_unlock(&fd_map_lock);
+}
+
+int
+nexus_vref_mint_slot_for(struct nexus_vref *entry, pid_t target_team,
+	uint64_t *out_key)
+{
+	if (entry == NULL || out_key == NULL)
+		return -EINVAL;
+	return nexus_vref_add_slot_for(entry, target_team,
+		nexus_vref_backing_mode(entry), out_key);
+}
+
+int
+nexus_vref_grant_slot_for_id(int32_t id, pid_t target_team)
+{
+	struct nexus_vref *entry;
+	struct nexus_vref_slot *s;
+	bool already_owns = false;
+	uint64_t key;
+	int ret;
+
+	if (target_team <= 0)
+		return -EINVAL;
+	entry = nexus_vref_kref_acquire(id);
+	if (entry == NULL)
+		return -ENOENT;
+
+	mutex_lock(&entry->slots_lock);
+	list_for_each_entry(s, &entry->slots, node) {
+		if (s->owner_team == target_team) {
+			already_owns = true;
 			break;
 		}
 	}
-	mutex_unlock(&fd_map_lock);
-	return fd;
+	mutex_unlock(&entry->slots_lock);
+
+	if (already_owns) {
+		nexus_vref_kref_release(entry);
+		return B_OK;
+	}
+
+	ret = nexus_vref_add_slot_for(entry, target_team,
+		nexus_vref_backing_mode(entry), &key);
+	nexus_vref_kref_release(entry);
+	return ret;
 }
+
+
+EXPORT_SYMBOL(nexus_vref_kref_acquire);
+EXPORT_SYMBOL(nexus_vref_kref_release);
+EXPORT_SYMBOL(nexus_vref_mint_slot_for);
+EXPORT_SYMBOL(nexus_vref_grant_slot_for_id);
+EXPORT_SYMBOL(nexus_vref_ioctl);
+EXPORT_SYMBOL(nexus_vref_create_from_file);
+EXPORT_SYMBOL(nexus_vref_drop_kernel_ref);
 
 
 void
@@ -270,61 +520,25 @@ nexus_vref_drop_kernel_ref(int32_t id)
 }
 
 
-static long
-nexus_vref_release(int32_t id)
-{
-	struct nexus_vref *entry = NULL;
-	struct hlist_node *tmp = NULL;
-	long ret = -EINVAL;
-
-	mutex_lock(&fd_map_lock);
-	hash_for_each_possible_safe(fd_hashmap, entry, tmp, node, id) {
-		if (entry->id == id) {
-			if (entry->team != current->tgid) {
-				ret = 0;
-			} else {
-				kref_put(&entry->ref_count, nexus_vref_destroy);
-				ret = 0;
-			}
-			break;
-		}
-	}
-	mutex_unlock(&fd_map_lock);
-	return ret;
-}
-
-
 long
 nexus_vref_ioctl(unsigned int cmd, unsigned long arg)
 {
-	int fd = -1;
-	int32_t id = -1;
-
 	switch (cmd) {
 		case NEXUS_VREF_CREATE:
-			if (copy_from_user(&fd, (int __user *)arg, sizeof(fd)))
-				return -EFAULT;
-			return nexus_vref_create_from_user_fd(fd);
-
-		case NEXUS_VREF_ACQUIRE_FD:
-			if (copy_from_user(&id, (int __user *)arg, sizeof(id)))
-				return -EFAULT;
-			return nexus_vref_acquire_fd(id);
+			return nexus_vref_create(
+				(struct nexus_vref_create __user *)arg);
 
 		case NEXUS_VREF_ACQUIRE:
-			if (copy_from_user(&id, (int __user *)arg, sizeof(id)))
-				return -EFAULT;
-			return nexus_vref_acquire(id);
-
-		case NEXUS_VREF_OPEN:
-			if (copy_from_user(&id, (int __user *)arg, sizeof(id)))
-				return -EFAULT;
-			return nexus_vref_open(id);
+			return nexus_vref_acquire(
+				(struct nexus_vref_op __user *)arg);
 
 		case NEXUS_VREF_RELEASE:
-			if (copy_from_user(&id, (int __user *)arg, sizeof(id)))
-				return -EFAULT;
-			return nexus_vref_release(id);
+			return nexus_vref_release(
+				(struct nexus_vref_op __user *)arg);
+
+		case NEXUS_VREF_OPEN:
+			return nexus_vref_open(
+				(struct nexus_vref_open __user *)arg);
 
 		default:
 			return -ENOTTY;
@@ -335,7 +549,7 @@ nexus_vref_ioctl(unsigned int cmd, unsigned long arg)
 int
 nexus_vref_init(void)
 {
-	pr_info("nexus_vref: initialized (fh+path)\n");
+	nexus_register_team_exit(nexus_vref_team_exit);
 	return 0;
 }
 
@@ -343,8 +557,8 @@ nexus_vref_init(void)
 void
 nexus_vref_exit(void)
 {
+	nexus_unregister_team_exit(nexus_vref_team_exit);
 	ida_destroy(&vref_ida);
-	pr_info("nexus_vref: cleaned up\n");
 }
 
 
@@ -357,11 +571,20 @@ nexus_vref_team_exit(pid_t team)
 
 	mutex_lock(&fd_map_lock);
 	hash_for_each_safe(fd_hashmap, bkt, tmp, entry, node) {
-		if (entry->team == (int)team) {
-			pr_debug("nexus_vref: releasing vref %d for exiting team %d\n",
-				entry->id, team);
-			kref_put(&entry->ref_count, nexus_vref_destroy);
+		struct nexus_vref_slot *slot, *stmp;
+		int reaped = 0;
+
+		mutex_lock(&entry->slots_lock);
+		list_for_each_entry_safe(slot, stmp, &entry->slots, node) {
+			if (slot->owner_team == (int)team) {
+				list_del(&slot->node);
+				kfree(slot);
+				reaped++;
+			}
 		}
+		mutex_unlock(&entry->slots_lock);
+		while (reaped--)
+			kref_put(&entry->ref_count, nexus_vref_destroy);
 	}
 	mutex_unlock(&fd_map_lock);
 }

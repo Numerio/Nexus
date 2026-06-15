@@ -9,6 +9,8 @@
 #include <linux/fs.h>
 #include <linux/hashtable.h>
 #include <linux/kref.h>
+#include <linux/list.h>
+#include <linux/mutex.h>
 #include <linux/path.h>
 
 
@@ -92,6 +94,13 @@ struct nexus_thread {
 	struct nexus_team*		team;
 };
 
+struct nexus_vref;
+
+struct nexus_port_cap_kref {
+	struct nexus_vref*		vref;
+	uint32_t				buffer_offset;
+};
+
 struct nexus_buffer {
 	struct list_head		node;
 
@@ -102,6 +111,9 @@ struct nexus_buffer {
 	uid_t					sender;
 	gid_t					sender_group;
 	team_id					sender_team;
+
+	struct nexus_port_cap_kref*	caps;
+	int						cap_count;
 };
 
 struct nexus_port {
@@ -195,12 +207,21 @@ enum nexus_vref_kind {
 	VREF_PATH,
 };
 
+struct nexus_vref_slot {
+	struct list_head		node;
+	uint64_t				key;
+	pid_t					owner_team;
+	fmode_t					allowed_mode;
+};
+
 struct nexus_vref {
 	struct hlist_node		node;
 	struct kref				ref_count;
 
 	int32_t					id;
-	pid_t					team;
+
+	struct list_head		slots;
+	struct mutex			slots_lock;
 
 	enum nexus_vref_kind	kind;
 	union {
@@ -221,10 +242,10 @@ struct nexus_vref {
 
 /* Team-exit notification callbacks */
 
-int  nexus_sem_init(void);
-void nexus_sem_exit(void);
-void nexus_sem_team_exit(pid_t team);
-long nexus_sem_ioctl(unsigned int cmd, unsigned long arg);
+int  					nexus_sem_init(void);
+void					nexus_sem_exit(void);
+void					nexus_sem_team_exit(pid_t team);
+long					nexus_sem_ioctl(unsigned int cmd, unsigned long arg);
 
 
 struct nexus_team*		nexus_team_init(void);
@@ -257,6 +278,8 @@ long					nexus_port_io_write(struct nexus_team *team, unsigned long arg);
 long					nexus_port_io_info(struct nexus_team *team, unsigned long arg);
 long					nexus_port_io_message_info(struct nexus_team *team, unsigned long arg);
 long					nexus_port_io_set_owner(struct nexus_team *team, unsigned long arg);
+long					nexus_port_io_write_caps(struct nexus_team *team, unsigned long arg);
+long					nexus_port_io_read_caps(struct nexus_team *team, unsigned long arg);
 
 void					nexus_sem_delete(struct kref* ref);
 

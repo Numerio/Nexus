@@ -20,6 +20,7 @@ typedef int32_t port_id;
 typedef int32_t area_id;
 typedef int32_t sem_id;
 typedef int32_t vref_id;
+typedef uint64_t vref_key;
 typedef pid_t team_id;
 typedef pid_t thread_id;
 typedef int64_t bigtime_t;
@@ -47,6 +48,8 @@ typedef int64_t bigtime_t;
 #define NEXUS_PORT_INFO          _IOWR(NEXUS_MAGIC, 33, struct nexus_port_get_info)
 #define NEXUS_PORT_MESSAGE_INFO  _IOWR(NEXUS_MAGIC, 34, struct nexus_port_get_message_info)
 #define NEXUS_SET_PORT_OWNER     _IOWR(NEXUS_MAGIC, 35, struct nexus_port_set_owner)
+#define NEXUS_PORT_WRITE_CAPS    _IOWR(NEXUS_MAGIC, 36, struct nexus_port_write_caps)
+#define NEXUS_PORT_READ_CAPS     _IOWR(NEXUS_MAGIC, 37, struct nexus_port_read_caps)
 #define NEXUS_PORT_FIND          _IOWR(NEXUS_MAGIC, 12, struct nexus_port_find_req)
 #define NEXUS_GET_NEXT_PORT_FOR_TEAM	_IOWR(NEXUS_MAGIC, 13, struct nexus_get_next_port)
 
@@ -60,11 +63,31 @@ typedef int64_t bigtime_t;
 
 #define NEXUS_VREF_MAGIC	'V'
 
-#define NEXUS_VREF_CREATE			_IO(NEXUS_VREF_MAGIC, 1)
-#define NEXUS_VREF_ACQUIRE			_IO(NEXUS_VREF_MAGIC, 2)
-#define NEXUS_VREF_ACQUIRE_FD		_IO(NEXUS_VREF_MAGIC, 3)
-#define NEXUS_VREF_OPEN				_IO(NEXUS_VREF_MAGIC, 4)
-#define NEXUS_VREF_RELEASE			_IO(NEXUS_VREF_MAGIC, 5)
+struct nexus_vref_create {
+	int			fd;
+	/* out */
+	vref_id		id;
+	vref_key	key;
+};
+
+struct nexus_vref_op {
+	vref_id		id;
+	vref_key	key;
+};
+
+
+struct nexus_vref_open {
+	vref_id		id;
+	vref_key	key;
+	uint32_t	requested_mode;
+	/* out */
+	int			fd_out;
+};
+
+#define NEXUS_VREF_CREATE	_IOWR(NEXUS_VREF_MAGIC, 6, struct nexus_vref_create)
+#define NEXUS_VREF_ACQUIRE	_IOWR(NEXUS_VREF_MAGIC, 7, struct nexus_vref_op)
+#define NEXUS_VREF_RELEASE	_IOWR(NEXUS_VREF_MAGIC, 8, struct nexus_vref_op)
+#define NEXUS_VREF_OPEN		_IOWR(NEXUS_VREF_MAGIC, 9, struct nexus_vref_open)
 
 #ifdef __KERNEL__
 typedef void (*nexus_team_notify_fn)(pid_t team);
@@ -90,7 +113,6 @@ void nexus_unregister_team_exit(nexus_team_notify_fn fn);
 #define NEXUS_AREA_DELETE			_IOWR(NEXUS_AREA_MAGIC, 3, struct nexus_area_delete)
 #define NEXUS_AREA_FIND				_IOWR(NEXUS_AREA_MAGIC, 4, struct nexus_area_find)
 #define NEXUS_AREA_GET_INFO			_IOWR(NEXUS_AREA_MAGIC, 5, struct nexus_area_get_info)
-#define NEXUS_AREA_RESIZE			_IOWR(NEXUS_AREA_MAGIC, 6, struct nexus_area_resize)
 #define NEXUS_AREA_SET_PROTECTION	_IOWR(NEXUS_AREA_MAGIC, 7, struct nexus_area_set_protection)
 #define NEXUS_AREA_TRANSFER			_IOWR(NEXUS_AREA_MAGIC, 8, struct nexus_area_transfer)
 #define NEXUS_AREA_GET_NEXT			_IOWR(NEXUS_AREA_MAGIC, 9, struct nexus_area_get_next)
@@ -159,6 +181,52 @@ struct nexus_port_write {
 	int32_t*		code;
 	const void*		buffer;
 	size_t			size;
+	uint32_t		flags;
+	int64_t			timeout;
+	/* out */
+	int32_t			ret;
+};
+
+/* Phase 2a: cap-bearing port I/O. kind = 1 (VREF) is the only kind
+ * defined. buffer_offset is purely receiver-side bookkeeping; the
+ * kernel does not interpret the message bytes. */
+#define NEXUS_PORT_CAP_VREF 1
+
+struct nexus_port_cap_in {
+	uint32_t		kind;
+	int32_t			vref_id;
+	uint32_t		buffer_offset;
+	uint32_t		_pad;
+};
+
+struct nexus_port_cap_out {
+	uint32_t		kind;
+	int32_t			vref_id;
+	uint32_t		buffer_offset;
+	uint32_t		_pad;
+	uint64_t		key;	/* freshly minted slot in receiver team */
+};
+
+struct nexus_port_write_caps {
+	int32_t			id;
+	int32_t*		code;
+	const void*		buffer;
+	size_t			size;
+	const struct nexus_port_cap_in*	caps;
+	size_t			caps_count;
+	uint32_t		flags;
+	int64_t			timeout;
+	/* out */
+	int32_t			ret;
+};
+
+struct nexus_port_read_caps {
+	int32_t			id;
+	int32_t*		code;
+	void*			buffer;
+	size_t			size;		/* in: capacity; out: actual */
+	struct nexus_port_cap_out*	caps;
+	size_t			caps_count;	/* in: capacity; out: actual */
 	uint32_t		flags;
 	int64_t			timeout;
 	/* out */
@@ -329,13 +397,6 @@ struct nexus_area_get_info {
 	uint32_t    lock;
 	uint32_t    protection;
 	int32_t     team;
-	int32_t     ret;
-};
-
-struct nexus_area_resize {
-	area_id     area;
-	uint64_t    new_size;
-	/* out */
 	int32_t     ret;
 };
 
