@@ -158,33 +158,68 @@ static inline void kmsg_add_string(struct kmsg_builder *msg, const char *name,
     kmsg_add_data(msg, name, B_STRING_TYPE, val, len);
 }
 
+#define NEXUS_KMSG_PATH_MAX 256
+
+static inline void kmsg_add_noderef_p(struct kmsg_builder *msg,
+	const char *name, int64_t device, int64_t node, const char *parent_path)
+{
+	size_t path_len = (parent_path != NULL) ? strlen(parent_path) + 1 : 1;
+	char buf[16 + NEXUS_KMSG_PATH_MAX];
+	if (path_len > NEXUS_KMSG_PATH_MAX)
+		path_len = NEXUS_KMSG_PATH_MAX;	// truncate; trailing NUL kept
+	memcpy(buf,     &device, 8);
+	memcpy(buf + 8, &node,   8);
+	if (parent_path != NULL && path_len > 1) {
+		memcpy(buf + 16, parent_path, path_len - 1);
+		buf[16 + path_len - 1] = '\0';
+	} else
+		buf[16] = '\0';
+	kmsg_add_data(msg, name, B_NODE_REF_TYPE, buf, 16 + path_len);
+}
+
 static inline void kmsg_add_noderef(struct kmsg_builder *msg, const char *name,
 	int64_t device, int64_t node)
 {
-	char buf[16];
-	memcpy(buf,     &device, 8);
-	memcpy(buf + 8, &node,   8);
-	kmsg_add_data(msg, name, B_NODE_REF_TYPE, buf, 16);
+	kmsg_add_noderef_p(msg, name, device, node, NULL);
+}
+
+static inline void kmsg_add_entryref_p(struct kmsg_builder *msg,
+	const char *name, int64_t device, int64_t directory,
+	const char *entry, const char *parent_path)
+{
+	size_t name_len = entry ? strlen(entry) + 1 : 1;
+	size_t path_len = (parent_path != NULL) ? strlen(parent_path) + 1 : 1;
+	size_t total = 16 + name_len + path_len;
+	char buf[16 + NAME_MAX + NEXUS_KMSG_PATH_MAX];
+	if (name_len > NAME_MAX)
+		name_len = NAME_MAX;
+	if (path_len > NEXUS_KMSG_PATH_MAX)
+		path_len = NEXUS_KMSG_PATH_MAX;
+	total = 16 + name_len + path_len;
+	memcpy(buf,     &device,    8);
+	memcpy(buf + 8, &directory, 8);
+	if (entry != NULL && name_len > 1) {
+		memcpy(buf + 16, entry, name_len - 1);
+		buf[16 + name_len - 1] = '\0';
+	} else
+		buf[16] = '\0';
+	if (parent_path != NULL && path_len > 1) {
+		memcpy(buf + 16 + name_len, parent_path, path_len - 1);
+		buf[16 + name_len + path_len - 1] = '\0';
+	} else
+		buf[16 + name_len] = '\0';
+	kmsg_add_data(msg, name, B_REF_TYPE, buf, total);
 }
 
 static inline void kmsg_add_entryref(struct kmsg_builder *msg, const char *name,
 	int64_t device, int64_t directory, const char *entry)
 {
-	size_t name_len = entry ? strlen(entry) + 1 : 0;
-	size_t total = 16 + name_len;
-	char buf[NAME_MAX + 16];
-	memcpy(buf,      &device,    8);
-	memcpy(buf + 8,  &directory, 8);
-	if (name_len)
-		memcpy(buf + 16, entry, name_len);
-	kmsg_add_data(msg, name, B_REF_TYPE, buf, total);
+	kmsg_add_entryref_p(msg, name, device, directory, entry, NULL);
 }
 
 static inline void kmsg_finalize(struct kmsg_builder *msg, port_id port, uint32_t token)
 {
-	// Header size
     *(int32_t *)(msg->buffer + 4) = (int32_t)msg->size;
-    // Delivery info: targetToken identifies handler; replyPort is N/A for notifications
     *(int32_t *)(msg->buffer + 16) = (int32_t)token;
     *(int32_t *)(msg->buffer + 20) = -1;
     (void)port;
