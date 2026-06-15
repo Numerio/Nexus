@@ -6,5 +6,8 @@ Build-Depends: debhelper (>= 13), dkms
 
 Package: nexus-dkms
 Architecture: all
-Depends: ${misc:Depends}
+Depends: ${misc:Depends}, dkms (>= 2.1.0.0), linux-headers-generic | linux-headers
 Description: DKMS version for the nexus IPC for V\OS
+ Nexus provides an improved BeOS-style IPC primitives (ports, semaphores,
+ areas, node monitoring) as a Linux kernel module. This package uses
+ DKMS to build the module for the running kernel automatically.
