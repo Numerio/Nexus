@@ -20,6 +20,7 @@
 #define B_BAD_TEAM_ID				-ESRCH
 #define B_BAD_VALUE					-EINVAL
 #define B_NO_MEMORY					-ENOMEM
+#define B_BUFFER_OVERFLOW			-EOVERFLOW
 #define B_ENTRY_NOT_FOUND			-ENOENT
 #define B_WOULD_BLOCK				-EAGAIN
 #define B_INTERRUPTED				-EINTR
