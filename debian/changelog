@@ -1,4 +1,4 @@
-nexus-dkms (1) bullseye; urgency=medium
+nexus-dkms (1) trixie; urgency=medium
 
   * Initial package.
 
