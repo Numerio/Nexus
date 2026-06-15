@@ -379,34 +379,6 @@ out_copy:
 	return 0;
 }
 
-static long nexus_area_resize(struct nexus_area_resize __user *arg)
-{
-	struct nexus_area_resize resize;
-	struct nexus_area *area;
-
-	if (copy_from_user(&resize, arg, sizeof(resize)))
-		return -EFAULT;
-
-	mutex_lock(&area_lock);
-
-	area = find_area_by_id(resize.area);
-	if (!area) {
-		resize.ret = B_BAD_VALUE;
-	} else if (area->team != current->tgid) {
-		resize.ret = B_NOT_ALLOWED;
-	} else {
-		area->size = resize.new_size;
-		resize.ret = B_OK;
-	}
-
-	mutex_unlock(&area_lock);
-
-	if (copy_to_user(arg, &resize, sizeof(resize)))
-		return -EFAULT;
-
-	return 0;
-}
-
 static long nexus_area_set_protection(struct nexus_area_set_protection __user *arg)
 {
 	struct nexus_area_set_protection prot;
@@ -452,8 +424,6 @@ static long area_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			return nexus_area_find((struct nexus_area_find __user *)arg);
 		case NEXUS_AREA_GET_INFO:
 			return nexus_area_get_info((struct nexus_area_get_info __user *)arg);
-		case NEXUS_AREA_RESIZE:
-			return nexus_area_resize((struct nexus_area_resize __user *)arg);
 		case NEXUS_AREA_TRANSFER:
 			return nexus_area_transfer((struct nexus_area_transfer __user *)arg);
 		case NEXUS_AREA_SET_PROTECTION:
