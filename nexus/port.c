@@ -615,68 +615,49 @@ static long nexus_port_write_with_caps(struct nexus_port* port,
 goahead:
 	buf = kzalloc(sizeof(struct nexus_buffer), GFP_KERNEL);
 	if (buf == NULL) {
-		port->write_count++;
-		return B_NO_MEMORY;
+		ret = B_NO_MEMORY;
+		goto err_count;
 	}
 
 	if (buffer != NULL && size > 0) {
 		buf->buffer = kzalloc(size, GFP_KERNEL);
 		if (buf->buffer == NULL) {
-			kfree(buf);
-			port->write_count++;
-			return B_NO_MEMORY;
+			ret = B_NO_MEMORY;
+			goto err_buf;
 		}
 		if (copy_from_user(buf->buffer, buffer, size)) {
-			kfree(buf->buffer);
-			kfree(buf);
-			port->write_count++;
-			return B_BAD_VALUE;
+			ret = B_BAD_VALUE;
+			goto err_buf;
 		}
 		buf->size = size;
 	}
 
 	if (copy_from_user(&buf->code, msg_code, sizeof(*msg_code))) {
-		kfree(buf->buffer);
-		kfree(buf);
-		port->write_count++;
-		return B_BAD_VALUE;
+		ret = B_BAD_VALUE;
+		goto err_buf;
 	}
 
 	if (cap_count > 0) {
 		caps_tmp = kmalloc_array(cap_count, sizeof(*caps_tmp), GFP_KERNEL);
 		caps_arr = kzalloc(cap_count * sizeof(*caps_arr), GFP_KERNEL);
 		if (caps_tmp == NULL || caps_arr == NULL) {
-			kfree(caps_tmp); kfree(caps_arr);
-			kfree(buf->buffer); kfree(buf);
-			port->write_count++;
-			return B_NO_MEMORY;
+			ret = B_NO_MEMORY;
+			goto err_caps;
 		}
 		if (copy_from_user(caps_tmp, user_caps,
 				cap_count * sizeof(*caps_tmp))) {
-			kfree(caps_tmp); kfree(caps_arr);
-			kfree(buf->buffer); kfree(buf);
-			port->write_count++;
-			return B_BAD_VALUE;
+			ret = B_BAD_VALUE;
+			goto err_caps;
 		}
 		for (i = 0; i < cap_count; i++) {
 			if (caps_tmp[i].kind != NEXUS_PORT_CAP_VREF) {
-
-				while (i-- > 0)
-					nexus_vref_kref_release(caps_arr[i].vref);
-				kfree(caps_tmp); kfree(caps_arr);
-				kfree(buf->buffer); kfree(buf);
-				port->write_count++;
-				return B_BAD_VALUE;
+				ret = B_BAD_VALUE;
+				goto err_caps_acquired;
 			}
-			caps_arr[i].vref =
-				nexus_vref_kref_acquire(caps_tmp[i].vref_id);
+			caps_arr[i].vref = nexus_vref_kref_acquire(caps_tmp[i].vref_id);
 			if (caps_arr[i].vref == NULL) {
-				while (i-- > 0)
-					nexus_vref_kref_release(caps_arr[i].vref);
-				kfree(caps_tmp); kfree(caps_arr);
-				kfree(buf->buffer); kfree(buf);
-				port->write_count++;
-				return B_BAD_VALUE;
+				ret = B_BAD_VALUE;
+				goto err_caps_acquired;
 			}
 			caps_arr[i].buffer_offset = caps_tmp[i].buffer_offset;
 		}
@@ -689,14 +670,20 @@ goahead:
 	port->read_count++;
 	wake_up_interruptible(&port->buffer_read);
 
-	if (buf->cap_count == 0 && size > 64
-			&& port->team != NULL
-			&& port->team->id != current->tgid)
-		pr_warn_ratelimited("nexus_port: WRITE_NOCAPS port=%d(%s) "
-			"caller=%d(%s) target_team=%d size=%zu\n",
-			port->id, port->name, current->tgid, current->comm,
-			port->team->id, size);
 	return B_OK;
+
+err_caps_acquired:
+	while (i-- > 0)
+		nexus_vref_kref_release(caps_arr[i].vref);
+err_caps:
+	kfree(caps_tmp);
+	kfree(caps_arr);
+err_buf:
+	kfree(buf->buffer);
+	kfree(buf);
+err_count:
+	port->write_count++;
+	return ret;
 }
 
 
@@ -769,48 +756,40 @@ static long nexus_port_read_with_caps(struct nexus_port* port, int32_t* code,
 	}
 
 	if (buf->cap_count > 0) {
-		caps_out = kzalloc(buf->cap_count * sizeof(*caps_out),
-			GFP_KERNEL);
+		caps_out = kzalloc(buf->cap_count * sizeof(*caps_out), GFP_KERNEL);
 		if (caps_out == NULL)
 			return B_NO_MEMORY;
 	}
 
 	for (i = 0; i < buf->cap_count; i++) {
 		uint64_t key = 0;
-		int mret = nexus_vref_mint_slot_for(buf->caps[i].vref,
+		ret = nexus_vref_mint_slot_for(buf->caps[i].vref,
 			current->tgid, &key);
-		if (mret != B_OK) {
-			kfree(caps_out);
-			return mret;
-		}
+		if (ret != B_OK)
+			goto out;
 		caps_out[i].kind = NEXUS_PORT_CAP_VREF;
 		caps_out[i].vref_id = buf->caps[i].vref->id;
 		caps_out[i].buffer_offset = buf->caps[i].buffer_offset;
 		caps_out[i].key = key;
 	}
 
-	if (buf->buffer != NULL && buf->size > 0) {
-		if (copy_to_user(buffer, buf->buffer, buf->size)) {
-			kfree(caps_out);
-			return B_BAD_VALUE;
-		}
+	if (buf->buffer != NULL && buf->size > 0
+			&& copy_to_user(buffer, buf->buffer, buf->size)) {
+		ret = B_BAD_VALUE;
+		goto out;
 	}
-	if (buf->cap_count > 0) {
-		if (copy_to_user(user_caps, caps_out,
-				buf->cap_count * sizeof(*caps_out))) {
-			kfree(caps_out);
-			return B_BAD_VALUE;
-		}
+	if (buf->cap_count > 0 && copy_to_user(user_caps, caps_out,
+			buf->cap_count * sizeof(*caps_out))) {
+		ret = B_BAD_VALUE;
+		goto out;
 	}
-	if (code != NULL) {
-		if (copy_to_user(code, &buf->code, sizeof(*code))) {
-			kfree(caps_out);
-			return B_BAD_VALUE;
-		}
+	if (code != NULL && copy_to_user(code, &buf->code, sizeof(*code))) {
+		ret = B_BAD_VALUE;
+		goto out;
 	}
+
 	*size_inout = buf->size;
 	*caps_count_inout = buf->cap_count;
-	kfree(caps_out);
 
 	list_del(&buf->node);
 	port->read_count--;
@@ -818,7 +797,11 @@ static long nexus_port_read_with_caps(struct nexus_port* port, int32_t* code,
 	port->total_count++;
 	wake_up_interruptible(&port->buffer_write);
 	nexus_buffer_free(buf);
-	return B_OK;
+	ret = B_OK;
+
+out:
+	kfree(caps_out);
+	return ret;
 }
 
 
