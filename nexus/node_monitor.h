@@ -48,21 +48,6 @@
 
 #define B_NODE_MONITOR          0x4e444d4e
 
-struct nexus_probe_suppress {
-	struct hlist_node  node;
-	struct task_struct *task;
-};
-
-bool nexus_probe_is_suppressed(void);
-void nexus_probe_suppress_enter(struct nexus_probe_suppress *e);
-void nexus_probe_suppress_exit(struct nexus_probe_suppress *e);
-
-#define NEXUS_PROBE_SUPPRESS_SCOPE(name) \
-	struct nexus_probe_suppress name; \
-	nexus_probe_suppress_enter(&name)
-
-void nexus_emit_attr_changed(struct file *file, const char *attr, int cause);
-
 uint64_t nexus_node_monitor_dev(void);
 
 #endif // __KERNEL__
