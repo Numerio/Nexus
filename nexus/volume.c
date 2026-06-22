@@ -12,6 +12,7 @@
 #include "nexus.h"
 #include "node_monitor.h"
 #include "volume.h"
+#include "fs_caps_kernel.h"
 
 int nexus_volume_init(void) { return 0; }
 void nexus_volume_exit(void) {}
@@ -25,29 +26,21 @@ uint32_t nexus_caps_for_inode(struct inode *inode)
 		return 0;
 	n = inode->i_sb->s_type->name;
 
-	if (!strcmp(n, "proc") || !strcmp(n, "sysfs")
-		|| !strcmp(n, "devpts") || !strcmp(n, "devtmpfs")
-		|| !strcmp(n, "cgroup") || !strcmp(n, "cgroup2")
-		|| !strcmp(n, "debugfs") || !strcmp(n, "tracefs")
-		|| !strcmp(n, "securityfs") || !strcmp(n, "pstore")
-		|| !strcmp(n, "configfs") || !strcmp(n, "bpf")
-		|| !strcmp(n, "mqueue") || !strcmp(n, "hugetlbfs")
-		|| !strcmp(n, "autofs") || !strcmp(n, "binfmt_misc")
-		|| !strcmp(n, "rpc_pipefs") || !strcmp(n, "fusectl")
-		|| !strcmp(n, "nsfs") || !strcmp(n, "pipefs")
-		|| !strcmp(n, "sockfs") || !strcmp(n, "anon_inodefs")) {
+	if (fs_caps_kernel_is_pseudo(n))
 		return 0;
-	}
 
-	if (!strcmp(n, "squashfs") || !strcmp(n, "erofs")
-		|| !strcmp(n, "iso9660")
-		|| !strcmp(n, "tmpfs") || !strcmp(n, "ramfs")) {
-		caps = NX_FS_HAS_ATTR;
-	} else {
+	u32 tf = fs_caps_kernel_caps_for(n);
+	if (tf & FS_CAP_ATTR)
+		caps |= NX_FS_HAS_ATTR;
+	if (tf & FS_CAP_QUERY)
+		caps |= NX_FS_HAS_QUERY;
+	if (tf & FS_CAP_NODEMON)
+		caps |= NX_FS_SUPPORTS_NODE_MONITORING
+			| NX_FS_SUPPORTS_MONITOR_CHILDREN;
+	if (tf == 0)
 		caps = NX_FS_HAS_ATTR | NX_FS_HAS_QUERY
-			 | NX_FS_SUPPORTS_NODE_MONITORING
-			 | NX_FS_SUPPORTS_MONITOR_CHILDREN;
-	}
+			| NX_FS_SUPPORTS_NODE_MONITORING
+			| NX_FS_SUPPORTS_MONITOR_CHILDREN;
 
 	if (inode->i_sb->s_flags & SB_RDONLY)
 		caps |= NX_FS_IS_READONLY;

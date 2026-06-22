@@ -29,6 +29,7 @@
 #include "attribute.h"
 #include "index.h"
 #include "volume.h"
+#include "fs_caps_kernel.h"
 
 #ifndef NEXUS_NM_DEBUG
 #define NEXUS_NM_DEBUG 0
@@ -2254,7 +2255,8 @@ static int __init nexus_node_monitor_init(void)
 {
 	int ret;
 
-	nm_info("initializing nexus node monitor\n");
+	nm_info("initializing nexus node monitor (fs_caps checksum=0x%08x)\n",
+		FS_CAPS_CHECKSUM);
 
 	nm_dispatch_wq = alloc_workqueue("nexus_nm", WQ_UNBOUND, 1);
 	if (!nm_dispatch_wq) {
