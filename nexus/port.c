@@ -536,6 +536,17 @@ pid_t nexus_port_team_of(uint32_t id)
 }
 EXPORT_SYMBOL(nexus_port_team_of);
 
+// Caller must already hold nexus_main_lock. Used by team_exit callbacks
+// invoked from nexus_release → nexus_team_destroy where the mutex is held.
+pid_t nexus_port_team_of_locked(uint32_t id)
+{
+	struct nexus_port *port = idr_find(&nexus_port_idr, id);
+	if (port != NULL && port->team != NULL)
+		return port->team->id;
+	return -1;
+}
+EXPORT_SYMBOL(nexus_port_team_of_locked);
+
 static long nexus_port_write_with_caps(struct nexus_port* port,
 	int32_t* msg_code, const void __user* buffer, size_t size,
 	const struct nexus_port_cap_in __user* user_caps, size_t cap_count,

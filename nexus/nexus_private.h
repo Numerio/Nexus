@@ -281,6 +281,8 @@ long					nexus_port_io_set_owner(struct nexus_team *team, unsigned long arg);
 long					nexus_port_io_write_caps(struct nexus_team *team, unsigned long arg);
 long					nexus_port_io_read_caps(struct nexus_team *team, unsigned long arg);
 pid_t					nexus_port_team_of(uint32_t id);
+pid_t					nexus_port_team_of_locked(uint32_t id);
+uint64_t				nexus_core_dev(void);
 
 void					nexus_sem_delete(struct kref* ref);
 

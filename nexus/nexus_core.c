@@ -27,12 +27,23 @@
 
 #define DEV_NAME "nexus"
 
-static int major = -1;
+static dev_t major = 0;
+
+uint64_t nexus_core_dev(void)
+{
+	// Userspace stat() encodes dev_t differently from kernel MKDEV
+	// (glibc: (major<<8)|minor, kernel: major<<MINORBITS|minor).
+	// Convert so the value we stamp into kmsgs matches st_rdev seen
+	// by libroot's get_vref_dev() (fstat of /dev/nexus).
+	return (uint64_t)new_encode_dev(major);
+}
+EXPORT_SYMBOL(nexus_core_dev);
 static struct cdev nexus_cdev;
 static struct class *nexus_class = NULL;
 
 DEFINE_MUTEX(nexus_main_lock);
 HLIST_HEAD(nexus_teams);
+EXPORT_SYMBOL(nexus_teams);
 
 DEFINE_IDR(nexus_port_idr);
 static DEFINE_IDR(nexus_teams_idr);

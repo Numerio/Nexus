@@ -10,6 +10,7 @@
 #include <linux/uuid.h>
 
 #include "nexus.h"
+#include "nexus_private.h"
 #include "node_monitor.h"
 #include "volume.h"
 #include "fs_caps_kernel.h"
@@ -64,7 +65,7 @@ int nexus_uuid_for_inode(struct inode *inode, char *out)
 
 uint64_t nexus_volume_sentinel_dev(void)
 {
-	return nexus_node_monitor_dev();
+	return nexus_core_dev();
 }
 
 long nexus_volume_ioctl_query_flags(unsigned long arg)

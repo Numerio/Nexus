@@ -10,10 +10,11 @@
 #include <linux/spinlock.h>
 #include <linux/file.h>
 #include <linux/hashtable.h>
-#include <linux/kprobes.h>
 #include <linux/xattr.h>
 #include <linux/mount.h>
 #include <linux/dcache.h>
+
+extern struct hlist_head nexus_teams;
 #include <linux/cred.h>
 #include <linux/fs.h>
 #include <linux/workqueue.h>
@@ -104,7 +105,12 @@ static const char *fsn_mask_str(uint32_t mask)
 #define FD_FILE(f) ((f).file)
 #endif
 
-#define MOVE_TIMEOUT_MS 1000
+/* Maximum time we wait for FS_MOVED_TO to arrive after FS_MOVED_FROM.
+ * When dest is watched, TO arrives within microseconds (same syscall);
+ * this timeout only fires when dest is unwatched, in which case we
+ * flush a from-only B_ENTRY_MOVED so the source listener still sees
+ * the entry leaving. */
+#define MOVE_TIMEOUT_MS 50
 
 #define MARK_HASH_BITS 12
 #define MOVE_HASH_BITS 8
@@ -212,6 +218,14 @@ struct nexus_listener {
 	port_id port;
 	uint32_t token;
 	uint32_t flags;
+
+	/* Tag-along listener on parent dir for child move events. */
+	bool             is_tagalong;
+	dev_t            tagalong_dev;
+	ino_t            tagalong_ino;
+
+	/* Suppress degraded FS_MOVE_SELF when parent tagalong handles it. */
+	bool             tagalong_armed;
 };
 
 struct nm_child_vref {
@@ -237,21 +251,28 @@ struct nexus_mark {
 
 	struct list_head children_vrefs;
 	spinlock_t       children_vrefs_lock;
+
+	/* Write-dirty bit (BFS bfs_free_cookie parity). Set by FS_MODIFY,
+	 * cleared on FS_CLOSE_WRITE emit. Suppresses CLOSE_WRITE ->
+	 * B_STAT_CHANGED when no bytes were actually written between
+	 * opens (e.g. BNode O_RDWR for attr access with no data write).
+	 * Guarded by mark->lock. */
+	bool             write_dirty;
 };
 
 struct pending_move {
 	struct list_head list;
 	uint32_t cookie;
 	int32_t old_dir_vref_id;   // mark->vref_id from MOVED_FROM; never dropped (mark owns it)
+	int32_t child_vref_id;     // child's vref, minted at MOVED_FROM; mark owns it
+	struct nexus_mark *old_mark; // refcount-held; used to dispatch to source listeners
+	dev_t old_device;
 	unsigned long expires;
 	char old_name[NAME_MAX + 1];
 };
 
-/* Deferred child-vref creation queue.  The fsnotify event handler runs on
- * the originating syscall thread (mkdir, open, etc.).  Calling
- * nm_vref_from_inode there (d_find_alias + dentry_open) is too expensive
- * and freezes the whole desktop.  Instead we igrab the inode, queue it
- * here, and let the dispatch worker mint the vref off-thread. */
+/* Deferred child-vref creation: event handler runs on syscall thread,
+ * vref minting is too expensive there, so queue for off-thread worker. */
 struct pending_child_vref {
 	struct list_head list;
 	struct nexus_mark *mark;   /* refcount-held */
@@ -267,6 +288,9 @@ static DEFINE_SPINLOCK(nm_pending_vrefs_lock);
 static struct fsnotify_group *nexus_fsn_group;
 static LIST_HEAD(pending_moves);
 static DEFINE_SPINLOCK(move_lock);
+static void pending_move_flush_work_fn(struct work_struct *work);
+static DECLARE_DELAYED_WORK(pending_move_flush_work,
+	pending_move_flush_work_fn);
 
 static DEFINE_HASHTABLE(marks_hash, MARK_HASH_BITS);
 static DEFINE_SPINLOCK(marks_hash_lock);
@@ -404,11 +428,28 @@ struct listener_snapshot {
 	port_id port;
 	uint32_t token;
 	uint32_t flags;
+	bool    is_tagalong;
+	dev_t   tagalong_dev;
+	ino_t   tagalong_ino;
+	bool    tagalong_armed;
 };
 
-/* Synchronous send used by the kprobe-driven attr path
- * (notify_xattr_change -> notify_attr_changed).  The in_atomic() guard in
- * notify_xattr_change keeps us out of contexts where a blocking port write
+static inline void
+listener_snap_copy(struct listener_snapshot *s,
+	const struct nexus_listener *l)
+{
+	s->port = l->port;
+	s->token = l->token;
+	s->flags = l->flags;
+	s->is_tagalong = l->is_tagalong;
+	s->tagalong_dev = l->tagalong_dev;
+	s->tagalong_ino = l->tagalong_ino;
+	s->tagalong_armed = l->tagalong_armed;
+}
+
+/* Synchronous send used by the attr path
+ * (nexus_nm_notify_xattr -> notify_attr_changed).  The in_atomic() guard in
+ * nexus_nm_notify_xattr keeps us out of contexts where a blocking port write
  * would be illegal. */
 static void send_to_listener(struct nexus_listener *listener,
 	struct kmsg_builder *msg)
@@ -467,6 +508,80 @@ static struct pending_move *find_pending_move(uint32_t cookie)
 	return NULL;
 }
 
+/* Dispatch from-only B_ENTRY_MOVED when FS_MOVED_TO never arrived.
+ * Caller must hold move_lock. */
+static void dispatch_pending_move_from_only(struct pending_move *pm)
+{
+	struct nexus_mark *mark = pm->old_mark;
+	struct listener_snapshot *snap = NULL;
+	int count = 0, i;
+	struct nexus_listener *l;
+	unsigned long flags;
+	int64_t sentinel = (int64_t)nexus_volume_sentinel_dev();
+
+	if (!mark)
+		return;
+
+	spin_lock_irqsave(&mark->lock, flags);
+	list_for_each_entry(l, &mark->listeners, list)
+		count++;
+	if (count > 0) {
+		snap = kmalloc_array(count, sizeof(*snap), GFP_ATOMIC);
+		if (snap) {
+			i = 0;
+			list_for_each_entry(l, &mark->listeners, list) {
+				listener_snap_copy(&snap[i], l);
+				i++;
+			}
+			count = i;
+		} else {
+			count = 0;
+		}
+	}
+	spin_unlock_irqrestore(&mark->lock, flags);
+
+	for (i = 0; snap && i < count; i++) {
+		uint32_t lflags = snap[i].flags;
+		char buf[KMSG_BUFFER_SIZE];
+		struct kmsg_builder msg;
+
+		/* TODO: tag-along listeners on this source mark may receive
+		 * an unrelated B_ENTRY_MOVED here (timed-out MOVED_FROM with
+		 * no matching MOVED_TO — file moved out of any watched
+		 * scope). pending_move doesn't carry the child's (dev, ino),
+		 * so we can't filter against tagalong_ino. Cheap fix later:
+		 * store child dev+ino on pending_move at MOVED_FROM time. */
+		if (snap[i].is_tagalong) {
+			/* Skip tagalongs for now (better to under-deliver
+			 * than mislabel a B_ENTRY_MOVED for a different
+			 * child). */
+			continue;
+		}
+		if (!(lflags & (B_WATCH_NAME | B_WATCH_DIRECTORY
+				| B_WATCH_CHILDREN)))
+			continue;
+
+		kmsg_init(&msg, buf, sizeof(buf), B_NODE_MONITOR);
+		kmsg_add_int32(&msg, "opcode", B_ENTRY_MOVED);
+		kmsg_add_uint64(&msg, "device", (uint64_t)pm->old_device);
+		kmsg_add_int64(&msg, "node device", (int64_t)pm->old_device);
+		if (pm->old_dir_vref_id >= 0)
+			kmsg_add_entryref(&msg, "virtual:from directory",
+				sentinel, (int64_t)pm->old_dir_vref_id,
+				pm->old_name);
+		if (pm->child_vref_id >= 0)
+			kmsg_add_noderef(&msg, "virtual:node", sentinel,
+				(int64_t)pm->child_vref_id);
+		if (pm->old_name[0]) {
+			kmsg_add_string(&msg, "name", pm->old_name);
+			kmsg_add_string(&msg, "from name", pm->old_name);
+		}
+		queue_notification(&msg, snap[i].port, snap[i].token);
+	}
+	kfree(snap);
+}
+
+/* Caller must hold move_lock. */
 static void cleanup_expired_moves(void)
 {
 	struct pending_move *pm, *tmp;
@@ -476,8 +591,11 @@ static void cleanup_expired_moves(void)
 	list_for_each_entry_safe(pm, tmp, &pending_moves, list) {
 		if (time_after(now, pm->expires)) {
 			nm_dbg("cleanup_expired_moves: expiring cookie=%u\n", pm->cookie);
-			/* old_dir_vref_id is mark->vref_id, not a
-			 * freshly-minted ref — do not drop it. */
+			dispatch_pending_move_from_only(pm);
+			if (pm->old_mark) {
+				fsnotify_put_mark(&pm->old_mark->fs_mark);
+				pm->old_mark = NULL;
+			}
 			list_del(&pm->list);
 			kfree(pm);
 			count++;
@@ -487,14 +605,33 @@ static void cleanup_expired_moves(void)
 		nm_dbg("cleanup_expired_moves: cleaned %d entries\n", count);
 }
 
+static void pending_move_flush_work_fn(struct work_struct *work)
+{
+	unsigned long flags;
+	bool more;
+
+	spin_lock_irqsave(&move_lock, flags);
+	cleanup_expired_moves();
+	more = !list_empty(&pending_moves);
+	spin_unlock_irqrestore(&move_lock, flags);
+
+	/* If there are still un-expired pending_moves, re-arm so they get
+	 * flushed once their deadline passes.  Each one carries its own
+	 * expires jiffy, so a single re-arm at MOVE_TIMEOUT_MS is enough. */
+	if (more)
+		schedule_delayed_work(&pending_move_flush_work,
+			msecs_to_jiffies(MOVE_TIMEOUT_MS));
+
+	send_queued_notifications();
+}
+
 static void nexus_mark_free(struct fsnotify_mark *fs_mark)
 {
 	struct nexus_mark *mark = get_nexus_mark(fs_mark);
 	struct nexus_listener *listener, *tmp;
 
-	nm_dbg("nexus_mark_free: dev=%u ino=%lu vref_id=%d\n",
-		(unsigned)mark->device, (unsigned long)mark->inode,
-		mark->vref_id);
+	nm_info("mark_free ino=%lu vref=%d mnt=%p\n",
+		(unsigned long)mark->inode, mark->vref_id, mark->mnt_stored);
 
 	unsigned long flags;
 	nm_dbg_lock("nexus_mark_free: acquiring marks_hash_lock\n");
@@ -692,6 +829,13 @@ static int32_t nm_vref_from_inode(struct inode *inode, struct vfsmount *mnt)
 	if (!inode || !mnt)
 		return -1;
 
+	// dentry_open + create_from_file sleep; bail if called from atomic ctx.
+	if (in_atomic() || irqs_disabled()) {
+		nm_dbg("nm_vref_from_inode: skipped (atomic context) ino=%lu\n",
+			(unsigned long)inode->i_ino);
+		return -1;
+	}
+
 	// Force GFP_NOFS for every allocation reachable from here.
 	// We are typically on the fsnotify callback path with the
 	// inode lock held by the originating syscall; without this,
@@ -851,6 +995,7 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 	const char *name;
 	dev_t device;
 	ino_t ino;
+
 	unsigned long flags;
 	int type;
 	int64_t sentinel;
@@ -868,6 +1013,10 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 		const struct path *path = data;
 		if (path && path->dentry)
 			inode = d_inode(path->dentry);
+	} else if (data_type == FSNOTIFY_EVENT_DENTRY) {
+		const struct dentry *dentry = data;
+		if (dentry)
+			inode = d_inode(dentry);
 	}
 
 	if (!inode) {
@@ -889,12 +1038,35 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 		fsn_mask_str(mask), (unsigned)device, (unsigned long)ino,
 		(unsigned long)(dir ? dir->i_ino : ino), name, cookie);
 
+
 	sentinel = (int64_t)nexus_volume_sentinel_dev();
 
 	if (!mask)
 		return 0;
 
 	bool parent_in_iter = false;
+
+	struct nexus_mark *move_old_mark = NULL;
+	int32_t move_from_dir_vref_id = -1;
+	int32_t move_to_dir_vref_id = -1;
+	int32_t move_child_vref_id = -1;
+	char move_old_name[NAME_MAX + 1] = "";
+	if (mask & FS_MOVED_TO) {
+		struct pending_move *pm;
+		unsigned long mflags;
+		spin_lock_irqsave(&move_lock, mflags);
+		pm = find_pending_move(cookie);
+		if (pm) {
+			move_from_dir_vref_id = pm->old_dir_vref_id;
+			pm->old_dir_vref_id = -1;
+			strscpy(move_old_name, pm->old_name, sizeof(move_old_name));
+			move_old_mark = pm->old_mark;
+			pm->old_mark = NULL;
+			list_del(&pm->list);
+			kfree(pm);
+		}
+		spin_unlock_irqrestore(&move_lock, mflags);
+	}
 
 	for (type = 0; type < FSNOTIFY_ITER_TYPE_COUNT; type++) {
 		int32_t node_vref_id = -1;
@@ -938,11 +1110,24 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 		i = 0;
 		l = NULL;
 		list_for_each_entry(l, &mark->listeners, list) {
-			snap[i].port = l->port;
-			snap[i].token = l->token;
-			snap[i].flags = l->flags;
+			listener_snap_copy(&snap[i], l);
 			i++;
 		}
+		/* Write-dirty tracking (BFS bfs_free_cookie parity).
+		 * FS_MODIFY → set dirty; FS_CLOSE_WRITE → emit STAT_CHANGED
+		 * only if dirty, then clear. Linux fires FS_CLOSE_WRITE on
+		 * every writable-fd close (BNode opens O_RDWR for attr
+		 * access then closes without writing) — without this
+		 * filter, every attr access on a B_WATCH_STAT'd file
+		 * produces a self-talk STAT notification. */
+		bool close_write_emit = false;
+		if (mask & FS_MODIFY)
+			mark->write_dirty = true;
+		if ((mask & FS_CLOSE_WRITE) && mark->write_dirty) {
+			mark->write_dirty = false;
+			close_write_emit = true;
+		}
+
 		spin_unlock_irqrestore(&mark->lock, flags);
 		snap_count = i;
 
@@ -950,6 +1135,17 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 			port_id port = snap[i].port;
 			uint32_t token = snap[i].token;
 			uint32_t lflags = snap[i].flags;
+
+			/* Tagalong listeners live on a parent dir mark to
+			 * route MOVED_FROM/TO/DELETE for a specific child to
+			 * the child-watcher's port. Skip events for any other
+			 * child in the same dir. */
+			if (snap[i].is_tagalong) {
+				if (!inode
+				    || snap[i].tagalong_dev != inode->i_sb->s_dev
+				    || snap[i].tagalong_ino != inode->i_ino)
+					continue;
+			}
 
 			nm_dbg_event("  processing listener port=%d flags=0x%x\n",
 				port, lflags);
@@ -1025,6 +1221,7 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 				struct pending_move *pm;
 				unsigned long mflags;
 				int32_t old_dir_vref = -1;
+				bool armed = false;
 				/* nm_dir_vref_for_event returns mark->vref_id
 				 * (not a freshly-minted ref), so we never drop
 				 * it here — the mark owns its lifetime. */
@@ -1034,42 +1231,42 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 				spin_lock_irqsave(&move_lock, mflags);
 				cleanup_expired_moves();
 
-				if (cookie) {
+				if (cookie && !find_pending_move(cookie)) {
 					pm = kmalloc(sizeof(*pm), GFP_ATOMIC);
 					if (pm) {
 						pm->cookie = cookie;
 						pm->old_dir_vref_id = old_dir_vref;
+						pm->child_vref_id =
+							nm_mark_get_or_mint_child_vref(
+								mark, inode);
+						pm->old_mark = mark;
+						pm->old_device = device;
+						refcount_inc(&mark->fs_mark.refcnt);
 						pm->expires = jiffies +
 							msecs_to_jiffies(MOVE_TIMEOUT_MS);
 						strscpy(pm->old_name, name,
 							sizeof(pm->old_name));
 						list_add(&pm->list, &pending_moves);
+						armed = true;
 					}
 				}
 				spin_unlock_irqrestore(&move_lock, mflags);
+
+				if (armed)
+					schedule_delayed_work(
+						&pending_move_flush_work,
+						msecs_to_jiffies(MOVE_TIMEOUT_MS)
+							+ 1);
 			}
 
 			if ((mask & FS_MOVED_TO)
 				&& (lflags & (B_WATCH_NAME | B_WATCH_DIRECTORY | B_WATCH_CHILDREN))) {
-				struct pending_move *pm;
-				unsigned long mflags;
-				char old_name[NAME_MAX + 1] = "";
 				char buf[KMSG_BUFFER_SIZE];
 				struct kmsg_builder msg;
 				int32_t to_dir_vref_id  = -1;
-				int32_t from_dir_vref_id = -1;
+				int32_t from_dir_vref_id = move_from_dir_vref_id;
 				int32_t child_vref_id;
-
-				spin_lock_irqsave(&move_lock, mflags);
-				pm = find_pending_move(cookie);
-				if (pm) {
-					from_dir_vref_id = pm->old_dir_vref_id;
-					pm->old_dir_vref_id = -1; // ownership transferred
-					strscpy(old_name, pm->old_name, sizeof(old_name));
-					list_del(&pm->list);
-					kfree(pm);
-				}
-				spin_unlock_irqrestore(&move_lock, mflags);
+				const char *old_name = move_old_name;
 
 				if (!dir_vref_tried && dir && mark->mnt_stored) {
 					dir_vref_id = nm_dir_vref_for_event(mark, dir);
@@ -1079,6 +1276,10 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 
 				child_vref_id = nm_mark_get_or_mint_child_vref(mark,
 					inode);
+				if (move_to_dir_vref_id < 0)
+					move_to_dir_vref_id = to_dir_vref_id;
+				if (move_child_vref_id < 0)
+					move_child_vref_id = child_vref_id;
 
 				kmsg_init(&msg, buf, sizeof(buf), B_NODE_MONITOR);
 				kmsg_add_int32(&msg, "opcode", B_ENTRY_MOVED);
@@ -1102,16 +1303,25 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 				queue_notification(&msg, port, token);
 			}
 
-			if ((mask & FS_MODIFY) && (lflags & B_WATCH_STAT)) {
-				bool interim = (lflags & B_WATCH_INTERIM_STAT) != 0;
+			/* Haiku semantics: filesystem drivers (e.g. BFS) emit
+			 * B_STAT_CHANGED on write only periodically and only with
+			 * B_STAT_INTERIM_UPDATE; the final size/mtime delivery
+			 * happens on close. Linux fsnotify fires FS_MODIFY per
+			 * write, so we must gate this on B_WATCH_INTERIM_STAT —
+			 * otherwise listeners that didn't opt in (Tracker) get
+			 * a flood that becomes a self-feedback loop when the
+			 * writer is itself a listener of the same node. The
+			 * FS_CLOSE_WRITE branch below remains the "writer done"
+			 * delivery. */
+			if ((mask & FS_MODIFY) && (lflags & B_WATCH_STAT)
+			    && (lflags & B_WATCH_INTERIM_STAT)) {
 				char buf[KMSG_BUFFER_SIZE];
 				struct kmsg_builder msg;
 				int32_t target_vref =
 					nm_node_vref_for_event(mark, inode);
 				uint32_t fields =
-					B_STAT_SIZE | B_STAT_MODIFICATION_TIME;
-				if (interim)
-					fields |= B_STAT_INTERIM_UPDATE;
+					B_STAT_SIZE | B_STAT_MODIFICATION_TIME
+					| B_STAT_INTERIM_UPDATE;
 				kmsg_init(&msg, buf, sizeof(buf), B_NODE_MONITOR);
 				kmsg_add_int32(&msg, "opcode", B_STAT_CHANGED);
 				kmsg_add_uint64(&msg, "device", (uint64_t)device);
@@ -1122,6 +1332,15 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 				queue_notification(&msg, port, token);
 			}
 
+			/* FS_ATTRIB covers chmod/chown/utime AND setxattr at the
+			 * same Linux bit. Both genuinely change inode ctime, so
+			 * emitting B_STAT_CHANGED here is correct for both cases —
+			 * an xattr write produces a (slightly redundant) STAT in
+			 * addition to whatever B_ATTR_CHANGED channel exists. The
+			 * previous self-talk concern was killed by the dirty-bit
+			 * filter on FS_CLOSE_WRITE + the parent-walk dispatch
+			 * removal + the FS_MODIFY INTERIM gate; FS_ATTRIB alone
+			 * doesn't loop because handlers re-stat (no event). */
 			if ((mask & FS_ATTRIB) && (lflags & B_WATCH_STAT)) {
 				char buf[KMSG_BUFFER_SIZE];
 				struct kmsg_builder msg;
@@ -1140,19 +1359,19 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 			}
 
 			// FS_ATTRIB with B_WATCH_ATTR is intentionally NOT
-			// handled here.  Attribute-change notifications are the
-			// exclusive domain of the vfs_setxattr/vfs_removexattr
-			// kretprobes (see notify_xattr_change), which fire on the
-			// actual xattr write and carry the real attribute name.
-			// Emitting B_ATTR_CHANGED from this fsnotify path too
-			// would duplicate every attribute notification.
+			// handled here.  Attribute-change notifications are
+			// emitted directly from attribute.c's write/remove/
+			// rename ioctls via nexus_nm_notify_xattr, which
+			// carries the real attribute name.  Foreign setxattr
+			// (outside our API) is intentionally not observed.
 
 			// FS_CLOSE_WRITE -> B_STAT_CHANGED.  Linux fires this
 			// once when a writer closes a file; the matching Haiku
 			// semantic is a final size+mtime update.  FS_MODIFY covers
 			// per-write churn; this branch is the "writer done" hint
 			// that many editor-save flows depend on.
-			if ((mask & FS_CLOSE_WRITE) && (lflags & B_WATCH_STAT)) {
+			if ((mask & FS_CLOSE_WRITE) && close_write_emit
+			    && (lflags & B_WATCH_STAT)) {
 				char buf[KMSG_BUFFER_SIZE];
 				struct kmsg_builder msg;
 				int32_t target_vref =
@@ -1175,7 +1394,8 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 			// mark, if any).  Emit a degraded B_ENTRY_MOVED with the
 			// post-move location populated and from-info left empty;
 			// receivers re-resolve from there.
-			if ((mask & FS_MOVE_SELF) && (lflags & B_WATCH_NAME)) {
+			if ((mask & FS_MOVE_SELF) && (lflags & B_WATCH_NAME)
+			    && !snap[i].tagalong_armed) {
 				char buf[KMSG_BUFFER_SIZE];
 				struct kmsg_builder msg;
 				int32_t to_dir_vref_id = -1;
@@ -1277,9 +1497,7 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 					list_for_each_entry(l,
 						&parent_mark->listeners,
 						list) {
-						psnap[pi].port = l->port;
-						psnap[pi].token = l->token;
-						psnap[pi].flags = l->flags;
+						listener_snap_copy(&psnap[pi], l);
 						pi++;
 					}
 					psnap_count = pi;
@@ -1290,8 +1508,16 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 			for (pi = 0; psnap && pi < psnap_count; pi++) {
 				uint32_t pflags = psnap[pi].flags;
 
-				if (!(pflags & B_WATCH_CHILDREN))
+				if (psnap[pi].is_tagalong) {
+					if (!inode
+					    || psnap[pi].tagalong_dev
+						!= inode->i_sb->s_dev
+					    || psnap[pi].tagalong_ino
+						!= inode->i_ino)
+						continue;
+				} else if (!(pflags & B_WATCH_CHILDREN)) {
 					continue;
+				}
 
 				if (mask & FS_CREATE) {
 					char buf2[KMSG_BUFFER_SIZE];
@@ -1410,69 +1636,92 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 					queue_notification(&msg2, psnap[pi].port, psnap[pi].token);
 				}
 
-			// Parent-walk MODIFY -> B_STAT_CHANGED (size + mtime).
-			if ((mask & FS_MODIFY) && (pflags & B_WATCH_STAT)) {
-				bool interim = (pflags & B_WATCH_INTERIM_STAT) != 0;
-				char buf2[KMSG_BUFFER_SIZE];
-				struct kmsg_builder msg2;
-				int32_t cvref = nm_mark_lookup_child_vref(parent_mark, inode);
-				if (cvref < 0) {
-					nm_queue_child_vref(parent_mark, inode);
-				}
-				uint32_t fields = B_STAT_SIZE | B_STAT_MODIFICATION_TIME;
-					if (interim)
-						fields |= B_STAT_INTERIM_UPDATE;
-
-					kmsg_init(&msg2, buf2, sizeof(buf2), B_NODE_MONITOR);
-					kmsg_add_int32(&msg2, "opcode", B_STAT_CHANGED);
-					kmsg_add_uint64(&msg2, "device", (uint64_t)device);
-					if (cvref >= 0)
-						kmsg_add_noderef(&msg2, "virtual:node", sentinel, (int64_t)cvref);
-					kmsg_add_int32(&msg2, "fields", (int32_t)fields);
-					queue_notification(&msg2, psnap[pi].port, psnap[pi].token);
-				}
-
-			// Parent-walk ATTRIB -> B_STAT_CHANGED (mode/uid/gid/ctime).
-			if ((mask & FS_ATTRIB) && (pflags & B_WATCH_STAT)) {
-				char buf2[KMSG_BUFFER_SIZE];
-				struct kmsg_builder msg2;
-				int32_t cvref = nm_mark_lookup_child_vref(parent_mark, inode);
-				if (cvref < 0) {
-					nm_queue_child_vref(parent_mark, inode);
-				}
-
-				kmsg_init(&msg2, buf2, sizeof(buf2), B_NODE_MONITOR);
-				kmsg_add_int32(&msg2, "opcode", B_STAT_CHANGED);
-				kmsg_add_uint64(&msg2, "device", (uint64_t)device);
-				if (cvref >= 0)
-					kmsg_add_noderef(&msg2, "virtual:node", sentinel, (int64_t)cvref);
-				kmsg_add_int32(&msg2, "fields", B_STAT_MODE | B_STAT_UID | B_STAT_GID | B_STAT_CHANGE_TIME);
-				queue_notification(&msg2, psnap[pi].port, psnap[pi].token);
-			}
-
-			// Parent-walk CLOSE_WRITE -> B_STAT_CHANGED.
-			if ((mask & FS_CLOSE_WRITE) && (pflags & B_WATCH_STAT)) {
-				char buf2[KMSG_BUFFER_SIZE];
-				struct kmsg_builder msg2;
-				int32_t cvref = nm_mark_lookup_child_vref(parent_mark, inode);
-				if (cvref < 0) {
-					nm_queue_child_vref(parent_mark, inode);
-				}
-
-				kmsg_init(&msg2, buf2, sizeof(buf2), B_NODE_MONITOR);
-				kmsg_add_int32(&msg2, "opcode", B_STAT_CHANGED);
-				kmsg_add_uint64(&msg2, "device", (uint64_t)device);
-				if (cvref >= 0)
-					kmsg_add_noderef(&msg2, "virtual:node", sentinel, (int64_t)cvref);
-				kmsg_add_int32(&msg2, "fields", B_STAT_SIZE | B_STAT_MODIFICATION_TIME);
-				queue_notification(&msg2, psnap[pi].port, psnap[pi].token);
-			}
+			/* BeOS B_WATCH_CHILDREN delivered child create/delete/move
+			 * only — never per-write stat updates from grandchildren up
+			 * the tree. The MODIFY/ATTRIB/CLOSE_WRITE -> B_STAT_CHANGED
+			 * parent-walk dispatches were the dominant amplifier in the
+			 * STAT storm. Listeners that want a child's stat should
+			 * install a per-file watch, not rely on parent fan-out. */
 		}
 
 			kfree(psnap);
 		}
 		if (parent_mark)
 			fsnotify_put_mark(&parent_mark->fs_mark);
+	}
+
+	/* When MOVED_TO is delivered on a watched dest mark, also fan the
+	 * same full from+to B_ENTRY_MOVED out to the SOURCE mark's listeners.
+	 * The source mark isn't in iter_info on this call (fsnotify_move
+	 * splits the event), so we use the refcount we took in MOVED_FROM. */
+	if (move_old_mark) {
+		struct listener_snapshot *ssnap = NULL;
+		int scount = 0, si;
+		struct nexus_listener *l;
+		unsigned long sflags;
+
+		spin_lock_irqsave(&move_old_mark->lock, sflags);
+		list_for_each_entry(l, &move_old_mark->listeners, list)
+			scount++;
+		if (scount > 0) {
+			ssnap = kmalloc_array(scount, sizeof(*ssnap), GFP_ATOMIC);
+			if (ssnap) {
+				si = 0;
+				list_for_each_entry(l,
+					&move_old_mark->listeners, list) {
+					listener_snap_copy(&ssnap[si], l);
+					si++;
+				}
+				scount = si;
+			} else {
+				scount = 0;
+			}
+		}
+		spin_unlock_irqrestore(&move_old_mark->lock, sflags);
+
+		for (si = 0; ssnap && si < scount; si++) {
+			uint32_t lflags2 = ssnap[si].flags;
+			char buf[KMSG_BUFFER_SIZE];
+			struct kmsg_builder msg;
+
+			if (ssnap[si].is_tagalong) {
+				if (!inode
+				    || ssnap[si].tagalong_dev != inode->i_sb->s_dev
+				    || ssnap[si].tagalong_ino != inode->i_ino)
+					continue;
+			} else if (!(lflags2 & (B_WATCH_NAME | B_WATCH_DIRECTORY
+						| B_WATCH_CHILDREN))) {
+				continue;
+			}
+
+			kmsg_init(&msg, buf, sizeof(buf), B_NODE_MONITOR);
+			kmsg_add_int32(&msg, "opcode", B_ENTRY_MOVED);
+			kmsg_add_uint64(&msg, "device", (uint64_t)device);
+			kmsg_add_int64(&msg, "node device", (int64_t)device);
+			if (move_from_dir_vref_id >= 0)
+				kmsg_add_entryref(&msg, "virtual:from directory",
+					sentinel,
+					(int64_t)move_from_dir_vref_id,
+					move_old_name[0] ? move_old_name : "");
+			if (move_to_dir_vref_id >= 0)
+				kmsg_add_entryref(&msg, "virtual:to directory",
+					sentinel,
+					(int64_t)move_to_dir_vref_id,
+					name ? name : "");
+			if (move_child_vref_id >= 0)
+				kmsg_add_noderef(&msg, "virtual:node",
+					sentinel,
+					(int64_t)move_child_vref_id);
+			if (name && name[0])
+				kmsg_add_string(&msg, "name", name);
+			if (move_old_name[0])
+				kmsg_add_string(&msg, "from name", move_old_name);
+			queue_notification(&msg, ssnap[si].port,
+				ssnap[si].token);
+		}
+		kfree(ssnap);
+		fsnotify_put_mark(&move_old_mark->fs_mark);
+		move_old_mark = NULL;
 	}
 
 	send_queued_notifications();
@@ -1488,7 +1737,6 @@ static const struct fsnotify_ops nexus_fsn_ops = {
 static struct nexus_mark *find_or_create_mark(struct inode *inode,
 	uint32_t initial_mask)
 {
-	struct fsnotify_mark *fs_mark;
 	struct nexus_mark *mark;
 	int ret;
 
@@ -1496,13 +1744,29 @@ static struct nexus_mark *find_or_create_mark(struct inode *inode,
 
 	mutex_lock(&find_or_create_mutex);
 
-	fs_mark = fsnotify_find_mark(&inode->i_fsnotify_marks,
-		FSNOTIFY_OBJ_TYPE_INODE, nexus_fsn_group);
-	if (fs_mark) {
-		nm_dbg("find_or_create_mark: found existing mark\n");
-		mutex_unlock(&find_or_create_mutex);
-		return get_nexus_mark(fs_mark);
+	/* Use our own marks_hash (authoritative) instead of fsnotify's
+	 * find_mark — the upstream helper has shifted args across kernel
+	 * versions and silently misses on 6.12, leaking a fresh mark per
+	 * call. */
+	struct nexus_mark *existing;
+	uint32_t h = hash_dev_ino(inode->i_sb->s_dev, inode->i_ino);
+	unsigned long hflags;
+
+	spin_lock_irqsave(&marks_hash_lock, hflags);
+	hlist_for_each_entry(existing, &marks_hash[h], hash_node) {
+		if (existing->device == inode->i_sb->s_dev &&
+		    existing->inode == inode->i_ino) {
+			refcount_inc(&existing->fs_mark.refcnt);
+			spin_unlock_irqrestore(&marks_hash_lock, hflags);
+			existing->fs_mark.mask |= initial_mask;
+			nm_dbg("find_or_create_mark: found existing mark "
+				"(hash) ino=%lu\n",
+				(unsigned long)inode->i_ino);
+			mutex_unlock(&find_or_create_mutex);
+			return existing;
+		}
 	}
+	spin_unlock_irqrestore(&marks_hash_lock, hflags);
 
 	mark = kzalloc(sizeof(*mark), GFP_KERNEL);
 	if (!mark) {
@@ -1523,8 +1787,7 @@ static struct nexus_mark *find_or_create_mark(struct inode *inode,
 	mark->vref_id = -1;
 	mark->mnt_stored = NULL;
 
-	nm_dbg("find_or_create_mark: creating new mark dev=%u ino=%lu is_dir=%d "
-		"initial_mask=0x%x\n",
+	nm_info("creating mark dev=%u ino=%lu is_dir=%d mask=0x%x\n",
 		(unsigned)mark->device, (unsigned long)mark->inode, mark->is_dir,
 		initial_mask);
 
@@ -1551,16 +1814,21 @@ static struct nexus_mark *find_or_create_mark(struct inode *inode,
 		// Some other path attached a mark for our group to this inode
 		// between our find_mark and add (find_or_create_mutex serializes
 		// THIS function but apparently not every path). Discover the
-		// winner and return it. Not an error worth logging.
+		// winner via the hash and return it.
 		kfree(mark);
-		fs_mark = fsnotify_find_mark(&inode->i_fsnotify_marks,
-			FSNOTIFY_OBJ_TYPE_INODE, nexus_fsn_group);
-		if (fs_mark) {
-			mark = get_nexus_mark(fs_mark);
-			mark->fs_mark.mask |= initial_mask;
-			mutex_unlock(&find_or_create_mutex);
-			return mark;
+		struct nexus_mark *winner;
+		spin_lock_irqsave(&marks_hash_lock, hflags);
+		hlist_for_each_entry(winner, &marks_hash[h], hash_node) {
+			if (winner->device == inode->i_sb->s_dev &&
+			    winner->inode == inode->i_ino) {
+				refcount_inc(&winner->fs_mark.refcnt);
+				spin_unlock_irqrestore(&marks_hash_lock, hflags);
+				winner->fs_mark.mask |= initial_mask;
+				mutex_unlock(&find_or_create_mutex);
+				return winner;
+			}
 		}
+		spin_unlock_irqrestore(&marks_hash_lock, hflags);
 		mutex_unlock(&find_or_create_mutex);
 		return ERR_PTR(-EEXIST);
 	}
@@ -1601,6 +1869,11 @@ static uint32_t flags_to_fsnotify_mask(uint32_t flags)
 }
 
 
+// Whitelist of B_WATCH_* bits accepted from userspace.
+#define NEXUS_NM_VALID_WATCH_FLAGS \
+	(B_WATCH_NAME | B_WATCH_STAT | B_WATCH_ATTR | B_WATCH_DIRECTORY \
+	 | B_WATCH_CHILDREN | B_WATCH_MOUNT | B_WATCH_INTERIM_STAT)
+
 static int nexus_start_watching(struct nexus_watch_fd __user *exchange)
 {
 	struct nexus_watch_fd req;
@@ -1609,13 +1882,25 @@ static int nexus_start_watching(struct nexus_watch_fd __user *exchange)
 	struct fd f;
 	struct file *file;
 	struct inode *inode;
+	const char *fs_name;
 	unsigned long flags;
+	might_sleep();
 
 	if (copy_from_user(&req, exchange, sizeof(req)))
 		return -EFAULT;
 
-	nm_dbg("nexus_start_watching: fd=%d flags=0x%x port=%d token=%u\n",
-		req.fd, req.flags, req.port, req.token);
+	nm_dbg("nexus_start_watching: fd=%d flags=0x%x port=%d token=%u vref=%d\n",
+		req.fd, req.flags, req.port, req.token, req.vref_id);
+
+	// Reject unknown flag bits.
+	if (req.flags & ~NEXUS_NM_VALID_WATCH_FLAGS) {
+		nm_err("nexus_start_watching: unknown flag bits 0x%x rejected\n",
+			req.flags & ~NEXUS_NM_VALID_WATCH_FLAGS);
+		return -EINVAL;
+	}
+
+	if (req.port < 0)
+		return -EINVAL;
 
 	if (req.fd < 0) {
 		if (req.flags == B_WATCH_MOUNT) {
@@ -1641,6 +1926,16 @@ static int nexus_start_watching(struct nexus_watch_fd __user *exchange)
 		return -EINVAL;
 	}
 
+	// Reject pseudo-fs (procfs, sysfs, devtmpfs, ...) — our semantics break
+	// and mntget() would pin the mount for no benefit.
+	fs_name = (inode->i_sb && inode->i_sb->s_type)
+		? inode->i_sb->s_type->name : NULL;
+	if (fs_name && fs_caps_kernel_is_pseudo(fs_name)) {
+		nm_dbg("nexus_start_watching: rejected pseudo fs '%s'\n", fs_name);
+		fdput(f);
+		return -EOPNOTSUPP;
+	}
+
 	mark = find_or_create_mark(inode, flags_to_fsnotify_mask(req.flags));
 	if (IS_ERR(mark)) {
 		fdput(f);
@@ -1654,7 +1949,7 @@ static int nexus_start_watching(struct nexus_watch_fd __user *exchange)
 		return -ENOTDIR;
 	}
 
-	listener = kmalloc(sizeof(*listener), GFP_KERNEL);
+	listener = kzalloc(sizeof(*listener), GFP_KERNEL);
 	if (!listener) {
 		nm_err("nexus_start_watching: failed to allocate listener\n");
 		fdput(f);
@@ -1666,11 +1961,25 @@ static int nexus_start_watching(struct nexus_watch_fd __user *exchange)
 	listener->token = req.token;
 	listener->flags = req.flags;
 
+	// Acquire the userspace-supplied vref id rather than re-mint via
+	// nexus_vref_create_from_file (exportfs_encode_fh + GFP_KERNEL alloc).
+	if (mark->vref_id < 0 && req.vref_id >= 0) {
+		if (nexus_vref_acquire_kernel_ref(req.vref_id)) {
+			mark->vref_id = req.vref_id;
+			nm_dbg("nexus_start_watching: acquired userspace vref_id=%d "
+				"for ino=%lu\n",
+				req.vref_id, (unsigned long)inode->i_ino);
+		} else {
+			nm_warn("nexus_start_watching: vref_id=%d not found in cache\n",
+				req.vref_id);
+		}
+	}
+
 	if (mark->vref_id < 0) {
+		// Fallback for callers that bypassed VRefCache.
 		int32_t vref = nexus_vref_create_from_file(file);
 		if (vref < 0) {
-			nm_warn("nexus_start_watching: vref creation failed for fd=%d "
-				"(vref_id will be -1, virtual:node unavailable)\n",
+			nm_warn("nexus_start_watching: vref creation failed for fd=%d\n",
 				req.fd);
 		} else {
 			mark->vref_id = vref;
@@ -1696,6 +2005,118 @@ static int nexus_start_watching(struct nexus_watch_fd __user *exchange)
 	// bits the first watch requested.
 	mark->fs_mark.mask |= flags_to_fsnotify_mask(req.flags);
 
+	/* Tag-along parent listener: for a non-dir file watched with
+	 * B_WATCH_NAME, also install a listener on the parent dir's mark
+	 * so we receive FS_MOVED_FROM/TO/FS_DELETE (with cookie + name +
+	 * dir) for this specific child. Without this, FS_MOVE_SELF on
+	 * the file's own mark is anemic (no name, no dir, cookie=0) and
+	 * we can't emit a complete B_ENTRY_MOVED to the {port, token}.
+	 *
+	 * Dedup: if the same {port, token} already has a non-tagalong
+	 * watch on the parent dir (e.g. Tracker watches Desktop AND
+	 * opens a file there), skip — the existing watch already
+	 * delivers B_ENTRY_MOVED. */
+	if (!mark->is_dir && (req.flags & B_WATCH_NAME)) {
+		struct dentry *fdent = file->f_path.dentry;
+		struct dentry *pdent = dget_parent(fdent);
+		struct inode *pinode = pdent ? d_inode(pdent) : NULL;
+
+		if (pinode && pinode != inode) {
+			struct nexus_mark *pmark = find_or_create_mark(
+				pinode,
+				FS_MOVED_FROM | FS_MOVED_TO | FS_DELETE
+				| FS_CREATE);
+			if (!IS_ERR(pmark)) {
+				struct nexus_listener *existing = NULL, *l;
+				struct nexus_listener *tagalong = NULL;
+				unsigned long pflags;
+
+				spin_lock_irqsave(&pmark->lock, pflags);
+				list_for_each_entry(l, &pmark->listeners, list) {
+					if (l->port != req.port
+					    || l->token != req.token)
+						continue;
+					if (!l->is_tagalong) {
+						/* Explicit parent watch covers
+						 * us — dedup to it. */
+						existing = l;
+						break;
+					}
+					if (l->tagalong_dev
+						== inode->i_sb->s_dev
+					    && l->tagalong_ino
+						== inode->i_ino) {
+						/* Already installed a tagalong
+						 * for the same child via the
+						 * same port — duplicate
+						 * watch_node call; reuse. */
+						existing = l;
+						break;
+					}
+				}
+				spin_unlock_irqrestore(&pmark->lock, pflags);
+
+				if (!existing) {
+					tagalong = kzalloc(sizeof(*tagalong),
+						GFP_KERNEL);
+				}
+				if (tagalong) {
+					tagalong->port = req.port;
+					tagalong->token = req.token;
+					tagalong->flags = B_WATCH_NAME;
+					tagalong->is_tagalong = true;
+					tagalong->tagalong_dev =
+						inode->i_sb->s_dev;
+					tagalong->tagalong_ino = inode->i_ino;
+					spin_lock_irqsave(&pmark->lock, pflags);
+					list_add(&tagalong->list,
+						&pmark->listeners);
+					spin_unlock_irqrestore(&pmark->lock,
+						pflags);
+
+					/* Suppress the degraded FS_MOVE_SELF
+					 * emit on the file's own mark for
+					 * this listener — the tagalong now
+					 * delivers a complete B_ENTRY_MOVED
+					 * via the parent. */
+					spin_lock_irqsave(&mark->lock, flags);
+					listener->tagalong_armed = true;
+					spin_unlock_irqrestore(&mark->lock,
+						flags);
+
+					nm_dbg("tagalong: installed on parent "
+						"ino=%lu for child ino=%lu "
+						"port=%d token=%u\n",
+						(unsigned long)pinode->i_ino,
+						(unsigned long)inode->i_ino,
+						req.port, req.token);
+					/* Balance find_or_create_mark's inc. */
+					fsnotify_put_mark(&pmark->fs_mark);
+				} else if (existing) {
+					/* Dedup hit: an explicit parent
+					 * watch already covers this listener.
+					 * Arm anyway — the parent watch's
+					 * MOVED_TO delivers full info, so we
+					 * still suppress the file mark's
+					 * degraded MOVE_SELF emit. */
+					spin_lock_irqsave(&mark->lock, flags);
+					listener->tagalong_armed = true;
+					spin_unlock_irqrestore(&mark->lock,
+						flags);
+					fsnotify_put_mark(&pmark->fs_mark);
+				} else {
+					/* Allocation failure: drop the mark
+					 * ref taken by find_or_create. The
+					 * file's MOVE_SELF emit stays
+					 * un-suppressed as a degraded
+					 * fallback. */
+					fsnotify_put_mark(&pmark->fs_mark);
+				}
+			}
+		}
+		dput(pdent);
+	}
+
 #if NEXUS_NM_DEBUG
 	atomic_inc(&stat_watches);
 	nm_dbg("nexus_start_watching: success, total watches=%d\n",
@@ -1716,11 +2137,16 @@ static int nexus_stop_watching(struct nexus_unwatch_fd __user *exchange)
 	unsigned long flags;
 	int found = 0;
 
+	might_sleep();
+
 	if (copy_from_user(&req, exchange, sizeof(req)))
 		return -EFAULT;
 
 	nm_dbg("nexus_stop_watching: dev=%llu node=%llu port=%d token=%u\n",
 		req.device, req.node, req.port, req.token);
+
+	if (req.port < 0)
+		return -EINVAL;
 
 	if (req.device == (uint64_t)-1 && req.node == (uint64_t)-1) {
 		nm_dbg("nexus_stop_watching: mount watching, handled in userspace\n");
@@ -1728,6 +2154,7 @@ static int nexus_stop_watching(struct nexus_unwatch_fd __user *exchange)
 	}
 
 	struct fsnotify_mark *to_destroy = NULL;
+	struct fsnotify_mark *tagalong_parent_to_destroy = NULL;
 
 	nm_dbg_lock("nexus_stop_watching: acquiring mark_mutex\n");
 	mutex_lock(&nexus_fsn_group->mark_mutex);
@@ -1741,7 +2168,8 @@ static int nexus_stop_watching(struct nexus_unwatch_fd __user *exchange)
 		spin_lock_irqsave(&mark->lock, flags);
 
 		list_for_each_entry_safe(listener, tmp, &mark->listeners, list) {
-			if (listener->port == req.port && listener->token == req.token) {
+			if (listener->port == req.port && listener->token == req.token
+			    && !listener->is_tagalong) {
 				nm_dbg("nexus_stop_watching: removing listener port=%d token=%u\n",
 					listener->port, listener->token);
 				list_del(&listener->list);
@@ -1764,12 +2192,52 @@ static int nexus_stop_watching(struct nexus_unwatch_fd __user *exchange)
 		break;
 	}
 
+	/* If this watch had a tag-along on a parent dir's mark, remove
+	 * the matching tagalong listener. We don't know which parent —
+	 * scan marks for any tagalong with matching child key + port +
+	 * token. (A single watch installs at most one tagalong.) */
+	if (found) {
+		struct fsnotify_mark *pfm;
+		list_for_each_entry(pfm, &nexus_fsn_group->marks_list, g_list) {
+			struct nexus_mark *pmark = get_nexus_mark(pfm);
+			struct nexus_listener *pl, *ptmp;
+			bool removed_here = false;
+			spin_lock_irqsave(&pmark->lock, flags);
+			list_for_each_entry_safe(pl, ptmp,
+				&pmark->listeners, list) {
+				if (pl->is_tagalong
+				    && pl->port == req.port
+				    && pl->token == req.token
+				    && pl->tagalong_dev == (dev_t)req.device
+				    && pl->tagalong_ino == (ino_t)req.node) {
+					list_del(&pl->list);
+					kfree(pl);
+					removed_here = true;
+					break;
+				}
+			}
+			if (removed_here && list_empty(&pmark->listeners)) {
+				tagalong_parent_to_destroy = pfm;
+				refcount_inc(&pfm->refcnt);
+			}
+			spin_unlock_irqrestore(&pmark->lock, flags);
+			if (removed_here)
+				break;
+		}
+	}
+
 	mutex_unlock(&nexus_fsn_group->mark_mutex);
 
 	if (to_destroy) {
 		nm_dbg("nexus_stop_watching: no more listeners, destroying mark\n");
 		fsnotify_destroy_mark(to_destroy, nexus_fsn_group);
 		fsnotify_put_mark(to_destroy);
+	}
+	if (tagalong_parent_to_destroy) {
+		nm_dbg("nexus_stop_watching: destroying empty parent tagalong mark\n");
+		fsnotify_destroy_mark(tagalong_parent_to_destroy,
+			nexus_fsn_group);
+		fsnotify_put_mark(tagalong_parent_to_destroy);
 	}
 
 	nm_dbg("nexus_stop_watching: %s\n", found ? "found and removed" : "not found");
@@ -1790,10 +2258,15 @@ static int nexus_stop_notifying(struct nexus_stop_notifying __user *exchange)
 	int marks_capacity = 16;
 	int i;
 
+	might_sleep();
+
 	if (copy_from_user(&req, exchange, sizeof(req)))
 		return -EFAULT;
 
 	nm_dbg("nexus_stop_notifying: port=%d token=%u\n", req.port, req.token);
+
+	if (req.port < 0)
+		return -EINVAL;
 
 	marks_to_remove = kmalloc_array(marks_capacity, sizeof(*marks_to_remove),
 		GFP_KERNEL);
@@ -1947,23 +2420,16 @@ uint64_t nexus_node_monitor_dev(void)
 }
 
 /* =====================================================================
- * xattr change notification via kretprobes
+ * xattr change notification
  *
- * vfs_setxattr / vfs_removexattr are kretprobed.  On successful return the
- * inode + xattr name are handed to notify_xattr_change, which filters to
- * user.beos.* attributes and emits a B_ATTR_CHANGED to every listener with
- * B_WATCH_ATTR.  This is the SOLE source of attribute notifications; the
- * fsnotify FS_ATTRIB path deliberately does not emit B_ATTR_CHANGED, so each
- * attribute write produces exactly one notification.
+ * Called synchronously from attribute.c after a successful user.beos.* write,
+ * remove, or rename.  Foreign setxattr/removexattr (outside our ioctl API) is
+ * intentionally not observed — that path is reserved for a future LSM hook.
+ * The fsnotify FS_ATTRIB path emits only B_STAT_CHANGED so each attr op
+ * produces exactly one B_ATTR_CHANGED.
  * ===================================================================== */
 
-struct xattr_probe_data {
-	struct inode *inode;
-	char name[XATTR_NAME_MAX];
-	int cause;
-};
-
-static void notify_xattr_change(struct inode *inode, const char *name, int cause)
+void nexus_nm_notify_xattr(struct inode *inode, const char *name, int cause)
 {
 	struct fsnotify_mark *fs_mark;
 	struct nexus_mark *mark;
@@ -1981,7 +2447,7 @@ static void notify_xattr_change(struct inode *inode, const char *name, int cause
 	if (!inode)
 		return;
 
-	nm_dbg("notify_xattr_change: ino=%lu name='%s' cause=%d\n",
+	nm_dbg("nexus_nm_notify_xattr: ino=%lu name='%s' cause=%d\n",
 		(unsigned long)inode->i_ino, name ? name : "(null)", cause);
 
 	// Only user.beos.* xattrs are visible
@@ -1992,19 +2458,31 @@ static void notify_xattr_change(struct inode *inode, const char *name, int cause
 		return;
 	const char *stripped_name = name + sizeof(kBeosPrefix) - 1;
 
-	fs_mark = fsnotify_find_mark(&inode->i_fsnotify_marks,
-		FSNOTIFY_OBJ_TYPE_INODE, nexus_fsn_group);
-	if (!fs_mark)
-		return;
+	struct nexus_mark *found;
+	uint32_t h = hash_dev_ino(inode->i_sb->s_dev, inode->i_ino);
+	unsigned long hflags;
 
-	mark = get_nexus_mark(fs_mark);
+	mark = NULL;
+	spin_lock_irqsave(&marks_hash_lock, hflags);
+	hlist_for_each_entry(found, &marks_hash[h], hash_node) {
+		if (found->device == inode->i_sb->s_dev &&
+		    found->inode == inode->i_ino) {
+			refcount_inc(&found->fs_mark.refcnt);
+			mark = found;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&marks_hash_lock, hflags);
+	if (!mark)
+		return;
+	fs_mark = &mark->fs_mark;
 
 	struct listener_snapshot *snap = NULL;
 	int snap_count = 0, i = 0;
 	int32_t node_vref_id;
 	dev_t device;
 
-	nm_dbg_lock("notify_xattr_change: acquiring mark->lock\n");
+	nm_dbg_lock("nexus_nm_notify_xattr: acquiring mark->lock\n");
 	spin_lock_irqsave(&mark->lock, flags);
 	node_vref_id = mark->vref_id;
 	device = mark->device;
@@ -2016,9 +2494,7 @@ static void notify_xattr_change(struct inode *inode, const char *name, int cause
 		if (snap) {
 			list_for_each_entry(listener, &mark->listeners, list) {
 				if (listener->flags & B_WATCH_ATTR) {
-					snap[i].port  = listener->port;
-					snap[i].token = listener->token;
-					snap[i].flags = listener->flags;
+					listener_snap_copy(&snap[i], listener);
 					i++;
 				}
 			}
@@ -2043,154 +2519,6 @@ static void notify_xattr_change(struct inode *inode, const char *name, int cause
 	fsnotify_put_mark(fs_mark);
 }
 
-static int setxattr_entry_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
-{
-	struct xattr_probe_data *data = (struct xattr_probe_data *)ri->data;
-
-#ifdef CONFIG_X86_64
-	struct mnt_idmap *idmap = (struct mnt_idmap *)regs->di;
-	struct dentry *dentry = (struct dentry *)regs->si;
-	const char *name = (const char *)regs->dx;
-#elif defined(CONFIG_ARM64)
-	struct mnt_idmap *idmap = (struct mnt_idmap *)regs->regs[0];
-	struct dentry *dentry = (struct dentry *)regs->regs[1];
-	const char *name = (const char *)regs->regs[2];
-#else
-	nm_dbg("setxattr_entry_handler: unsupported architecture\n");
-	data->inode = NULL;
-	return 0;
-#endif
-
-	if (dentry && d_inode(dentry)) {
-		data->inode = d_inode(dentry);
-		if (name)
-			strscpy(data->name, name, XATTR_NAME_MAX);
-		else
-			data->name[0] = '\0';
-		// Distinguish first-write (CREATED) from overwrite (CHANGED)
-		// by probing whether the xattr already exists.  Safe here: the
-		// kretprobe entry fires before vfs_setxattr takes inode_lock,
-		// and vfs_getxattr is not one of our probed symbols so no
-		// re-entrancy.
-		if (name && name[0]) {
-			unsigned int nofs = memalloc_nofs_save();
-			ssize_t exist = vfs_getxattr(idmap, dentry, name, NULL, 0);
-			memalloc_nofs_restore(nofs);
-			data->cause = (exist >= 0)
-				? B_ATTR_CAUSE_CHANGED : B_ATTR_CAUSE_CREATED;
-		} else {
-			data->cause = B_ATTR_CAUSE_CHANGED;
-		}
-		nm_dbg("setxattr_entry_handler: ino=%lu name='%s'\n",
-			(unsigned long)data->inode->i_ino, data->name);
-	} else {
-		data->inode = NULL;
-	}
-	return 0;
-}
-
-static int setxattr_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
-{
-	struct xattr_probe_data *data = (struct xattr_probe_data *)ri->data;
-	long ret = regs_return_value(regs);
-
-	nm_dbg("setxattr_ret_handler: ret=%ld\n", ret);
-
-	if (ret == 0 && data->inode && data->name[0])
-		notify_xattr_change(data->inode, data->name, data->cause);
-
-	data->inode = NULL;
-	return 0;
-}
-
-static int removexattr_entry_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
-{
-	struct xattr_probe_data *data = (struct xattr_probe_data *)ri->data;
-
-#ifdef CONFIG_X86_64
-	struct dentry *dentry = (struct dentry *)regs->si;
-	const char *name = (const char *)regs->dx;
-#elif defined(CONFIG_ARM64)
-	struct dentry *dentry = (struct dentry *)regs->regs[1];
-	const char *name = (const char *)regs->regs[2];
-#else
-	data->inode = NULL;
-	return 0;
-#endif
-
-	if (dentry && d_inode(dentry)) {
-		data->inode = d_inode(dentry);
-		if (name)
-			strscpy(data->name, name, XATTR_NAME_MAX);
-		else
-			data->name[0] = '\0';
-		data->cause = B_ATTR_CAUSE_REMOVED;
-		nm_dbg("removexattr_entry_handler: ino=%lu name='%s'\n",
-			(unsigned long)data->inode->i_ino, data->name);
-	} else {
-		data->inode = NULL;
-	}
-	return 0;
-}
-
-static int removexattr_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
-{
-	struct xattr_probe_data *data = (struct xattr_probe_data *)ri->data;
-	long ret = regs_return_value(regs);
-
-	nm_dbg("removexattr_ret_handler: ret=%ld\n", ret);
-
-	if (ret == 0 && data->inode && data->name[0])
-		notify_xattr_change(data->inode, data->name, B_ATTR_CAUSE_REMOVED);
-
-	data->inode = NULL;
-	return 0;
-}
-
-static struct kretprobe setxattr_kretprobe = {
-	.handler = setxattr_ret_handler,
-	.entry_handler = setxattr_entry_handler,
-	.maxactive = 20,
-	.data_size = sizeof(struct xattr_probe_data),
-	.kp.symbol_name = "vfs_setxattr",
-};
-
-static struct kretprobe removexattr_kretprobe = {
-	.handler = removexattr_ret_handler,
-	.entry_handler = removexattr_entry_handler,
-	.maxactive = 20,
-	.data_size = sizeof(struct xattr_probe_data),
-	.kp.symbol_name = "vfs_removexattr",
-};
-
-static int register_xattr_kprobes(void)
-{
-	int ret;
-
-	ret = register_kretprobe(&setxattr_kretprobe);
-	if (ret < 0) {
-		nm_warn("setxattr kretprobe registration failed: %d\n", ret);
-		return ret;
-	}
-
-	ret = register_kretprobe(&removexattr_kretprobe);
-	if (ret < 0) {
-		nm_warn("removexattr kretprobe registration failed: %d\n", ret);
-		unregister_kretprobe(&setxattr_kretprobe);
-		return ret;
-	}
-
-	nm_info("xattr kprobes registered successfully\n");
-	return 0;
-}
-
-static void unregister_xattr_kprobes(void)
-{
-	unregister_kretprobe(&setxattr_kretprobe);
-	unregister_kretprobe(&removexattr_kretprobe);
-	nm_dbg("xattr kprobes unregistered\n");
-}
-
 /* Team-exit cleanup: when a process dies, drop every listener it owned and
  * destroy any mark left empty. Without this, listeners owned by SIGKILL'd
  * receivers accumulate on marks forever and every subsequent fs event pays
@@ -2198,6 +2526,7 @@ static void unregister_xattr_kprobes(void)
  * (port already torn down) the same as a match so we sweep stragglers too. */
 static void node_monitor_team_exit(pid_t team)
 {
+	nm_info("team_exit team=%d\n", team);
 	struct fsnotify_mark *fs_mark, *tmp_mark;
 	struct nexus_mark *mark;
 	struct nexus_listener *listener, *tmp;
@@ -2217,9 +2546,14 @@ static void node_monitor_team_exit(pid_t team)
 	list_for_each_entry_safe(fs_mark, tmp_mark,
 		&nexus_fsn_group->marks_list, g_list) {
 		mark = get_nexus_mark(fs_mark);
+
+		// Caller holds nexus_main_lock (nexus_release → team_destroy
+		// → team_exit_callbacks). Use the _locked variant; the public
+		// nexus_port_team_of would re-acquire and self-deadlock on RT.
 		spin_lock_irqsave(&mark->lock, flags);
 		list_for_each_entry_safe(listener, tmp, &mark->listeners, list) {
-			pid_t owner = nexus_port_team_of((uint32_t)listener->port);
+			pid_t owner = nexus_port_team_of_locked(
+				(uint32_t)listener->port);
 			if (owner == team || owner <= 0) {
 				list_del(&listener->list);
 				kfree(listener);
@@ -2249,6 +2583,43 @@ static void node_monitor_team_exit(pid_t team)
 		fsnotify_put_mark(&marks_to_remove[i]->fs_mark);
 	}
 	kfree(marks_to_remove);
+
+	/* Last nexus team gone: drain any leaked marks so shutdown umount
+	 * isn't blocked by inode pins. */
+	if (hlist_empty(&nexus_teams)) {
+		struct fsnotify_mark **leaks;
+		int leaks_count = 0, leaks_cap = 16;
+
+		leaks = kmalloc_array(leaks_cap, sizeof(*leaks), GFP_KERNEL);
+		if (!leaks)
+			return;
+
+		mutex_lock(&nexus_fsn_group->mark_mutex);
+		list_for_each_entry_safe(fs_mark, tmp_mark,
+			&nexus_fsn_group->marks_list, g_list) {
+			mark = get_nexus_mark(fs_mark);
+			pr_warn_ratelimited("nexus_nm: orphan mark dev=%u:%u ino=%lu\n",
+				MAJOR(mark->device), MINOR(mark->device),
+				(unsigned long)mark->inode);
+			if (leaks_count >= leaks_cap) {
+				struct fsnotify_mark **nm = krealloc(leaks,
+					(leaks_cap * 2) * sizeof(*leaks), GFP_KERNEL);
+				if (!nm)
+					continue;
+				leaks = nm;
+				leaks_cap *= 2;
+			}
+			refcount_inc(&fs_mark->refcnt);
+			leaks[leaks_count++] = fs_mark;
+		}
+		mutex_unlock(&nexus_fsn_group->mark_mutex);
+
+		for (i = 0; i < leaks_count; i++) {
+			fsnotify_destroy_mark(leaks[i], nexus_fsn_group);
+			fsnotify_put_mark(leaks[i]);
+		}
+		kfree(leaks);
+	}
 }
 
 static int __init nexus_node_monitor_init(void)
@@ -2273,19 +2644,6 @@ static int __init nexus_node_monitor_init(void)
 		return PTR_ERR(nexus_fsn_group);
 	}
 
-	ret = misc_register(&nexus_nm_miscdev);
-	if (ret) {
-		nm_err("failed to register misc device: %d\n", ret);
-		fsnotify_put_group(nexus_fsn_group);
-		destroy_workqueue(nm_dispatch_wq);
-		nm_dispatch_wq = NULL;
-		return ret;
-	}
-
-	ret = register_xattr_kprobes();
-	if (ret < 0)
-		nm_warn("xattr tracking disabled (kprobes failed)\n");
-
 	if (nexus_register_team_exit(node_monitor_team_exit) < 0)
 		nm_warn("team-exit callback registration failed; "
 			"listeners from crashed teams will accumulate\n");
@@ -2298,6 +2656,22 @@ static int __init nexus_node_monitor_init(void)
 		nm_warn("attr subsystem init failed\n");
 	if (nexus_index_init())
 		nm_warn("index subsystem init failed\n");
+
+	// Register miscdev last so the device only appears after every
+	// subsystem is ready; otherwise userspace races subsystem sentinels.
+	ret = misc_register(&nexus_nm_miscdev);
+	if (ret) {
+		nm_err("failed to register misc device: %d\n", ret);
+		nexus_unregister_team_exit(node_monitor_team_exit);
+		nexus_index_exit();
+		nexus_attr_exit();
+		nexus_query_exit();
+		nexus_volume_exit();
+		fsnotify_put_group(nexus_fsn_group);
+		destroy_workqueue(nm_dispatch_wq);
+		nm_dispatch_wq = NULL;
+		return ret;
+	}
 
 	nm_info("loaded successfully: /dev/%s\n", NEXUS_NODE_MONITOR_DEVICE);
 	return 0;
@@ -2325,14 +2699,17 @@ static void __exit nexus_node_monitor_exit(void)
 				dropped);
 	}
 
+	nm_info("teardown step=team_exit_unreg\n");
 	nexus_unregister_team_exit(node_monitor_team_exit);
 
+	nm_info("teardown step=subsystems_exit\n");
 	nexus_index_exit();
 	nexus_attr_exit();
 	nexus_query_exit();
 	nexus_volume_exit();
 
-	unregister_xattr_kprobes();
+	// Deregister miscdev FIRST so no new ioctls land while we tear down.
+	nm_info("teardown step=misc_deregister\n");
 	misc_deregister(&nexus_nm_miscdev);
 
 	// Stop new enqueues FIRST (the NULL check in send_queued_notifications
@@ -2356,11 +2733,19 @@ static void __exit nexus_node_monitor_exit(void)
 	// destroy_group isn't exported on 6.12. After misc_deregister no new
 	// ioctls can create marks; put_group runs the final destroy when
 	// outstanding mark refs drop.
+	nm_info("teardown step=fsnotify_put_group\n");
 	fsnotify_put_group(nexus_fsn_group);
+	nm_info("teardown step=fsnotify_put_group_done\n");
+
+	cancel_delayed_work_sync(&pending_move_flush_work);
 
 	spin_lock_irqsave(&move_lock, flags);
 	list_for_each_entry_safe(pm, tmp, &pending_moves, list) {
 		/* old_dir_vref_id is mark->vref_id — do not drop */
+		if (pm->old_mark) {
+			fsnotify_put_mark(&pm->old_mark->fs_mark);
+			pm->old_mark = NULL;
+		}
 		list_del(&pm->list);
 		kfree(pm);
 	}

@@ -27,6 +27,8 @@ static DEFINE_HASHTABLE(fd_hashmap, 10);
 static DEFINE_MUTEX(fd_map_lock);
 static DEFINE_IDA(vref_ida);
 
+extern struct hlist_head nexus_teams;
+
 
 static bool
 is_rejected_fs(unsigned long magic)
@@ -577,10 +579,53 @@ nexus_vref_init(void)
 }
 
 
+/* Caller must hold fd_map_lock. */
+static void
+drain_all_locked(bool log)
+{
+	struct nexus_vref *entry;
+	struct hlist_node *tmp;
+	int bkt;
+	char pathbuf[256];
+
+	hash_for_each_safe(fd_hashmap, bkt, tmp, entry, node) {
+		struct nexus_vref_slot *slot, *stmp;
+		int reaped = 0;
+
+		if (log) {
+			const char *p = "?";
+			if (entry->kind == VREF_PATH) {
+				p = d_path(&entry->pth.path, pathbuf, sizeof(pathbuf));
+				if (IS_ERR(p))
+					p = "?";
+			}
+			pr_warn_ratelimited("nexus: orphan vref id=%d kind=%s path=%s\n",
+				entry->id, entry->kind == VREF_PATH ? "path" : "fh", p);
+		}
+
+		mutex_lock(&entry->slots_lock);
+		list_for_each_entry_safe(slot, stmp, &entry->slots, node) {
+			list_del(&slot->node);
+			kfree(slot);
+			reaped++;
+		}
+		mutex_unlock(&entry->slots_lock);
+		while (reaped--)
+			kref_put(&entry->ref_count, nexus_vref_destroy);
+		kref_put(&entry->ref_count, nexus_vref_destroy);
+	}
+}
+
+
 void
 nexus_vref_exit(void)
 {
 	nexus_unregister_team_exit(nexus_vref_team_exit);
+
+	mutex_lock(&fd_map_lock);
+	drain_all_locked(false);
+	mutex_unlock(&fd_map_lock);
+
 	ida_destroy(&vref_ida);
 }
 
@@ -609,5 +654,11 @@ nexus_vref_team_exit(pid_t team)
 		while (reaped--)
 			kref_put(&entry->ref_count, nexus_vref_destroy);
 	}
+
+	/* Last nexus team gone: anything left is a leak pinning mnt refs;
+	 * drain so shutdown remount-ro / umount can proceed. */
+	if (hlist_empty(&nexus_teams))
+		drain_all_locked(true);
+
 	mutex_unlock(&fd_map_lock);
 }

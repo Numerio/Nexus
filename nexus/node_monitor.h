@@ -50,6 +50,9 @@
 
 uint64_t nexus_node_monitor_dev(void);
 
+struct inode;
+void nexus_nm_notify_xattr(struct inode *inode, const char *name, int cause);
+
 #endif // __KERNEL__
 
 
@@ -70,6 +73,8 @@ struct nexus_watch_fd {
 	//
 	int32_t		port;
 	uint32_t	token;
+	int32_t		vref_id;	// originating vref id; -1 if unknown
+	int32_t		_pad;
 };
 
 struct nexus_unwatch_fd {

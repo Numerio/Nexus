@@ -560,8 +560,12 @@ long nexus_attr_ioctl_write(unsigned long arg)
 	ret = vfs_setxattr(&nop_mnt_idmap, target_file->f_path.dentry,
 			   xattr_name, new_payload, new_payload_len, 0);
 
-	if (ret == 0)
+	if (ret == 0) {
+		nexus_nm_notify_xattr(inode, xattr_name,
+			attr_existed ? B_ATTR_CAUSE_CHANGED
+				     : B_ATTR_CAUSE_CREATED);
 		ret = (int)req.buf_len;
+	}
 
 out_unlock:
 	nexus_attr_lock_release(lk);
@@ -687,6 +691,9 @@ long nexus_attr_ioctl_remove(unsigned long arg)
 	ret = vfs_removexattr(&nop_mnt_idmap, target_file->f_path.dentry,
 			      xattr_name);
 
+	if (ret == 0)
+		nexus_nm_notify_xattr(inode, xattr_name, B_ATTR_CAUSE_REMOVED);
+
 	nexus_attr_lock_release(lk);
 	fput(target_file);
 	return ret;
@@ -804,6 +811,9 @@ long nexus_attr_ioctl_rename(unsigned long arg)
 				to_xattr);
 		goto out_payload;
 	}
+
+	nexus_nm_notify_xattr(to_inode,   to_xattr,   B_ATTR_CAUSE_CREATED);
+	nexus_nm_notify_xattr(from_inode, from_xattr, B_ATTR_CAUSE_REMOVED);
 
 out_payload:
 	kvfree(payload);
