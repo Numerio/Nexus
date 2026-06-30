@@ -5,8 +5,10 @@
 
 #include "nexus.h"
 
+#include <linux/cred.h>
 #include <linux/fs.h>
 #include <linux/idr.h>
+#include <linux/sched.h>
 #include <linux/kref.h>
 #include <linux/list.h>
 #include <linux/module.h>
@@ -450,6 +452,12 @@ goahead:
 		return B_NO_MEMORY;
 	}
 
+	if (from_user) {
+		buf->sender = from_kuid_munged(current_user_ns(), current_uid());
+		buf->sender_group = from_kgid_munged(current_user_ns(), current_gid());
+		buf->sender_team = task_tgid_nr(current);
+	}
+
 	if (buffer != NULL) {
 		buf->buffer = kzalloc(size, GFP_KERNEL);
 		if (buf->buffer == NULL) {
@@ -629,6 +637,10 @@ goahead:
 		ret = B_NO_MEMORY;
 		goto err_count;
 	}
+
+	buf->sender = from_kuid_munged(current_user_ns(), current_uid());
+	buf->sender_group = from_kgid_munged(current_user_ns(), current_gid());
+	buf->sender_team = task_tgid_nr(current);
 
 	if (buffer != NULL && size > 0) {
 		buf->buffer = kzalloc(size, GFP_KERNEL);
@@ -917,6 +929,9 @@ long nexus_port_message_info(struct nexus_port* port,
 	}
 
 	message_info.size = buf->size;
+	message_info.sender = buf->sender;
+	message_info.sender_group = buf->sender_group;
+	message_info.sender_team = buf->sender_team;
 
 	if (copy_to_user(info, &message_info, sizeof(*info))) {
 		return B_BAD_VALUE;
