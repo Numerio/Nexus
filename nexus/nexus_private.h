@@ -233,7 +233,9 @@ struct nexus_vref {
 			int				fh_type;
 		} fh;
 		struct {
-			struct path		path;
+			char			*name;
+			dev_t			dev;
+			ino_t			ino;
 			fmode_t			mode;
 		} pth;
 	};

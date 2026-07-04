@@ -13,6 +13,7 @@
 #include <linux/magic.h>
 #include <linux/mount.h>
 #include <linux/mutex.h>
+#include <linux/namei.h>
 #include <linux/path.h>
 #include <linux/random.h>
 #include <linux/slab.h>
@@ -58,6 +59,9 @@ find_entry_locked(int32_t id)
 }
 
 
+static int nexus_vref_resolve_path(struct nexus_vref *entry,
+	struct path *out);
+
 static void
 nexus_vref_destroy(struct kref *kref)
 {
@@ -75,7 +79,7 @@ nexus_vref_destroy(struct kref *kref)
 	if (entry->kind == VREF_FH)
 		mntput(entry->fh.mnt);
 	else
-		path_put(&entry->pth.path);
+		kfree(entry->pth.name);
 	ida_free(&vref_ida, entry->id);
 	kfree(entry);
 }
@@ -121,9 +125,26 @@ nexus_vref_create_from_file(struct file *file)
 	}
 
 	if (entry->kind == VREF_PATH) {
-		entry->pth.path = file->f_path;
-		path_get(&entry->pth.path);
+		char *pathbuf;
+		char *p;
+
+		entry->pth.dev  = sb->s_dev;
+		entry->pth.ino  = dentry->d_inode->i_ino;
 		entry->pth.mode = file->f_mode;
+
+		pathbuf = kmalloc(PATH_MAX, GFP_KERNEL);
+		if (pathbuf == NULL) {
+			kfree(entry);
+			return -ENOMEM;
+		}
+		p = d_path(&file->f_path, pathbuf, PATH_MAX);
+		if (!IS_ERR(p))
+			entry->pth.name = kstrdup(p, GFP_KERNEL);
+		kfree(pathbuf);
+		if (entry->pth.name == NULL) {
+			kfree(entry);
+			return -ENOMEM;
+		}
 	}
 
 	id = ida_alloc_min(&vref_ida, 1, GFP_KERNEL);
@@ -131,7 +152,7 @@ nexus_vref_create_from_file(struct file *file)
 		if (entry->kind == VREF_FH)
 			mntput(entry->fh.mnt);
 		else
-			path_put(&entry->pth.path);
+			kfree(entry->pth.name);
 		kfree(entry);
 		return -ENOMEM;
 	}
@@ -358,9 +379,6 @@ nexus_vref_open(struct nexus_vref_open __user *uarg)
 			fh_len = entry->fh.fh_len;
 			fh_type = entry->fh.fh_type;
 			memcpy(fh, entry->fh.fh, fh_len);
-		} else {
-			path = entry->pth.path;
-			path_get(&path);
 		}
 		kref_get(&entry->ref_count);
 		held_kref = true;
@@ -369,6 +387,17 @@ nexus_vref_open(struct nexus_vref_open __user *uarg)
 
 	if (ret != B_OK)
 		return ret;
+
+	if (kind == VREF_PATH) {
+		/* Weak resolve: kern_path must run outside fd_map_lock. kref is
+		 * held via held_kref, so entry (and entry->pth.name) is safe. */
+		int rc = nexus_vref_resolve_path(entry, &path);
+		if (rc) {
+			ret = (rc == -ESTALE || rc == -ENOENT)
+				? B_ENTRY_NOT_FOUND : B_ERROR;
+			goto out;
+		}
+	}
 
 	if (kind == VREF_FH) {
 		struct dentry *dec = exportfs_decode_fh(mnt,
@@ -508,6 +537,70 @@ nexus_vref_grant_slot_for_id(int32_t id, pid_t target_team)
 }
 
 
+/* Caller must path_put(*out) on success. */
+static int
+nexus_vref_resolve_path(struct nexus_vref *entry, struct path *out)
+{
+	struct path p;
+	int err;
+
+	if (entry->kind != VREF_PATH)
+		return -EINVAL;
+	if (entry->pth.name == NULL)
+		return -ENXIO;
+
+	err = kern_path(entry->pth.name, LOOKUP_FOLLOW, &p);
+	if (err) {
+		pr_warn_ratelimited(
+			"nexus: vref id=%d name=%s kern_path failed (%d)\n",
+			entry->id, entry->pth.name, err);
+		return err;
+	}
+
+	if (p.dentry->d_sb->s_dev != entry->pth.dev) {
+		pr_warn_ratelimited(
+			"nexus: vref id=%d name=%s dev mismatch (was %u:%u, now %u:%u)\n",
+			entry->id, entry->pth.name,
+			MAJOR(entry->pth.dev), MINOR(entry->pth.dev),
+			MAJOR(p.dentry->d_sb->s_dev), MINOR(p.dentry->d_sb->s_dev));
+		path_put(&p);
+		return -ENXIO;
+	}
+	if (p.dentry->d_inode == NULL
+			|| p.dentry->d_inode->i_ino != entry->pth.ino) {
+		pr_warn_ratelimited(
+			"nexus: vref id=%d name=%s ino mismatch (was %lu, now %lu)\n",
+			entry->id, entry->pth.name,
+			(unsigned long)entry->pth.ino,
+			p.dentry->d_inode
+				? (unsigned long)p.dentry->d_inode->i_ino : 0UL);
+		path_put(&p);
+		return -ESTALE;
+	}
+
+	*out = p;
+	return 0;
+}
+
+int
+nexus_vref_resolve_id_to_path(int32_t id, struct path *out)
+{
+	struct nexus_vref *entry;
+	int rc;
+
+	if (out == NULL)
+		return -EINVAL;
+
+	entry = nexus_vref_kref_acquire(id);
+	if (entry == NULL)
+		return -ENOENT;
+	rc = nexus_vref_resolve_path(entry, out);
+	nexus_vref_kref_release(entry);
+	return rc;
+}
+
+
+EXPORT_SYMBOL(nexus_vref_resolve_id_to_path);
 EXPORT_SYMBOL(nexus_vref_kref_acquire);
 EXPORT_SYMBOL(nexus_vref_kref_release);
 EXPORT_SYMBOL(nexus_vref_mint_slot_for);
@@ -586,7 +679,6 @@ drain_all_locked(bool log)
 	struct nexus_vref *entry;
 	struct hlist_node *tmp;
 	int bkt;
-	char pathbuf[256];
 
 	hash_for_each_safe(fd_hashmap, bkt, tmp, entry, node) {
 		struct nexus_vref_slot *slot, *stmp;
@@ -594,11 +686,8 @@ drain_all_locked(bool log)
 
 		if (log) {
 			const char *p = "?";
-			if (entry->kind == VREF_PATH) {
-				p = d_path(&entry->pth.path, pathbuf, sizeof(pathbuf));
-				if (IS_ERR(p))
-					p = "?";
-			}
+			if (entry->kind == VREF_PATH && entry->pth.name != NULL)
+				p = entry->pth.name;
 			pr_warn_ratelimited("nexus: orphan vref id=%d kind=%s path=%s\n",
 				entry->id, entry->kind == VREF_PATH ? "path" : "fh", p);
 		}

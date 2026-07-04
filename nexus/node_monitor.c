@@ -1470,12 +1470,12 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 		hlist_for_each_entry(pm_iter, &marks_hash[phash], hash_node) {
 			if (pm_iter->device == device &&
 			    pm_iter->inode == dir->i_ino) {
+				if (!refcount_inc_not_zero(&pm_iter->fs_mark.refcnt))
+					continue;
 				parent_mark = pm_iter;
 				break;
 			}
 		}
-		if (parent_mark)
-			refcount_inc(&parent_mark->fs_mark.refcnt);
 		spin_unlock_irqrestore(&marks_hash_lock, hlflags);
 
 		if (parent_mark) {
@@ -1756,7 +1756,10 @@ static struct nexus_mark *find_or_create_mark(struct inode *inode,
 	hlist_for_each_entry(existing, &marks_hash[h], hash_node) {
 		if (existing->device == inode->i_sb->s_dev &&
 		    existing->inode == inode->i_ino) {
-			refcount_inc(&existing->fs_mark.refcnt);
+			/* nexus_mark_free calls hlist_del_init late, so a mark
+			 * can be in the hash with refcnt == 0. Skip corpses. */
+			if (!refcount_inc_not_zero(&existing->fs_mark.refcnt))
+				continue;
 			spin_unlock_irqrestore(&marks_hash_lock, hflags);
 			existing->fs_mark.mask |= initial_mask;
 			nm_dbg("find_or_create_mark: found existing mark "
@@ -1821,7 +1824,8 @@ static struct nexus_mark *find_or_create_mark(struct inode *inode,
 		hlist_for_each_entry(winner, &marks_hash[h], hash_node) {
 			if (winner->device == inode->i_sb->s_dev &&
 			    winner->inode == inode->i_ino) {
-				refcount_inc(&winner->fs_mark.refcnt);
+				if (!refcount_inc_not_zero(&winner->fs_mark.refcnt))
+					continue;
 				spin_unlock_irqrestore(&marks_hash_lock, hflags);
 				winner->fs_mark.mask |= initial_mask;
 				mutex_unlock(&find_or_create_mutex);
@@ -2304,7 +2308,7 @@ static int nexus_stop_notifying(struct nexus_stop_notifying __user *exchange)
 				int new_cap = marks_capacity * 2;
 				struct nexus_mark **new_arr;
 				new_arr = krealloc(marks_to_remove,
-					new_cap * sizeof(*marks_to_remove), GFP_ATOMIC);
+					new_cap * sizeof(*marks_to_remove), GFP_KERNEL);
 				if (new_arr) {
 					marks_to_remove = new_arr;
 					marks_capacity = new_cap;
@@ -2467,7 +2471,8 @@ void nexus_nm_notify_xattr(struct inode *inode, const char *name, int cause)
 	hlist_for_each_entry(found, &marks_hash[h], hash_node) {
 		if (found->device == inode->i_sb->s_dev &&
 		    found->inode == inode->i_ino) {
-			refcount_inc(&found->fs_mark.refcnt);
+			if (!refcount_inc_not_zero(&found->fs_mark.refcnt))
+				continue;
 			mark = found;
 			break;
 		}
@@ -2563,7 +2568,7 @@ static void node_monitor_team_exit(pid_t team)
 			if (marks_count >= marks_capacity) {
 				int new_cap = marks_capacity * 2;
 				struct nexus_mark **new_arr = krealloc(marks_to_remove,
-					new_cap * sizeof(*marks_to_remove), GFP_ATOMIC);
+					new_cap * sizeof(*marks_to_remove), GFP_KERNEL);
 				if (new_arr) {
 					marks_to_remove = new_arr;
 					marks_capacity = new_cap;
