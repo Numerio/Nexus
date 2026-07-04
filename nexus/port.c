@@ -713,7 +713,9 @@ err_count:
 static long nexus_port_read_with_caps(struct nexus_port* port, int32_t* code,
 	void __user* buffer, size_t* size_inout,
 	struct nexus_port_cap_out __user* user_caps, size_t* caps_count_inout,
-	uint32_t flags, int64_t timeout)
+	uint32_t flags, int64_t timeout,
+	uint32_t* out_sender_uid, uint32_t* out_sender_gid,
+	int32_t* out_sender_team)
 {
 	struct nexus_buffer* buf = NULL;
 	struct nexus_port_cap_out* caps_out = NULL;
@@ -813,6 +815,13 @@ static long nexus_port_read_with_caps(struct nexus_port* port, int32_t* code,
 
 	*size_inout = buf->size;
 	*caps_count_inout = buf->cap_count;
+
+	if (out_sender_uid != NULL)
+		*out_sender_uid = buf->sender;
+	if (out_sender_gid != NULL)
+		*out_sender_gid = buf->sender_group;
+	if (out_sender_team != NULL)
+		*out_sender_team = buf->sender_team;
 
 	list_del(&buf->node);
 	port->read_count--;
@@ -1084,9 +1093,14 @@ long nexus_port_io_read_caps(struct nexus_team *team, unsigned long arg)
 		return -EFAULT;
 
 	port = idr_find(&nexus_port_idr, data.id);
+	data.sender_uid = (uint32_t)-1;
+	data.sender_gid = (uint32_t)-1;
+	data.sender_team = -1;
 	data.ret = port ? nexus_port_read_with_caps(port, data.code,
 		data.buffer, &data.size, data.caps, &data.caps_count,
-		data.flags, data.timeout) : B_BAD_PORT_ID;
+		data.flags, data.timeout,
+		&data.sender_uid, &data.sender_gid, &data.sender_team)
+		: B_BAD_PORT_ID;
 
 	if (copy_to_user((void __user *)arg, &data, sizeof(data)))
 		return -EFAULT;

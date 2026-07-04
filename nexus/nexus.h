@@ -231,6 +231,9 @@ struct nexus_port_read_caps {
 	int64_t			timeout;
 	/* out */
 	int32_t			ret;
+	uint32_t		sender_uid;	/* out: kernel-populated writer uid */
+	uint32_t		sender_gid;
+	int32_t			sender_team;
 };
 
 struct nexus_port_get_info {
