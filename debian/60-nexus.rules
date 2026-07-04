@@ -1,0 +1,13 @@
+# Nexus character devices — accessible by the default desktop user.
+#
+# Missing access to any one of these prevents app startup:
+#   /dev/nexus              — ports / BLooper / app launch
+#   /dev/nexus_area         — shared areas (BApplication init aborts without it)
+#   /dev/nexus_node_monitor — watch_node + vref sentinel device detection
+#
+# Group ownership (rather than MODE=0666) is intentional — world-writable
+# would be a real security regression vs. the group-restricted form.
+
+KERNEL=="nexus",              GROUP="vitruvio", MODE="0660"
+KERNEL=="nexus_area",         GROUP="vitruvio", MODE="0660"
+KERNEL=="nexus_node_monitor", GROUP="vitruvio", MODE="0660"
