@@ -1,4 +1,4 @@
-# Nexus character devices — accessible by the default desktop user.
+# Nexus character devices — accessible to members of the "nexus" group.
 #
 # Missing access to any one of these prevents app startup:
 #   /dev/nexus              — ports / BLooper / app launch
@@ -8,6 +8,6 @@
 # Group ownership (rather than MODE=0666) is intentional — world-writable
 # would be a real security regression vs. the group-restricted form.
 
-KERNEL=="nexus",              GROUP="vitruvio", MODE="0660"
-KERNEL=="nexus_area",         GROUP="vitruvio", MODE="0660"
-KERNEL=="nexus_node_monitor", GROUP="vitruvio", MODE="0660"
+KERNEL=="nexus",              GROUP="nexus", MODE="0660"
+KERNEL=="nexus_area",         GROUP="nexus", MODE="0660"
+KERNEL=="nexus_node_monitor", GROUP="nexus", MODE="0660"
