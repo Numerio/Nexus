@@ -168,6 +168,52 @@ nexus_vref_create_from_file(struct file *file)
 	return entry->id;
 }
 
+
+/* Build a path-backed vref directly from a known path string, with no open
+ * file and no vfsmount. Used by the node monitor to mint vrefs for children
+ * discovered via fsnotify (parent dir path + child name), so the hot path
+ * neither pins a mount nor performs a dentry_open. */
+int32_t
+nexus_vref_create_path(const char *path, dev_t dev, ino_t ino, fmode_t mode)
+{
+	struct nexus_vref *entry;
+	int id;
+
+	if (!path || !path[0])
+		return -EINVAL;
+
+	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
+	if (!entry)
+		return -ENOMEM;
+
+	entry->kind     = VREF_PATH;
+	entry->pth.dev  = dev;
+	entry->pth.ino  = ino;
+	entry->pth.mode = mode;
+	entry->pth.name = kstrdup(path, GFP_KERNEL);
+	if (!entry->pth.name) {
+		kfree(entry);
+		return -ENOMEM;
+	}
+
+	id = ida_alloc_min(&vref_ida, 1, GFP_KERNEL);
+	if (id < 0) {
+		kfree(entry->pth.name);
+		kfree(entry);
+		return -ENOMEM;
+	}
+
+	mutex_lock(&fd_map_lock);
+	kref_init(&entry->ref_count);
+	entry->id = id;
+	INIT_LIST_HEAD(&entry->slots);
+	mutex_init(&entry->slots_lock);
+	hash_add(fd_hashmap, &entry->node, entry->id);
+	mutex_unlock(&fd_map_lock);
+
+	return entry->id;
+}
+
 static fmode_t
 nexus_vref_backing_mode(const struct nexus_vref *entry)
 {
@@ -276,6 +322,14 @@ nexus_vref_create(struct nexus_vref_create __user *uarg)
 		return -ENOENT;
 	}
 	ret = nexus_vref_add_slot(entry, &k.key);
+	/* Drop the creation ref returned by nexus_vref_create_from_file. On
+	 * success the new slot now owns the vref, so it is destroyed when its
+	 * last slot (and any kernel ref) is released instead of leaking at
+	 * kref==1 until the shutdown drain — the leak that kept every
+	 * VRefCache entry (and its fh.mnt pin) alive for the whole session. On
+	 * failure this destroys the just-created, slot-less vref. Unreachable
+	 * either way: VREF_ACQUIRE/OPEN require owning a slot. */
+	kref_put(&entry->ref_count, nexus_vref_destroy);
 	mutex_unlock(&fd_map_lock);
 	if (ret != B_OK)
 		return ret;
@@ -607,6 +661,7 @@ EXPORT_SYMBOL(nexus_vref_mint_slot_for);
 EXPORT_SYMBOL(nexus_vref_grant_slot_for_id);
 EXPORT_SYMBOL(nexus_vref_ioctl);
 EXPORT_SYMBOL(nexus_vref_create_from_file);
+EXPORT_SYMBOL(nexus_vref_create_path);
 EXPORT_SYMBOL(nexus_vref_drop_kernel_ref);
 EXPORT_SYMBOL(nexus_vref_acquire_kernel_ref);
 

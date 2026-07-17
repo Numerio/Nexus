@@ -13,6 +13,10 @@ void     nexus_vref_exit(void);
 void     nexus_vref_team_exit(pid_t team);
 long     nexus_vref_ioctl(unsigned int cmd, unsigned long arg);
 int32_t  nexus_vref_create_from_file(struct file *file);
+// Build a path-backed vref with no open file and no vfsmount reference.
+// Used by the node monitor to mint child vrefs from a path string.
+int32_t  nexus_vref_create_path(const char *path, dev_t dev, ino_t ino,
+             fmode_t mode);
 void     nexus_vref_drop_kernel_ref(int32_t id);
 // Bumps the kref on the entry with the given id. Returns true if found.
 // Use to extend a vref's lifetime past the original holder (e.g., keep a

@@ -247,7 +247,10 @@ struct nexus_mark {
 	struct hlist_node hash_node;    // protected by marks_hash_lock
 
 	int32_t          vref_id;       // -1 if unminted
-	struct vfsmount *mnt_stored;    // for nm_vref_from_inode
+	/* Full path of the watched node, captured at start_watching. Used to
+	 * build child paths (node_path + "/" + name) for path-backed child
+	 * vrefs, so the mark never pins a vfsmount. NULL if unavailable. */
+	char            *node_path;
 
 	struct list_head children_vrefs;
 	spinlock_t       children_vrefs_lock;
@@ -270,20 +273,6 @@ struct pending_move {
 	unsigned long expires;
 	char old_name[NAME_MAX + 1];
 };
-
-/* Deferred child-vref creation: event handler runs on syscall thread,
- * vref minting is too expensive there, so queue for off-thread worker. */
-struct pending_child_vref {
-	struct list_head list;
-	struct nexus_mark *mark;   /* refcount-held */
-	struct inode    *inode;    /* igrab'd */
-	struct vfsmount *mnt;      /* mntget'd */
-	dev_t            device;
-	ino_t            ino;
-};
-
-static LIST_HEAD(nm_pending_vrefs);
-static DEFINE_SPINLOCK(nm_pending_vrefs_lock);
 
 static struct fsnotify_group *nexus_fsn_group;
 static LIST_HEAD(pending_moves);
@@ -340,7 +329,6 @@ static unsigned int nm_dispatch_depth;
 #define NM_DISPATCH_MAX_DEPTH 2048
 static struct workqueue_struct *nm_dispatch_wq;
 static void nm_dispatch_work(struct work_struct *w);
-static void nm_process_pending_vrefs(void);
 static DECLARE_WORK(nm_dispatch_work_item, nm_dispatch_work);
 
 static void queue_notification(struct kmsg_builder *msg, port_id port, uint32_t token)
@@ -388,10 +376,6 @@ static void nm_dispatch_work(struct work_struct *w)
 	unsigned long flags;
 
 	(void)w;
-
-	/* Mint deferred child vrefs first, so they're available for
-	 * notifications about to be dispatched. */
-	nm_process_pending_vrefs();
 
 	for (;;) {
 		spin_lock_irqsave(&nm_dispatch_lock, flags);
@@ -630,8 +614,9 @@ static void nexus_mark_free(struct fsnotify_mark *fs_mark)
 	struct nexus_mark *mark = get_nexus_mark(fs_mark);
 	struct nexus_listener *listener, *tmp;
 
-	nm_info("mark_free ino=%lu vref=%d mnt=%p\n",
-		(unsigned long)mark->inode, mark->vref_id, mark->mnt_stored);
+	nm_info("mark_free ino=%lu vref=%d path=%s\n",
+		(unsigned long)mark->inode, mark->vref_id,
+		mark->node_path ? mark->node_path : "(none)");
 
 	unsigned long flags;
 	nm_dbg_lock("nexus_mark_free: acquiring marks_hash_lock\n");
@@ -666,10 +651,8 @@ static void nexus_mark_free(struct fsnotify_mark *fs_mark)
 		kfree(cv);
 	}
 
-	if (mark->mnt_stored) {
-		mntput(mark->mnt_stored);
-		mark->mnt_stored = NULL;
-	}
+	kfree(mark->node_path);
+	mark->node_path = NULL;
 
 	if (mark->vref_id >= 0)
 		nexus_vref_drop_kernel_ref(mark->vref_id);
@@ -684,7 +667,10 @@ static void nexus_freeing_mark(struct fsnotify_mark *mark,
 	nm_dbg("nexus_freeing_mark called\n");
 }
 
-static int32_t nm_vref_from_inode(struct inode *inode, struct vfsmount *mnt);
+/* Child vrefs are path-backed identifiers minted for the node monitor's own
+ * bookkeeping; the real access check happens in the VFS when a subscriber
+ * later opens the vref, so a permissive backing mode is correct here. */
+#define NM_CHILD_VREF_MODE (FMODE_READ | FMODE_WRITE)
 
 static int32_t nm_mark_lookup_child_vref(struct nexus_mark *mark,
 	struct inode *inode)
@@ -705,27 +691,62 @@ static int32_t nm_mark_lookup_child_vref(struct nexus_mark *mark,
 	return id;
 }
 
-static void nm_queue_child_vref(struct nexus_mark *mark, struct inode *inode);
-
-/* Synchronous vref creation for CREATE/MOVED_TO paths.  These are
- * relatively rare events (file creation, rename), and subscribers
- * like Tracker need a complete node_ref in the notification to
- * create or update their Pose.  The cost of d_find_alias +
- * dentry_open(O_PATH) is small relative to the filesystem I/O
- * that the originating syscall is already performing. */
-static int32_t nm_mark_get_or_mint_child_vref(struct nexus_mark *mark,
-	struct inode *inode)
+/* Mint a path-backed vref for a child of a watched directory, from the
+ * mark's stored directory path plus the child name reported by fsnotify.
+ * No dentry_open, no vfsmount, no inode pin — so nothing here can block a
+ * later unmount of the backing filesystem. Must not be called from atomic
+ * context (allocates and takes fd_map_lock); all callers run outside the
+ * mark spinlocks. */
+static int32_t nm_child_vref_mint(struct nexus_mark *mark,
+	struct inode *inode, const char *name)
 {
-	struct nm_child_vref *e;
+	char *path;
+	int32_t id;
+	unsigned int nofs;
+
+	if (!mark->node_path || !name || !name[0])
+		return -1;
+
+	path = kmalloc(PATH_MAX, GFP_KERNEL);
+	if (!path)
+		return -1;
+	if (snprintf(path, PATH_MAX, "%s/%s", mark->node_path, name)
+			>= PATH_MAX) {
+		kfree(path);
+		return -1;
+	}
+
+	/* GFP_NOFS across the create: we may be on the fsnotify callback with
+	 * the originating syscall's inode lock held, so reclaim must not
+	 * recurse back into the filesystem (writeback -> fsnotify -> us). */
+	nofs = memalloc_nofs_save();
+	id = nexus_vref_create_path(path, inode->i_sb->s_dev, inode->i_ino,
+		NM_CHILD_VREF_MODE);
+	memalloc_nofs_restore(nofs);
+
+	kfree(path);
+	return id;
+}
+
+/* Look up (or mint and cache) the child vref for an event on a child of a
+ * watched directory. Rare-ish (create/delete/rename/first stat of a child);
+ * minting is a string build + one small allocation now that vrefs are
+ * path-backed. */
+static int32_t nm_mark_get_or_mint_child_vref(struct nexus_mark *mark,
+	struct inode *inode, const char *name)
+{
+	struct nm_child_vref *e, *existing;
+	unsigned long cflags;
 	int32_t id = nm_mark_lookup_child_vref(mark, inode);
+
 	if (id >= 0)
 		return id;
 
-	id = nm_vref_from_inode(inode, mark->mnt_stored);
+	id = nm_child_vref_mint(mark, inode, name);
 	if (id < 0)
 		return -1;
 
-	e = kzalloc(sizeof(*e), GFP_ATOMIC);
+	e = kzalloc(sizeof(*e), GFP_KERNEL);
 	if (!e) {
 		nexus_vref_drop_kernel_ref(id);
 		return -1;
@@ -734,51 +755,41 @@ static int32_t nm_mark_get_or_mint_child_vref(struct nexus_mark *mark,
 	e->inode   = inode->i_ino;
 	e->vref_id = id;
 
-	{
-		unsigned long cflags;
-		struct nm_child_vref *existing;
-		spin_lock_irqsave(&mark->children_vrefs_lock, cflags);
-		list_for_each_entry(existing, &mark->children_vrefs, list) {
-			if (existing->inode == e->inode &&
-			    existing->device == e->device) {
-				spin_unlock_irqrestore(
-					&mark->children_vrefs_lock, cflags);
-				nexus_vref_drop_kernel_ref(id);
-				kfree(e);
-				return existing->vref_id;
-			}
+	spin_lock_irqsave(&mark->children_vrefs_lock, cflags);
+	list_for_each_entry(existing, &mark->children_vrefs, list) {
+		if (existing->inode == e->inode &&
+		    existing->device == e->device) {
+			spin_unlock_irqrestore(&mark->children_vrefs_lock,
+				cflags);
+			nexus_vref_drop_kernel_ref(id);
+			kfree(e);
+			return existing->vref_id;
 		}
-		list_add(&e->list, &mark->children_vrefs);
-		spin_unlock_irqrestore(&mark->children_vrefs_lock, cflags);
 	}
+	list_add(&e->list, &mark->children_vrefs);
+	spin_unlock_irqrestore(&mark->children_vrefs_lock, cflags);
 	return id;
 }
 
-/* Cache-only lookup for frequent events (MODIFY/ATTRIB/CLOSE_WRITE).
- * If the child was CREATE'd after the watch was established, the
- * vref is already cached here.  For pre-existing children, queue
- * a background warm-up so subsequent events find the vref. */
-static inline int32_t nm_node_vref_for_event(struct nexus_mark *mark,
-	struct inode *inode)
+/* Node vref for a stat-class event (MODIFY/ATTRIB/CLOSE_WRITE). For an event
+ * on the watched node itself, reuse mark->vref_id; for a child, mint/cache a
+ * path-backed vref. */
+static int32_t nm_node_vref_for_event(struct nexus_mark *mark,
+	struct inode *inode, const char *name)
 {
-	int32_t id;
 	if (inode->i_ino == mark->inode &&
 	    inode->i_sb->s_dev == mark->device)
 		return mark->vref_id;
-	id = nm_mark_lookup_child_vref(mark, inode);
-	if (id < 0)
-		nm_queue_child_vref(mark, inode);
-	return id;
+	return nm_mark_get_or_mint_child_vref(mark, inode, name);
 }
 
 
 /* Dir-side equivalent: when an event fires on a directory mark, the
- * parent inode is the watched mark itself, so reuse mark->vref_id rather
- * than minting a fresh vref via nm_vref_from_inode().  Userspace stores
- * the watch fd's vref id at start_watching time and compares incoming
- * notifications by node_ref equality; without this dedup every emitted
- * "virtual:directory" carried a different vref id than the one Tracker
- * holds, so the dirNode != targetModel->NodeRef() guard in
+ * parent inode is the watched mark itself, so reuse mark->vref_id.
+ * Userspace stores the watch fd's vref id at start_watching time and
+ * compares incoming notifications by node_ref equality; without this dedup
+ * every emitted "virtual:directory" carried a different vref id than the one
+ * Tracker holds, so the dirNode != targetModel->NodeRef() guard in
  * BPoseView::FSNotification dropped every CREATE/DELETE/MOVED. */
 static inline int32_t nm_dir_vref_for_event(struct nexus_mark *mark,
 	struct inode *dir)
@@ -788,9 +799,7 @@ static inline int32_t nm_dir_vref_for_event(struct nexus_mark *mark,
 	if (dir->i_ino == mark->inode &&
 	    dir->i_sb->s_dev == mark->device)
 		return mark->vref_id;
-	/* Slow path (dir != mark): return -1 rather than blocking the
-	 * syscall thread with nm_vref_from_inode.  Subscribers resolve
-	 * by device + name. */
+	/* dir != mark: subscribers resolve by device + name. */
 	return -1;
 }
 
@@ -816,172 +825,6 @@ static int32_t nm_mark_release_child_vref(struct nexus_mark *mark,
 	if (id >= 0)
 		nexus_vref_drop_kernel_ref(id);
 	return id;
-}
-
-static int32_t nm_vref_from_inode(struct inode *inode, struct vfsmount *mnt)
-{
-	struct dentry *dentry;
-	struct path p;
-	struct file *f;
-	int32_t vref_id = -1;
-	unsigned int nofs_flags;
-
-	if (!inode || !mnt)
-		return -1;
-
-	// dentry_open + create_from_file sleep; bail if called from atomic ctx.
-	if (in_atomic() || irqs_disabled()) {
-		nm_dbg("nm_vref_from_inode: skipped (atomic context) ino=%lu\n",
-			(unsigned long)inode->i_ino);
-		return -1;
-	}
-
-	// Force GFP_NOFS for every allocation reachable from here.
-	// We are typically on the fsnotify callback path with the
-	// inode lock held by the originating syscall; without this,
-	// dentry_open's GFP_KERNEL allocations can recurse into
-	// writeback -> fsnotify -> us and deadlock under memory pressure.
-	nofs_flags = memalloc_nofs_save();
-
-	dentry = d_find_alias(inode);
-	if (!dentry) {
-		memalloc_nofs_restore(nofs_flags);
-		nm_dbg("nm_vref_from_inode: d_find_alias returned NULL for ino=%lu\n",
-			(unsigned long)inode->i_ino);
-		return -1;
-	}
-
-	p.dentry = dentry;
-	p.mnt    = mnt;
-
-	f = dentry_open(&p, O_PATH | O_NOFOLLOW, current_cred());
-	if (IS_ERR(f)) {
-		nm_dbg("nm_vref_from_inode: dentry_open failed (%ld) for ino=%lu\n",
-			PTR_ERR(f), (unsigned long)inode->i_ino);
-		dput(dentry);
-		memalloc_nofs_restore(nofs_flags);
-		return -1;
-	}
-
-	vref_id = nexus_vref_create_from_file(f);
-	fput(f);
-	dput(dentry);
-
-	memalloc_nofs_restore(nofs_flags);
-
-	if (vref_id < 0)
-		nm_dbg("nm_vref_from_inode: nexus_vref_create_from_file failed for ino=%lu\n",
-			(unsigned long)inode->i_ino);
-
-	return vref_id;
-}
-
-/* Queue an async child-vref creation.  Called from the fsnotify hot path
- * (nexus_handle_event).  Must be non-blocking. */
-static void nm_queue_child_vref(struct nexus_mark *mark, struct inode *inode)
-{
-	struct pending_child_vref *pcv;
-	struct inode *grabbed;
-
-	if (!mark->mnt_stored)
-		return;
-
-	/* Dedup: skip if an entry for this (dev, ino) is already pending.
-	 * Cheap O(n) scan under the lock — the list is short and only
-	 * contains entries the worker hasn't drained yet. */
-	spin_lock(&nm_pending_vrefs_lock);
-	list_for_each_entry(pcv, &nm_pending_vrefs, list) {
-		if (pcv->mark == mark &&
-		    pcv->device == inode->i_sb->s_dev &&
-		    pcv->ino == inode->i_ino) {
-			spin_unlock(&nm_pending_vrefs_lock);
-			return;
-		}
-	}
-	spin_unlock(&nm_pending_vrefs_lock);
-
-	grabbed = igrab(inode);
-	if (!grabbed)
-		return;
-
-	pcv = kmalloc(sizeof(*pcv), GFP_ATOMIC);
-	if (!pcv) {
-		iput(grabbed);
-		return;
-	}
-
-	refcount_inc(&mark->fs_mark.refcnt);
-	pcv->mark   = mark;
-	pcv->inode  = grabbed;
-	pcv->mnt    = mntget(mark->mnt_stored);
-	pcv->device = inode->i_sb->s_dev;
-	pcv->ino    = inode->i_ino;
-
-	spin_lock(&nm_pending_vrefs_lock);
-	list_add_tail(&pcv->list, &nm_pending_vrefs);
-	spin_unlock(&nm_pending_vrefs_lock);
-}
-
-/* Worker-side: mint all pending child vrefs.  Runs in kthread context,
- * so d_find_alias + dentry_open + nexus_vref_create_from_file are safe. */
-static void nm_process_pending_vrefs(void)
-{
-	struct pending_child_vref *pcv, *tmp;
-	LIST_HEAD(local);
-
-	spin_lock(&nm_pending_vrefs_lock);
-	list_splice_init(&nm_pending_vrefs, &local);
-	spin_unlock(&nm_pending_vrefs_lock);
-
-	list_for_each_entry_safe(pcv, tmp, &local, list) {
-		int32_t id;
-		struct nm_child_vref *e;
-		unsigned long cflags;
-		struct nm_child_vref *existing;
-
-		/* Check cache first — another path may have created it */
-		id = nm_mark_lookup_child_vref(pcv->mark, pcv->inode);
-		if (id >= 0)
-			goto release;
-
-		id = nm_vref_from_inode(pcv->inode, pcv->mnt);
-		if (id < 0)
-			goto release;
-
-		e = kmalloc(sizeof(*e), GFP_KERNEL);
-		if (!e) {
-			nexus_vref_drop_kernel_ref(id);
-			goto release;
-		}
-		e->device  = pcv->device;
-		e->inode   = pcv->ino;
-		e->vref_id = id;
-
-		spin_lock_irqsave(&pcv->mark->children_vrefs_lock, cflags);
-		list_for_each_entry(existing, &pcv->mark->children_vrefs, list) {
-			if (existing->inode == pcv->ino &&
-			    existing->device == pcv->device) {
-				spin_unlock_irqrestore(
-					&pcv->mark->children_vrefs_lock, cflags);
-				kfree(e);
-				nexus_vref_drop_kernel_ref(id);
-				goto release;
-			}
-		}
-		list_add(&e->list, &pcv->mark->children_vrefs);
-		spin_unlock_irqrestore(&pcv->mark->children_vrefs_lock, cflags);
-
-		nm_dbg("nm_process_pending_vrefs: minted vref_id=%d for "
-			"dev=%u ino=%lu\n", id,
-			(unsigned)pcv->device, (unsigned long)pcv->ino);
-
-	release:
-		fsnotify_put_mark(&pcv->mark->fs_mark);
-		iput(pcv->inode);
-		mntput(pcv->mnt);
-		list_del(&pcv->list);
-		kfree(pcv);
-	}
 }
 
 static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
@@ -1155,7 +998,7 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 				struct kmsg_builder msg;
 				int32_t child_vref_id;
 
-				if (!dir_vref_tried && dir && mark->mnt_stored) {
+				if (!dir_vref_tried && dir) {
 					dir_vref_id = nm_dir_vref_for_event(mark, dir);
 					dir_vref_tried = true;
 					if (dir_vref_id < 0)
@@ -1165,7 +1008,7 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 				}
 
 				child_vref_id = nm_mark_get_or_mint_child_vref(mark,
-					inode);
+					inode, name);
 				if (child_vref_id < 0)
 					nm_dbg("handle_event CREATE: child vref "
 						"unavailable, virtual:node omitted\n");
@@ -1191,7 +1034,7 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 				struct kmsg_builder msg;
 				int32_t child_vref_id;
 
-				if (!dir_vref_tried && dir && mark->mnt_stored) {
+				if (!dir_vref_tried && dir) {
 					dir_vref_id = nm_dir_vref_for_event(mark, dir);
 					dir_vref_tried = true;
 					if (dir_vref_id < 0)
@@ -1221,12 +1064,20 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 				struct pending_move *pm;
 				unsigned long mflags;
 				int32_t old_dir_vref = -1;
+				int32_t move_child_vref;
 				bool armed = false;
 				/* nm_dir_vref_for_event returns mark->vref_id
 				 * (not a freshly-minted ref), so we never drop
 				 * it here — the mark owns its lifetime. */
 				if (dir)
 					old_dir_vref = nm_dir_vref_for_event(mark, dir);
+
+				/* Mint the child vref *before* taking move_lock:
+				 * minting allocates and may sleep, and the mark
+				 * owns the resulting ref (pending_move only
+				 * references it by id). */
+				move_child_vref = nm_mark_get_or_mint_child_vref(
+					mark, inode, name);
 
 				spin_lock_irqsave(&move_lock, mflags);
 				cleanup_expired_moves();
@@ -1236,9 +1087,7 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 					if (pm) {
 						pm->cookie = cookie;
 						pm->old_dir_vref_id = old_dir_vref;
-						pm->child_vref_id =
-							nm_mark_get_or_mint_child_vref(
-								mark, inode);
+						pm->child_vref_id = move_child_vref;
 						pm->old_mark = mark;
 						pm->old_device = device;
 						refcount_inc(&mark->fs_mark.refcnt);
@@ -1268,14 +1117,14 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 				int32_t child_vref_id;
 				const char *old_name = move_old_name;
 
-				if (!dir_vref_tried && dir && mark->mnt_stored) {
+				if (!dir_vref_tried && dir) {
 					dir_vref_id = nm_dir_vref_for_event(mark, dir);
 					dir_vref_tried = true;
 				}
 				to_dir_vref_id = dir_vref_id;
 
 				child_vref_id = nm_mark_get_or_mint_child_vref(mark,
-					inode);
+					inode, name);
 				if (move_to_dir_vref_id < 0)
 					move_to_dir_vref_id = to_dir_vref_id;
 				if (move_child_vref_id < 0)
@@ -1318,7 +1167,7 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 				char buf[KMSG_BUFFER_SIZE];
 				struct kmsg_builder msg;
 				int32_t target_vref =
-					nm_node_vref_for_event(mark, inode);
+					nm_node_vref_for_event(mark, inode, name);
 				uint32_t fields =
 					B_STAT_SIZE | B_STAT_MODIFICATION_TIME
 					| B_STAT_INTERIM_UPDATE;
@@ -1345,7 +1194,7 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 				char buf[KMSG_BUFFER_SIZE];
 				struct kmsg_builder msg;
 				int32_t target_vref =
-					nm_node_vref_for_event(mark, inode);
+					nm_node_vref_for_event(mark, inode, name);
 				kmsg_init(&msg, buf, sizeof(buf), B_NODE_MONITOR);
 				kmsg_add_int32(&msg, "opcode", B_STAT_CHANGED);
 				kmsg_add_uint64(&msg, "device", (uint64_t)device);
@@ -1375,7 +1224,7 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 				char buf[KMSG_BUFFER_SIZE];
 				struct kmsg_builder msg;
 				int32_t target_vref =
-					nm_node_vref_for_event(mark, inode);
+					nm_node_vref_for_event(mark, inode, name);
 				kmsg_init(&msg, buf, sizeof(buf), B_NODE_MONITOR);
 				kmsg_add_int32(&msg, "opcode", B_STAT_CHANGED);
 				kmsg_add_uint64(&msg, "device", (uint64_t)device);
@@ -1400,9 +1249,9 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 				struct kmsg_builder msg;
 				int32_t to_dir_vref_id = -1;
 				int32_t target_vref =
-					nm_node_vref_for_event(mark, inode);
+					nm_node_vref_for_event(mark, inode, name);
 
-				if (!dir_vref_tried && dir && mark->mnt_stored) {
+				if (!dir_vref_tried && dir) {
 					dir_vref_id = nm_dir_vref_for_event(mark, dir);
 					dir_vref_tried = true;
 				}
@@ -1432,9 +1281,9 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 				char buf[KMSG_BUFFER_SIZE];
 				struct kmsg_builder msg;
 				int32_t target_vref =
-					nm_node_vref_for_event(mark, inode);
+					nm_node_vref_for_event(mark, inode, name);
 
-				if (!dir_vref_tried && dir && mark->mnt_stored) {
+				if (!dir_vref_tried && dir) {
 					dir_vref_id = nm_dir_vref_for_event(mark, dir);
 					dir_vref_tried = true;
 				}
@@ -1527,7 +1376,7 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 
 					pdvref = nm_dir_vref_for_event(parent_mark, dir);
 					cvref = nm_mark_get_or_mint_child_vref(
-						parent_mark, inode);
+						parent_mark, inode, name);
 					kmsg_init(&msg2, buf2,
 						sizeof(buf2), B_NODE_MONITOR);
 					kmsg_add_int32(&msg2, "opcode",
@@ -1597,8 +1446,7 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 					int32_t pdvref = -1;
 					int32_t cvref;
 
-					if (parent_mark->mnt_stored)
-						pdvref = nm_dir_vref_for_event(parent_mark, dir);
+					pdvref = nm_dir_vref_for_event(parent_mark, dir);
 					cvref = nm_mark_lookup_child_vref(parent_mark, inode);
 
 					kmsg_init(&msg2, buf2, sizeof(buf2), B_NODE_MONITOR);
@@ -1620,9 +1468,8 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 					int32_t pdvref = -1;
 					int32_t cvref;
 
-					if (parent_mark->mnt_stored)
-						pdvref = nm_dir_vref_for_event(parent_mark, dir);
-					cvref = nm_mark_get_or_mint_child_vref(parent_mark, inode);
+					pdvref = nm_dir_vref_for_event(parent_mark, dir);
+					cvref = nm_mark_get_or_mint_child_vref(parent_mark, inode, name);
 
 					kmsg_init(&msg2, buf2, sizeof(buf2), B_NODE_MONITOR);
 					kmsg_add_int32(&msg2, "opcode", B_ENTRY_CREATED);
@@ -1788,7 +1635,7 @@ static struct nexus_mark *find_or_create_mark(struct inode *inode,
 	mark->inode = inode->i_ino;
 	mark->is_dir = S_ISDIR(inode->i_mode);
 	mark->vref_id = -1;
-	mark->mnt_stored = NULL;
+	mark->node_path = NULL;
 
 	nm_info("creating mark dev=%u ino=%lu is_dir=%d mask=0x%x\n",
 		(unsigned)mark->device, (unsigned long)mark->inode, mark->is_dir,
@@ -1992,10 +1839,32 @@ static int nexus_start_watching(struct nexus_watch_fd __user *exchange)
 		}
 	}
 
-	if (!mark->mnt_stored && file->f_path.mnt) {
-		mark->mnt_stored = mntget(file->f_path.mnt);
-		nm_dbg("nexus_start_watching: stored mnt %p for ino=%lu\n",
-			mark->mnt_stored, (unsigned long)inode->i_ino);
+	/* Capture the watched node's path (not a mount reference) so we can
+	 * build child paths for path-backed child vrefs. Storing a counted
+	 * vfsmount here would pin the mount and block a clean unmount of the
+	 * backing filesystem at shutdown. */
+	if (!mark->node_path) {
+		char *pbuf = kmalloc(PATH_MAX, GFP_KERNEL);
+		char *np = NULL;
+
+		if (pbuf) {
+			char *p = d_path(&file->f_path, pbuf, PATH_MAX);
+			if (!IS_ERR(p))
+				np = kstrdup(p, GFP_KERNEL);
+			kfree(pbuf);
+		}
+
+		spin_lock_irqsave(&mark->lock, flags);
+		if (!mark->node_path && np) {
+			mark->node_path = np;
+			np = NULL;
+		}
+		spin_unlock_irqrestore(&mark->lock, flags);
+		kfree(np);   /* frees only if we lost the set race */
+
+		nm_dbg("nexus_start_watching: node_path=%s for ino=%lu\n",
+			mark->node_path ? mark->node_path : "(none)",
+			(unsigned long)inode->i_ino);
 	}
 
 	spin_lock_irqsave(&mark->lock, flags);
@@ -2755,20 +2624,6 @@ static void __exit nexus_node_monitor_exit(void)
 		kfree(pm);
 	}
 	spin_unlock_irqrestore(&move_lock, flags);
-
-	/* Drain pending child-vref creations */
-	{
-		struct pending_child_vref *pcv, *ptmp;
-		spin_lock_irqsave(&nm_pending_vrefs_lock, flags);
-		list_for_each_entry_safe(pcv, ptmp, &nm_pending_vrefs, list) {
-			fsnotify_put_mark(&pcv->mark->fs_mark);
-			iput(pcv->inode);
-			mntput(pcv->mnt);
-			list_del(&pcv->list);
-			kfree(pcv);
-		}
-		spin_unlock_irqrestore(&nm_pending_vrefs_lock, flags);
-	}
 
 	nm_info("unloaded\n");
 }
