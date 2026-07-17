@@ -1,0 +1,17 @@
+#!/bin/sh
+# Create the "nexus" system group. Udev rules chown /dev/nexus{,_area,
+# _node_monitor} to root:nexus 0660 — any user that needs to talk to the
+# Vitruvian IPC must be in this group.
+#
+# Ephemeral live persona (vos-live) and the real user created by the
+# Installer both get added to this group elsewhere.
+
+set -e
+
+if ! getent group nexus >/dev/null; then
+    groupadd --system nexus
+fi
+
+#DEBHELPER#
+
+exit 0
