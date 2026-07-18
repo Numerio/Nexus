@@ -614,7 +614,7 @@ static void nexus_mark_free(struct fsnotify_mark *fs_mark)
 	struct nexus_mark *mark = get_nexus_mark(fs_mark);
 	struct nexus_listener *listener, *tmp;
 
-	nm_info("mark_free ino=%lu vref=%d path=%s\n",
+	nm_dbg("mark_free ino=%lu vref=%d path=%s\n",
 		(unsigned long)mark->inode, mark->vref_id,
 		mark->node_path ? mark->node_path : "(none)");
 
@@ -1637,7 +1637,7 @@ static struct nexus_mark *find_or_create_mark(struct inode *inode,
 	mark->vref_id = -1;
 	mark->node_path = NULL;
 
-	nm_info("creating mark dev=%u ino=%lu is_dir=%d mask=0x%x\n",
+	nm_dbg("creating mark dev=%u ino=%lu is_dir=%d mask=0x%x\n",
 		(unsigned)mark->device, (unsigned long)mark->inode, mark->is_dir,
 		initial_mask);
 
@@ -2400,7 +2400,7 @@ void nexus_nm_notify_xattr(struct inode *inode, const char *name, int cause)
  * (port already torn down) the same as a match so we sweep stragglers too. */
 static void node_monitor_team_exit(pid_t team)
 {
-	nm_info("team_exit team=%d\n", team);
+	nm_dbg("team_exit team=%d\n", team);
 	struct fsnotify_mark *fs_mark, *tmp_mark;
 	struct nexus_mark *mark;
 	struct nexus_listener *listener, *tmp;
