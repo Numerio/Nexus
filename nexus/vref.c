@@ -4,7 +4,6 @@
  */
 
 #include <linux/dcache.h>
-#include <linux/exportfs.h>
 #include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/hashtable.h>
@@ -59,8 +58,6 @@ find_entry_locked(int32_t id)
 }
 
 
-static int nexus_vref_resolve_path(struct nexus_vref *entry,
-	struct path *out);
 
 static void
 nexus_vref_destroy(struct kref *kref)
@@ -76,10 +73,7 @@ nexus_vref_destroy(struct kref *kref)
 		kfree(slot);
 	}
 
-	if (entry->kind == VREF_FH)
-		mntput(entry->fh.mnt);
-	else
-		kfree(entry->pth.name);
+	path_put(&entry->path);
 	ida_free(&vref_ida, entry->id);
 	kfree(entry);
 }
@@ -89,15 +83,13 @@ int32_t
 nexus_vref_create_from_file(struct file *file)
 {
 	struct nexus_vref *entry;
-	struct dentry *dentry;
 	struct super_block *sb;
 	int id;
 
 	if (!file || !file->f_path.dentry || !file->f_path.dentry->d_inode)
 		return -ENOENT;
 
-	dentry = file->f_path.dentry;
-	sb = dentry->d_sb;
+	sb = file->f_path.dentry->d_sb;
 	if (is_rejected_fs(sb->s_magic))
 		return -ENOTSUPP;
 
@@ -105,54 +97,16 @@ nexus_vref_create_from_file(struct file *file)
 	if (!entry)
 		return -ENOMEM;
 
-	if (sb->s_export_op != NULL) {
-		int max_len = NEXUS_FH_MAX / 4;
-		int type = exportfs_encode_fh(dentry,
-			(struct fid *)entry->fh.fh, &max_len, 0);
-
-		if (type > 0 && type != FILEID_INVALID
-				&& max_len * 4 <= NEXUS_FH_MAX) {
-			entry->kind     = VREF_FH;
-			entry->fh.mnt   = mntget(file->f_path.mnt);
-			entry->fh.fh_len  = (u8)(max_len * 4);
-			entry->fh.fh_type = type;
-			entry->fh.mode    = file->f_mode;
-		} else {
-			entry->kind = VREF_PATH;
-		}
-	} else {
-		entry->kind = VREF_PATH;
-	}
-
-	if (entry->kind == VREF_PATH) {
-		char *pathbuf;
-		char *p;
-
-		entry->pth.dev  = sb->s_dev;
-		entry->pth.ino  = dentry->d_inode->i_ino;
-		entry->pth.mode = file->f_mode;
-
-		pathbuf = kmalloc(PATH_MAX, GFP_KERNEL);
-		if (pathbuf == NULL) {
-			kfree(entry);
-			return -ENOMEM;
-		}
-		p = d_path(&file->f_path, pathbuf, PATH_MAX);
-		if (!IS_ERR(p))
-			entry->pth.name = kstrdup(p, GFP_KERNEL);
-		kfree(pathbuf);
-		if (entry->pth.name == NULL) {
-			kfree(entry);
-			return -ENOMEM;
-		}
-	}
+	/* Pin the live path: dentry + vfsmount. Identity is read live from
+	 * path.dentry->d_inode at open/resolve time; the held dentry tracks
+	 * the file across rename and overlay copy-up. */
+	entry->path = file->f_path;
+	path_get(&entry->path);
+	entry->mode = file->f_mode;
 
 	id = ida_alloc_min(&vref_ida, 1, GFP_KERNEL);
 	if (id < 0) {
-		if (entry->kind == VREF_FH)
-			mntput(entry->fh.mnt);
-		else
-			kfree(entry->pth.name);
+		path_put(&entry->path);
 		kfree(entry);
 		return -ENOMEM;
 	}
@@ -169,36 +123,28 @@ nexus_vref_create_from_file(struct file *file)
 }
 
 
-/* Build a path-backed vref directly from a known path string, with no open
- * file and no vfsmount. Used by the node monitor to mint vrefs for children
- * discovered via fsnotify (parent dir path + child name), so the hot path
- * neither pins a mount nor performs a dentry_open. */
+/* Pin the given path (dentry + vfsmount). Held dentry is d_move'd in place
+ * on rename, so the vref keeps resolving across moves. */
 int32_t
-nexus_vref_create_path(const char *path, dev_t dev, ino_t ino, fmode_t mode)
+nexus_vref_create_from_path(const struct path *src, fmode_t mode)
 {
 	struct nexus_vref *entry;
 	int id;
 
-	if (!path || !path[0])
+	if (!src || !src->dentry || !src->mnt)
 		return -EINVAL;
 
 	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
 	if (!entry)
 		return -ENOMEM;
 
-	entry->kind     = VREF_PATH;
-	entry->pth.dev  = dev;
-	entry->pth.ino  = ino;
-	entry->pth.mode = mode;
-	entry->pth.name = kstrdup(path, GFP_KERNEL);
-	if (!entry->pth.name) {
-		kfree(entry);
-		return -ENOMEM;
-	}
+	entry->path = *src;
+	path_get(&entry->path);
+	entry->mode = mode;
 
 	id = ida_alloc_min(&vref_ida, 1, GFP_KERNEL);
 	if (id < 0) {
-		kfree(entry->pth.name);
+		path_put(&entry->path);
 		kfree(entry);
 		return -ENOMEM;
 	}
@@ -217,7 +163,7 @@ nexus_vref_create_path(const char *path, dev_t dev, ino_t ino, fmode_t mode)
 static fmode_t
 nexus_vref_backing_mode(const struct nexus_vref *entry)
 {
-	return entry->kind == VREF_FH ? entry->fh.mode : entry->pth.mode;
+	return entry->mode;
 }
 
 static int
@@ -326,7 +272,8 @@ nexus_vref_create(struct nexus_vref_create __user *uarg)
 	 * success the new slot now owns the vref, so it is destroyed when its
 	 * last slot (and any kernel ref) is released instead of leaking at
 	 * kref==1 until the shutdown drain — the leak that kept every
-	 * VRefCache entry (and its fh.mnt pin) alive for the whole session. On
+	 * VRefCache entry (and its held path/mount pin) alive for the whole
+	 * session. On
 	 * failure this destroys the just-created, slot-less vref. Unreachable
 	 * either way: VREF_ACQUIRE/OPEN require owning a slot. */
 	kref_put(&entry->ref_count, nexus_vref_destroy);
@@ -395,12 +342,7 @@ nexus_vref_open(struct nexus_vref_open __user *uarg)
 	struct file *file;
 	int fd, ret = -EINVAL;
 
-	enum nexus_vref_kind kind;
-	struct vfsmount *mnt = NULL;
 	struct path path = { .mnt = NULL, .dentry = NULL };
-	u8 fh[NEXUS_FH_MAX];
-	u8 fh_len = 0;
-	int fh_type = 0;
 	fmode_t open_mode = 0;
 	bool held_kref = false;
 
@@ -427,13 +369,10 @@ nexus_vref_open(struct nexus_vref_open __user *uarg)
 	mutex_unlock(&entry->slots_lock);
 
 	if (ret == B_OK) {
-		kind = entry->kind;
-		if (kind == VREF_FH) {
-			mnt = mntget(entry->fh.mnt);
-			fh_len = entry->fh.fh_len;
-			fh_type = entry->fh.fh_type;
-			memcpy(fh, entry->fh.fh, fh_len);
-		}
+		/* Pin the held path; kref keeps entry alive for the open, which
+		 * must run outside fd_map_lock. */
+		path = entry->path;
+		path_get(&path);
 		kref_get(&entry->ref_count);
 		held_kref = true;
 	}
@@ -442,32 +381,7 @@ nexus_vref_open(struct nexus_vref_open __user *uarg)
 	if (ret != B_OK)
 		return ret;
 
-	if (kind == VREF_PATH) {
-		/* Weak resolve: kern_path must run outside fd_map_lock. kref is
-		 * held via held_kref, so entry (and entry->pth.name) is safe. */
-		int rc = nexus_vref_resolve_path(entry, &path);
-		if (rc) {
-			ret = (rc == -ESTALE || rc == -ENOENT)
-				? B_ENTRY_NOT_FOUND : B_ERROR;
-			goto out;
-		}
-	}
-
-	if (kind == VREF_FH) {
-		struct dentry *dec = exportfs_decode_fh(mnt,
-			(struct fid *)fh, fh_len / 4, fh_type, NULL, NULL);
-		struct path p;
-		if (IS_ERR(dec)) {
-			ret = PTR_ERR(dec) == -ESTALE
-				? B_ENTRY_NOT_FOUND : B_ERROR;
-			goto out;
-		}
-		p.mnt = mnt;
-		p.dentry = dec;
-		file = dentry_open(&p, open_mode, current_cred());
-		dput(dec);
-	} else
-		file = dentry_open(&path, open_mode, current_cred());
+	file = dentry_open(&path, open_mode, current_cred());
 
 	if (IS_ERR(file)) {
 		ret = B_NOT_ALLOWED;
@@ -484,10 +398,7 @@ nexus_vref_open(struct nexus_vref_open __user *uarg)
 	ret = B_OK;
 
 out:
-	if (kind == VREF_FH)
-		mntput(mnt);
-	else
-		path_put(&path);
+	path_put(&path);
 	if (held_kref) {
 		mutex_lock(&fd_map_lock);
 		kref_put(&entry->ref_count, nexus_vref_destroy);
@@ -554,6 +465,9 @@ nexus_vref_mint_slot_for(struct nexus_vref *entry, pid_t target_team,
 		nexus_vref_backing_mode(entry), out_key);
 }
 
+
+
+
 int
 nexus_vref_grant_slot_for_id(int32_t id, pid_t target_team)
 {
@@ -591,77 +505,10 @@ nexus_vref_grant_slot_for_id(int32_t id, pid_t target_team)
 }
 
 
-/* Caller must path_put(*out) on success. */
-static int
-nexus_vref_resolve_path(struct nexus_vref *entry, struct path *out)
-{
-	struct path p;
-	int err;
-
-	if (entry->kind != VREF_PATH)
-		return -EINVAL;
-	if (entry->pth.name == NULL)
-		return -ENXIO;
-
-	err = kern_path(entry->pth.name, LOOKUP_FOLLOW, &p);
-	if (err) {
-		pr_warn_ratelimited(
-			"nexus: vref id=%d name=%s kern_path failed (%d)\n",
-			entry->id, entry->pth.name, err);
-		return err;
-	}
-
-	if (p.dentry->d_sb->s_dev != entry->pth.dev) {
-		pr_warn_ratelimited(
-			"nexus: vref id=%d name=%s dev mismatch (was %u:%u, now %u:%u)\n",
-			entry->id, entry->pth.name,
-			MAJOR(entry->pth.dev), MINOR(entry->pth.dev),
-			MAJOR(p.dentry->d_sb->s_dev), MINOR(p.dentry->d_sb->s_dev));
-		path_put(&p);
-		return -ENXIO;
-	}
-	if (p.dentry->d_inode == NULL
-			|| p.dentry->d_inode->i_ino != entry->pth.ino) {
-		pr_warn_ratelimited(
-			"nexus: vref id=%d name=%s ino mismatch (was %lu, now %lu)\n",
-			entry->id, entry->pth.name,
-			(unsigned long)entry->pth.ino,
-			p.dentry->d_inode
-				? (unsigned long)p.dentry->d_inode->i_ino : 0UL);
-		path_put(&p);
-		return -ESTALE;
-	}
-
-	*out = p;
-	return 0;
-}
-
-int
-nexus_vref_resolve_id_to_path(int32_t id, struct path *out)
-{
-	struct nexus_vref *entry;
-	int rc;
-
-	if (out == NULL)
-		return -EINVAL;
-
-	entry = nexus_vref_kref_acquire(id);
-	if (entry == NULL)
-		return -ENOENT;
-	rc = nexus_vref_resolve_path(entry, out);
-	nexus_vref_kref_release(entry);
-	return rc;
-}
-
-
-EXPORT_SYMBOL(nexus_vref_resolve_id_to_path);
-EXPORT_SYMBOL(nexus_vref_kref_acquire);
-EXPORT_SYMBOL(nexus_vref_kref_release);
-EXPORT_SYMBOL(nexus_vref_mint_slot_for);
 EXPORT_SYMBOL(nexus_vref_grant_slot_for_id);
 EXPORT_SYMBOL(nexus_vref_ioctl);
 EXPORT_SYMBOL(nexus_vref_create_from_file);
-EXPORT_SYMBOL(nexus_vref_create_path);
+EXPORT_SYMBOL(nexus_vref_create_from_path);
 EXPORT_SYMBOL(nexus_vref_drop_kernel_ref);
 EXPORT_SYMBOL(nexus_vref_acquire_kernel_ref);
 
@@ -722,7 +569,7 @@ nexus_vref_ioctl(unsigned int cmd, unsigned long arg)
 int
 nexus_vref_init(void)
 {
-	nexus_register_team_exit(nexus_vref_team_exit);
+	/* Invoked last by nexus_team_destroy (not via the generic array). */
 	return 0;
 }
 
@@ -739,13 +586,8 @@ drain_all_locked(bool log)
 		struct nexus_vref_slot *slot, *stmp;
 		int reaped = 0;
 
-		if (log) {
-			const char *p = "?";
-			if (entry->kind == VREF_PATH && entry->pth.name != NULL)
-				p = entry->pth.name;
-			pr_warn_ratelimited("nexus: orphan vref id=%d kind=%s path=%s\n",
-				entry->id, entry->kind == VREF_PATH ? "path" : "fh", p);
-		}
+		if (log)
+			pr_warn_ratelimited("nexus: orphan vref id=%d\n", entry->id);
 
 		mutex_lock(&entry->slots_lock);
 		list_for_each_entry_safe(slot, stmp, &entry->slots, node) {
@@ -764,7 +606,7 @@ drain_all_locked(bool log)
 void
 nexus_vref_exit(void)
 {
-	nexus_unregister_team_exit(nexus_vref_team_exit);
+	/* Not registered via the generic array — no unregister needed. */
 
 	mutex_lock(&fd_map_lock);
 	drain_all_locked(false);

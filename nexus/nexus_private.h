@@ -200,13 +200,6 @@ typedef struct area_info {
 	void*					address;
 } area_info;
 
-#define NEXUS_FH_MAX 32
-
-enum nexus_vref_kind {
-	VREF_FH,
-	VREF_PATH,
-};
-
 struct nexus_vref_slot {
 	struct list_head		node;
 	uint64_t				key;
@@ -223,22 +216,11 @@ struct nexus_vref {
 	struct list_head		slots;
 	struct mutex			slots_lock;
 
-	enum nexus_vref_kind	kind;
-	union {
-		struct {
-			struct vfsmount	*mnt;
-			fmode_t			mode;
-			u8				fh[NEXUS_FH_MAX];
-			u8				fh_len;
-			int				fh_type;
-		} fh;
-		struct {
-			char			*name;
-			dev_t			dev;
-			ino_t			ino;
-			fmode_t			mode;
-		} pth;
-	};
+	/* Pinned (path_get): overlay dentry survives d_move and copy-up, so
+	 * path.dentry->d_inode is stable. Pins the mount — umount sees -EBUSY
+	 * until the owning team exits (accepted trade). */
+	struct path				path;
+	fmode_t					mode;	/* allowed backing mode */
 };
 
 
@@ -269,6 +251,9 @@ long					nexus_port_write(struct nexus_port* port, int32_t* msg_code,
 							const void* buffer, size_t size, uint32_t flags, int64_t timeout);
 status_t				nexus_write_port(uint32_t id, int32_t code, const void *buffer,
 							size_t buffer_size);
+status_t				nexus_write_port_with_caps(uint32_t id, int32_t code,
+							const void* buffer, size_t size,
+							const struct nexus_port_cap_in* caps, size_t cap_count);
 long					nexus_port_info(struct nexus_port* port, struct nexus_port_info* info);
 long					nexus_port_message_info(struct nexus_port* port,
 							struct nexus_port_message_info* info, size_t size,

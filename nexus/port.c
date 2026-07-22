@@ -555,10 +555,10 @@ pid_t nexus_port_team_of_locked(uint32_t id)
 }
 EXPORT_SYMBOL(nexus_port_team_of_locked);
 
-static long nexus_port_write_with_caps(struct nexus_port* port,
-	int32_t* msg_code, const void __user* buffer, size_t size,
-	const struct nexus_port_cap_in __user* user_caps, size_t cap_count,
-	uint32_t flags, int64_t timeout)
+static long _nexus_port_write_with_caps(struct nexus_port* port,
+	int32_t* msg_code, const void* buffer, size_t size,
+	const struct nexus_port_cap_in* caps, size_t cap_count,
+	uint32_t flags, int64_t timeout, bool from_user)
 {
 	struct nexus_buffer* buf = NULL;
 	struct nexus_port_cap_kref* caps_arr = NULL;
@@ -570,7 +570,7 @@ static long nexus_port_write_with_caps(struct nexus_port* port,
 			|| timeout < 0) {
 		return B_BAD_VALUE;
 	}
-	if (cap_count > 0 && user_caps == NULL)
+	if (cap_count > 0 && caps == NULL)
 		return B_BAD_VALUE;
 
 	// Max caps per message
@@ -638,9 +638,12 @@ goahead:
 		goto err_count;
 	}
 
-	buf->sender = from_kuid_munged(current_user_ns(), current_uid());
-	buf->sender_group = from_kgid_munged(current_user_ns(), current_gid());
-	buf->sender_team = task_tgid_nr(current);
+	if (from_user) {
+		buf->sender = from_kuid_munged(current_user_ns(), current_uid());
+		buf->sender_group = from_kgid_munged(current_user_ns(),
+			current_gid());
+		buf->sender_team = task_tgid_nr(current);
+	}
 
 	if (buffer != NULL && size > 0) {
 		buf->buffer = kzalloc(size, GFP_KERNEL);
@@ -648,29 +651,47 @@ goahead:
 			ret = B_NO_MEMORY;
 			goto err_buf;
 		}
-		if (copy_from_user(buf->buffer, buffer, size)) {
-			ret = B_BAD_VALUE;
-			goto err_buf;
+		if (from_user) {
+			if (copy_from_user(buf->buffer, buffer, size)) {
+				ret = B_BAD_VALUE;
+				goto err_buf;
+			}
+		} else {
+			memcpy(buf->buffer, buffer, size);
 		}
 		buf->size = size;
 	}
 
-	if (copy_from_user(&buf->code, msg_code, sizeof(*msg_code))) {
-		ret = B_BAD_VALUE;
-		goto err_buf;
+	if (from_user) {
+		if (copy_from_user(&buf->code, msg_code, sizeof(*msg_code))) {
+			ret = B_BAD_VALUE;
+			goto err_buf;
+		}
+	} else {
+		buf->code = *msg_code;
 	}
 
 	if (cap_count > 0) {
-		caps_tmp = kmalloc_array(cap_count, sizeof(*caps_tmp), GFP_KERNEL);
 		caps_arr = kzalloc(cap_count * sizeof(*caps_arr), GFP_KERNEL);
-		if (caps_tmp == NULL || caps_arr == NULL) {
+		if (caps_arr == NULL) {
 			ret = B_NO_MEMORY;
 			goto err_caps;
 		}
-		if (copy_from_user(caps_tmp, user_caps,
-				cap_count * sizeof(*caps_tmp))) {
-			ret = B_BAD_VALUE;
-			goto err_caps;
+		if (from_user) {
+			caps_tmp = kmalloc_array(cap_count, sizeof(*caps_tmp),
+				GFP_KERNEL);
+			if (caps_tmp == NULL) {
+				ret = B_NO_MEMORY;
+				goto err_caps;
+			}
+			if (copy_from_user(caps_tmp, caps,
+					cap_count * sizeof(*caps_tmp))) {
+				ret = B_BAD_VALUE;
+				goto err_caps;
+			}
+		} else {
+			/* Kernel caller passes an in-kernel array directly. */
+			caps_tmp = (struct nexus_port_cap_in*)caps;
 		}
 		for (i = 0; i < cap_count; i++) {
 			if (caps_tmp[i].kind != NEXUS_PORT_CAP_VREF) {
@@ -684,7 +705,8 @@ goahead:
 			}
 			caps_arr[i].buffer_offset = caps_tmp[i].buffer_offset;
 		}
-		kfree(caps_tmp);
+		if (from_user)
+			kfree(caps_tmp);
 		buf->caps = caps_arr;
 		buf->cap_count = cap_count;
 	}
@@ -699,7 +721,8 @@ err_caps_acquired:
 	while (i-- > 0)
 		nexus_vref_kref_release(caps_arr[i].vref);
 err_caps:
-	kfree(caps_tmp);
+	if (from_user)
+		kfree(caps_tmp);
 	kfree(caps_arr);
 err_buf:
 	kfree(buf->buffer);
@@ -708,6 +731,39 @@ err_count:
 	port->write_count++;
 	return ret;
 }
+
+
+static long nexus_port_write_with_caps(struct nexus_port* port,
+	int32_t* msg_code, const void __user* buffer, size_t size,
+	const struct nexus_port_cap_in __user* user_caps, size_t cap_count,
+	uint32_t flags, int64_t timeout)
+{
+	return _nexus_port_write_with_caps(port, msg_code,
+		(const void*)buffer, size,
+		(const struct nexus_port_cap_in*)user_caps, cap_count,
+		flags, timeout, true);
+}
+
+
+status_t nexus_write_port_with_caps(uint32_t id, int32_t code,
+	const void* buffer, size_t size,
+	const struct nexus_port_cap_in* caps, size_t cap_count)
+{
+	mutex_lock(&nexus_main_lock);
+
+	struct nexus_port* port = idr_find(&nexus_port_idr, id);
+	if (port == NULL) {
+		mutex_unlock(&nexus_main_lock);
+		return B_BAD_PORT_ID;
+	}
+
+	int32_t code_val = code;
+	long ret = _nexus_port_write_with_caps(port, &code_val, buffer, size,
+		caps, cap_count, B_RELATIVE_TIMEOUT, 0, false);
+	mutex_unlock(&nexus_main_lock);
+	return ret;
+}
+EXPORT_SYMBOL(nexus_write_port_with_caps);
 
 
 static long nexus_port_read_with_caps(struct nexus_port* port, int32_t* code,

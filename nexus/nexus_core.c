@@ -52,7 +52,6 @@ struct nexus_team* nexus_find_team(int32_t id)
 {
 	return idr_find(&nexus_teams_idr, id);
 }
-EXPORT_SYMBOL(nexus_find_team);
 
 // TODO make non-exported functions static
 // TODO fine-grained locking through spinlocks
@@ -192,6 +191,10 @@ void nexus_team_destroy(struct nexus_team *team)
 		spin_lock_irqsave(&team_exit_cb_lock, _flags);
 	}
 	spin_unlock_irqrestore(&team_exit_cb_lock, _flags);
+
+	/* Runs last so vref_team_exit can warn on orphan pinned refs. Registered
+	 * directly (not via nexus_register_team_exit) to pin ordering. */
+	nexus_vref_team_exit(team->id);
 
 	pr_debug("nexus: team %d destroyed\n", team->id);
 
