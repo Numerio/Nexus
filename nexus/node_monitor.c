@@ -743,28 +743,14 @@ static int32_t nm_child_vref_mint(struct nexus_mark *mark,
 	 * recurse back into the filesystem (writeback -> fsnotify -> us). */
 	nofs = memalloc_nofs_save();
 
+	/* Never kern_path() here: the event's own syscall may hold this dir's
+	 * i_rwsem. {ev_mnt,ev_dentry} is self-consistent; mark->mnt is not. */
 	mnt = ev_mnt ? ev_mnt : mark->mnt;
 	if (ev_dentry && d_inode(ev_dentry) && mnt
-			&& ev_dentry->d_sb->s_dev == mark->device) {
+			&& (ev_mnt != NULL
+				|| ev_dentry->d_sb->s_dev == mark->device)) {
 		struct path p = { .mnt = mnt, .dentry = ev_dentry };
 		id = nexus_vref_create_from_path(&p, NM_CHILD_VREF_MODE);
-	} else if (mark->node_path) {
-		/* Fallback: resolve node_path/name fresh. Only reached for
-		 * inode-only events or a layer/sb mismatch; may -ENOENT if the
-		 * child already moved. */
-		char *path = kmalloc(PATH_MAX, GFP_KERNEL);
-		if (path) {
-			if (snprintf(path, PATH_MAX, "%s/%s", mark->node_path,
-					name) < PATH_MAX) {
-				struct path p;
-				if (kern_path(path, LOOKUP_FOLLOW, &p) == 0) {
-					id = nexus_vref_create_from_path(&p,
-						NM_CHILD_VREF_MODE);
-					path_put(&p);
-				}
-			}
-			kfree(path);
-		}
 	}
 
 	memalloc_nofs_restore(nofs);
