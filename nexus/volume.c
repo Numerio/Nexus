@@ -13,7 +13,7 @@
 #include "nexus_private.h"
 #include "node_monitor.h"
 #include "volume.h"
-#include "fs_caps_kernel.h"
+#include "fs_caps.h"
 
 int nexus_volume_init(void) { return 0; }
 void nexus_volume_exit(void) {}

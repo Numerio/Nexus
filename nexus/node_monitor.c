@@ -31,7 +31,7 @@ extern struct hlist_head nexus_teams;
 #include "attribute.h"
 #include "index.h"
 #include "volume.h"
-#include "fs_caps_kernel.h"
+#include "fs_caps.h"
 
 #ifndef NEXUS_NM_DEBUG
 #define NEXUS_NM_DEBUG 0
