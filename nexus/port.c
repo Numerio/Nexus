@@ -36,10 +36,9 @@ long nexus_port_find(unsigned long arg)
 		return -EFAULT;
 	}
 
-	if (copy_from_user(name, in_data.name,
-			min(in_data.size, (size_t) B_OS_NAME_LENGTH))) {
+	if (strncpy_from_user(name, in_data.name, B_OS_NAME_LENGTH) < 0)
 		return -EFAULT;
-	}
+	name[B_OS_NAME_LENGTH - 1] = '\0';
 
 	struct nexus_port *p;
 	int pid;
@@ -75,8 +74,7 @@ long nexus_port_create(struct nexus_team* team, unsigned long arg)
 	}
 
 	if (in_data.capacity < 0 || in_data.capacity > PORT_MAX_QUEUE
-			|| in_data.size > B_OS_NAME_LENGTH
-				|| in_data.name == NULL) {
+			|| in_data.name == NULL) {
 		in_data.ret = B_BAD_VALUE;
 		goto out_copy;
 	}
@@ -101,12 +99,11 @@ long nexus_port_create(struct nexus_team* team, unsigned long arg)
 
 	INIT_LIST_HEAD(&port->queue);
 
-	// TODO check size
-	if (copy_from_user(port->name, in_data.name, min(in_data.size,
-			(size_t)B_OS_NAME_LENGTH))) {
+	if (strncpy_from_user(port->name, in_data.name, B_OS_NAME_LENGTH) < 0) {
 		kfree(port);
 		return -EFAULT;
 	}
+	port->name[B_OS_NAME_LENGTH - 1] = '\0';
 
 	// TODO we should publish info about a port in /proc/
 	// TODO utility functions for adding ports
