@@ -20,6 +20,45 @@
 static DEFINE_IDR(nexus_sem_idr);
 static DEFINE_SPINLOCK(sem_idr_lock);
 
+#define NEXUS_SEM_SLOT_BITS	16
+#define NEXUS_SEM_MAX_SLOTS	(1 << NEXUS_SEM_SLOT_BITS)
+#define NEXUS_SEM_GEN_BITS	15
+#define NEXUS_SEM_GEN_MASK	((1u << NEXUS_SEM_GEN_BITS) - 1)
+
+static DEFINE_IDA(nexus_sem_slot_ida);
+static uint32_t nexus_sem_slot_gen[NEXUS_SEM_MAX_SLOTS];
+
+static int nexus_sem_id_alloc(struct nexus_sem *sem)
+{
+	int slot, id;
+
+	slot = ida_alloc_max(&nexus_sem_slot_ida, NEXUS_SEM_MAX_SLOTS - 1,
+		GFP_ATOMIC);
+	if (slot < 0)
+		return slot;
+
+	if (slot == 0 && nexus_sem_slot_gen[0] == 0)
+		nexus_sem_slot_gen[0] = 1;
+
+	id = (int)((nexus_sem_slot_gen[slot] << NEXUS_SEM_SLOT_BITS)
+		| (uint32_t)slot);
+
+	if (idr_alloc(&nexus_sem_idr, sem, id, id + 1, GFP_ATOMIC) != id) {
+		ida_free(&nexus_sem_slot_ida, slot);
+		return -ENOSPC;
+	}
+	return id;
+}
+
+static void nexus_sem_id_free(int id)
+{
+	int slot = id & (NEXUS_SEM_MAX_SLOTS - 1);
+
+	nexus_sem_slot_gen[slot] = (nexus_sem_slot_gen[slot] + 1)
+		& NEXUS_SEM_GEN_MASK;
+	ida_free(&nexus_sem_slot_ida, slot);
+}
+
 static void wake_all_waiters_error(struct nexus_sem *sem, status_t err)
 {
 	struct nexus_sem_waiter *w, *tmp;
@@ -68,7 +107,7 @@ static int nexus_create_sem(int32_t count, const char __user *uname, sem_id *out
 	atomic_set(&sem->ref_count, 1);
 
 	spin_lock(&sem_idr_lock);
-	id = idr_alloc(&nexus_sem_idr, sem, 1, 0, GFP_ATOMIC);
+	id = nexus_sem_id_alloc(sem);
 	spin_unlock(&sem_idr_lock);
 
 	if (id < 0) {
@@ -91,7 +130,12 @@ static int nexus_delete_sem(sem_id id)
 		spin_unlock_irqrestore(&sem_idr_lock, flags);
 		return B_BAD_SEM_ID;
 	}
+	if (sem->owner != current->tgid) {
+		pr_warn_ratelimited("nexus: delete_sem: id=%d '%s' owner=%d used by tgid=%d\n",
+			id, sem->name, sem->owner, current->tgid);
+	}
 	idr_remove(&nexus_sem_idr, id);
+	nexus_sem_id_free(id);
 	spin_unlock_irqrestore(&sem_idr_lock, flags);
 
 	spin_lock_irqsave(&sem->lock, flags);
@@ -125,6 +169,10 @@ static int nexus_acquire_sem(sem_id id, int32_t count, uint32_t flags,
 		pr_err_ratelimited("nexus: acquire_sem: id=%d not in IDR (tgid=%d pid=%d)\n",
 		       id, current->tgid, current->pid);
 		return B_BAD_SEM_ID;
+	}
+	if (sem->owner != current->tgid) {
+		pr_warn_ratelimited("nexus: acquire_sem: id=%d '%s' owner=%d used by tgid=%d\n",
+			id, sem->name, sem->owner, current->tgid);
 	}
 	nexus_sem_get(sem);
 	spin_unlock_irqrestore(&sem_idr_lock, iflags);
@@ -234,6 +282,10 @@ static int nexus_release_sem(sem_id id, int32_t count, uint32_t flags)
 	if (!sem) {
 		spin_unlock_irqrestore(&sem_idr_lock, iflags);
 		return B_BAD_SEM_ID;
+	}
+	if (sem->owner != current->tgid) {
+		pr_warn_ratelimited("nexus: release_sem: id=%d '%s' owner=%d used by tgid=%d\n",
+			id, sem->name, sem->owner, current->tgid);
 	}
 	nexus_sem_get(sem);
 	spin_unlock_irqrestore(&sem_idr_lock, iflags);
@@ -363,6 +415,7 @@ void nexus_sem_team_exit(pid_t team)
 		if (sem->owner != (team_id)team)
 			continue;
 		idr_remove(&nexus_sem_idr, id);
+		nexus_sem_id_free(id);
 		spin_lock(&sem->lock);
 		if (!sem->deleted) {
 			sem->deleted = true;
@@ -402,6 +455,7 @@ void nexus_sem_exit(void)
 	}
 	idr_destroy(&nexus_sem_idr);
 	spin_unlock(&sem_idr_lock);
+	ida_destroy(&nexus_sem_slot_ida);
 }
 
 static long nexus_sem_ioctl_create(unsigned long arg)

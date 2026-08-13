@@ -22,13 +22,45 @@ static DEFINE_HASHTABLE(area_hashmap, 12);
 static DEFINE_MUTEX(area_lock);
 static DEFINE_IDA(area_ida);
 
+#define NEXUS_AREA_SLOT_BITS	16
+#define NEXUS_AREA_MAX_SLOTS	(1 << NEXUS_AREA_SLOT_BITS)
+#define NEXUS_AREA_GEN_BITS	15
+#define NEXUS_AREA_GEN_MASK	((1u << NEXUS_AREA_GEN_BITS) - 1)
+
+static uint32_t nexus_area_slot_gen[NEXUS_AREA_MAX_SLOTS];
+
+static int nexus_area_id_alloc(void)
+{
+	int slot, id;
+
+	slot = ida_alloc_max(&area_ida, NEXUS_AREA_MAX_SLOTS - 1, GFP_KERNEL);
+	if (slot < 0)
+		return slot;
+
+	if (slot == 0 && nexus_area_slot_gen[0] == 0)
+		nexus_area_slot_gen[0] = 1;
+
+	id = (int)((nexus_area_slot_gen[slot] << NEXUS_AREA_SLOT_BITS)
+		| (uint32_t)slot);
+	return id;
+}
+
+static void nexus_area_id_free(int id)
+{
+	int slot = id & (NEXUS_AREA_MAX_SLOTS - 1);
+
+	nexus_area_slot_gen[slot] = (nexus_area_slot_gen[slot] + 1)
+		& NEXUS_AREA_GEN_MASK;
+	ida_free(&area_ida, slot);
+}
+
 static void nexus_area_destroy(struct kref *kref)
 {
 	struct nexus_area *area = container_of(kref, struct nexus_area, ref_count);
 
 	pr_debug("nexus_area: destroy area %d '%s'\n", area->id, area->name);
 
-	ida_free(&area_ida, area->id);
+	nexus_area_id_free(area->id);
 
 	if (area->file)
 		fput(area->file);
@@ -80,7 +112,7 @@ static long nexus_area_create(struct nexus_area_create __user *arg)
 		goto out_copy;
 	}
 
-	int id = ida_alloc_min(&area_ida, 1, GFP_KERNEL);
+	int id = nexus_area_id_alloc();
 	if (id < 0) {
 		fput(file);
 		kfree(area);
@@ -156,7 +188,7 @@ static long nexus_area_clone(struct nexus_area_clone __user *arg)
 		goto out_copy;
 	}
 
-	int id = ida_alloc_min(&area_ida, 1, GFP_KERNEL);
+	int id = nexus_area_id_alloc();
 	if (id < 0) {
 		put_unused_fd(fd);
 		kfree(area);
@@ -303,7 +335,6 @@ static long nexus_area_transfer(struct nexus_area_transfer __user *arg)
 	if (copy_from_user(&tr, arg, sizeof(tr)))
 		return -EFAULT;
 
-	// Check the target process is alive
 	struct pid *target_pid = find_get_pid(tr.target);
 	if (!target_pid) {
 		tr.ret = B_BAD_TEAM_ID;
@@ -341,7 +372,7 @@ static long nexus_area_transfer(struct nexus_area_transfer __user *arg)
 		goto out_copy;
 	}
 
-	int id = ida_alloc_min(&area_ida, 1, GFP_KERNEL);
+	int id = nexus_area_id_alloc();
 	if (id < 0) {
 		fput(file);
 		kfree(target_area);
@@ -409,7 +440,6 @@ static long nexus_area_set_protection(struct nexus_area_set_protection __user *a
 
 static long area_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
-	// Reject a forked process that didn't respect rules.
 	if ((pid_t)(uintptr_t)file->private_data != current->tgid)
 		return -EPERM;
 

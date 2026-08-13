@@ -26,6 +26,42 @@ extern struct mutex nexus_main_lock;
 extern struct hlist_head nexus_teams;
 extern struct idr nexus_port_idr;
 
+#define NEXUS_PORT_SLOT_BITS	12
+#define NEXUS_PORT_MAX_SLOTS	(1 << NEXUS_PORT_SLOT_BITS)
+#define NEXUS_PORT_GEN_BITS	19
+#define NEXUS_PORT_GEN_MASK	((1u << NEXUS_PORT_GEN_BITS) - 1)
+
+static DEFINE_IDA(nexus_port_slot_ida);
+static uint32_t nexus_port_slot_gen[NEXUS_PORT_MAX_SLOTS];
+
+static int nexus_port_id_alloc(struct nexus_port *port)
+{
+	int slot, id;
+
+	slot = ida_alloc_max(&nexus_port_slot_ida, NEXUS_PORT_MAX_SLOTS - 1,
+		GFP_KERNEL);
+	if (slot < 0)
+		return slot;
+
+	id = (int)((nexus_port_slot_gen[slot] << NEXUS_PORT_SLOT_BITS)
+		| (uint32_t)slot);
+
+	if (idr_alloc(&nexus_port_idr, port, id, id + 1, GFP_KERNEL) != id) {
+		ida_free(&nexus_port_slot_ida, slot);
+		return -ENOSPC;
+	}
+	return id;
+}
+
+static void nexus_port_id_free(int id)
+{
+	int slot = id & (NEXUS_PORT_MAX_SLOTS - 1);
+
+	nexus_port_slot_gen[slot] = (nexus_port_slot_gen[slot] + 1)
+		& NEXUS_PORT_GEN_MASK;
+	ida_free(&nexus_port_slot_ida, slot);
+}
+
 long nexus_port_find(unsigned long arg)
 {
 	char name[B_OS_NAME_LENGTH];
@@ -126,7 +162,7 @@ long nexus_port_create(struct nexus_team* team, unsigned long arg)
 
 	rwlock_init(&port->rw_lock);
 
-	int id = idr_alloc(&nexus_port_idr, port, 1, 0, GFP_KERNEL);
+	int id = nexus_port_id_alloc(port);
 	if (id < 0) {
 		kfree(port);
 		in_data.ret = B_NO_MORE_PORTS;
@@ -173,8 +209,10 @@ void nexus_port_destroy(struct kref* ref)
 	struct nexus_port* port = container_of(ref, struct nexus_port, ref_count);
 
 	// id is zeroed by PORT_DELETE to avoid double removal
-	if (port->id != 0)
+	if (port->id != 0) {
 		idr_remove(&nexus_port_idr, port->id);
+		nexus_port_id_free(port->id);
+	}
 
 	if (port->is_open)
 		nexus_port_close(port);
@@ -1032,6 +1070,7 @@ long nexus_port_io_delete(struct nexus_team *team, unsigned long arg)
 		data.ret = B_BAD_PORT_ID;
 	} else {
 		idr_remove(&nexus_port_idr, port->id);
+		nexus_port_id_free(port->id);
 		if (port->is_open)
 			nexus_port_close(port);
 		port->id = 0;

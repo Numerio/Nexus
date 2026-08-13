@@ -27,6 +27,38 @@ static DEFINE_HASHTABLE(fd_hashmap, 10);
 static DEFINE_MUTEX(fd_map_lock);
 static DEFINE_IDA(vref_ida);
 
+#define NEXUS_VREF_SLOT_BITS	16
+#define NEXUS_VREF_MAX_SLOTS	(1 << NEXUS_VREF_SLOT_BITS)
+#define NEXUS_VREF_GEN_BITS	15
+#define NEXUS_VREF_GEN_MASK	((1u << NEXUS_VREF_GEN_BITS) - 1)
+
+static uint32_t nexus_vref_slot_gen[NEXUS_VREF_MAX_SLOTS];
+
+static int nexus_vref_id_alloc(void)
+{
+	int slot, id;
+
+	slot = ida_alloc_max(&vref_ida, NEXUS_VREF_MAX_SLOTS - 1, GFP_KERNEL);
+	if (slot < 0)
+		return slot;
+
+	if (slot == 0 && nexus_vref_slot_gen[0] == 0)
+		nexus_vref_slot_gen[0] = 1;
+
+	id = (int)((nexus_vref_slot_gen[slot] << NEXUS_VREF_SLOT_BITS)
+		| (uint32_t)slot);
+	return id;
+}
+
+static void nexus_vref_id_free(int id)
+{
+	int slot = id & (NEXUS_VREF_MAX_SLOTS - 1);
+
+	nexus_vref_slot_gen[slot] = (nexus_vref_slot_gen[slot] + 1)
+		& NEXUS_VREF_GEN_MASK;
+	ida_free(&vref_ida, slot);
+}
+
 extern struct hlist_head nexus_teams;
 
 
@@ -74,7 +106,7 @@ nexus_vref_destroy(struct kref *kref)
 	}
 
 	path_put(&entry->path);
-	ida_free(&vref_ida, entry->id);
+	nexus_vref_id_free(entry->id);
 	kfree(entry);
 }
 
@@ -104,7 +136,7 @@ nexus_vref_create_from_file(struct file *file)
 	path_get(&entry->path);
 	entry->mode = file->f_mode;
 
-	id = ida_alloc_min(&vref_ida, 1, GFP_KERNEL);
+	id = nexus_vref_id_alloc();
 	if (id < 0) {
 		path_put(&entry->path);
 		kfree(entry);
@@ -142,7 +174,7 @@ nexus_vref_create_from_path(const struct path *src, fmode_t mode)
 	path_get(&entry->path);
 	entry->mode = mode;
 
-	id = ida_alloc_min(&vref_ida, 1, GFP_KERNEL);
+	id = nexus_vref_id_alloc();
 	if (id < 0) {
 		path_put(&entry->path);
 		kfree(entry);
