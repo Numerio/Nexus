@@ -332,14 +332,15 @@ static struct nexus_thread* find_thread(struct nexus_team *team, const char *nam
 		} else {
 			return NULL;
 		}
-	} else if (name != NULL && thread->has_thread_exited) {
-		thread->has_thread_exited = false;
-		thread->has_return_code = false;
-		thread->thread_wait_newborn = false;
-		thread->child_thread = 0;
-		thread->newborn_src = NEXUS_NEWBORN_SRC_NONE;
-		thread->thread_resumed = false;
-	}
+    } else if (name != NULL && thread->has_thread_exited) {
+        thread->has_thread_exited = false;
+        thread->has_return_code = false;
+        thread->thread_wait_newborn = false;
+        thread->child_thread = 0;
+        thread->newborn_src = NEXUS_NEWBORN_SRC_NONE;
+        thread->thread_resumed = false;
+    }
+    return thread;
 }
 
 static struct nexus_thread* register_thread(struct nexus_team *team, pid_t pid) {
