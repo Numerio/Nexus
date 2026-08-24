@@ -59,6 +59,17 @@ static void nexus_sem_id_free(int id)
 	ida_free(&nexus_sem_slot_ida, slot);
 }
 
+static int32_t sem_reported_count(struct nexus_sem *sem)
+{
+	struct nexus_sem_waiter *w;
+	int32_t count = sem->count;
+
+	list_for_each_entry(w, &sem->waiters, list)
+		count -= w->count;
+
+	return count;
+}
+
 static void wake_all_waiters_error(struct nexus_sem *sem, status_t err)
 {
 	struct nexus_sem_waiter *w, *tmp;
@@ -345,7 +356,9 @@ static int nexus_get_sem_count(sem_id id, int32_t *count)
 		ret = B_BAD_SEM_ID;
 		goto out;
 	}
-	*count = sem->count;
+	spin_lock(&sem->lock);
+	*count = sem_reported_count(sem);
+	spin_unlock(&sem->lock);
 out:
 	spin_unlock_irqrestore(&sem_idr_lock, flags);
 	return ret;
@@ -367,7 +380,9 @@ static int nexus_get_sem_info(sem_id id, struct nexus_sem_info *info)
 	info->sem = sem->id;
 	strncpy(info->name, sem->name, B_OS_NAME_LENGTH);
 	info->name[B_OS_NAME_LENGTH - 1] = '\0';
-	info->count = sem->count;
+	spin_lock(&sem->lock);
+	info->count = sem_reported_count(sem);
+	spin_unlock(&sem->lock);
 	info->team = sem->owner;
 	info->latest_holder = sem->latest_holder;
 out:
@@ -392,7 +407,9 @@ static int nexus_get_next_sem_info(team_id team, int32_t cookie,
 		out->info.sem = sem->id;
 		strncpy(out->info.name, sem->name, B_OS_NAME_LENGTH);
 		out->info.name[B_OS_NAME_LENGTH - 1] = '\0';
-		out->info.count = sem->count;
+		spin_lock(&sem->lock);
+		out->info.count = sem_reported_count(sem);
+		spin_unlock(&sem->lock);
 		out->info.team = sem->owner;
 		out->info.latest_holder = sem->latest_holder;
 		out->cookie = id;
