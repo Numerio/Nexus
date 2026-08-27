@@ -857,8 +857,6 @@ static int32_t nm_mark_release_child_vref(struct nexus_mark *mark,
 	}
 	spin_unlock_irqrestore(&mark->children_vrefs_lock, flags);
 
-	if (id >= 0)
-		nexus_vref_drop_kernel_ref(id);
 	return id;
 }
 
@@ -1830,12 +1828,15 @@ static int nexus_start_watching(struct nexus_watch_fd __user *exchange)
 		return -EINVAL;
 	}
 
-	// Reject pseudo-fs (procfs, sysfs, devtmpfs, ...) — our semantics break
-	// and mntget() would pin the mount for no benefit.
+	/* Node monitoring is a per-filesystem capability, not the inverse of
+	 * "pseudo": devtmpfs has no persistent store but delivers fsnotify
+	 * fine, and /dev/input hotplug depends on it. */
 	fs_name = (inode->i_sb && inode->i_sb->s_type)
 		? inode->i_sb->s_type->name : NULL;
-	if (fs_name && fs_caps_kernel_is_pseudo(fs_name)) {
-		nm_dbg("nexus_start_watching: rejected pseudo fs '%s'\n", fs_name);
+	if (fs_name && fs_caps_kernel_is_pseudo(fs_name)
+		&& !fs_caps_kernel_supports_nodemon(fs_name)) {
+		nm_dbg("nexus_start_watching: '%s' has no node-monitor support\n",
+			fs_name);
 		fdput(f);
 		return -EOPNOTSUPP;
 	}

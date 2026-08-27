@@ -16,7 +16,7 @@
 #endif
 
 /* Version tag logged at module init; bump when the table changes. */
-#define FS_CAPS_CHECKSUM 0xea8c3f43u
+#define FS_CAPS_CHECKSUM 0xea8c3f44u
 
 #define FS_CAP_PSEUDO     (1u << 0)
 #define FS_CAP_PERSISTENT (1u << 1)
@@ -73,7 +73,10 @@ static const struct fs_cap_entry fs_caps_entries[] = {
 	{ "ramfs",         0x858458f6u, FS_CAP_ATTR | FS_CAP_NODEMON, "RAM File System" },
 	{ "proc",          0x00009fa0u, FS_CAP_PSEUDO | FS_CAP_READONLY, "" },
 	{ "sysfs",         0x62656572u, FS_CAP_PSEUDO, "" },
-	{ "devtmpfs",      0x00001373u, FS_CAP_PSEUDO, "" },
+	/* magic 0: real devtmpfs magic is TMPFS_MAGIC, already claimed by the
+	 * "tmpfs" row above; name-matched only, no persistent store but
+	 * delivers fsnotify fine (/dev/input hotplug depends on this). */
+	{ "devtmpfs",      0u,          FS_CAP_PSEUDO | FS_CAP_NODEMON, "" },
 	{ "devpts",        0x00001cd1u, FS_CAP_PSEUDO, "" },
 	{ "cgroup",        0x0027e0ebu, FS_CAP_PSEUDO, "" },
 	{ "cgroup2",       0x63677270u, FS_CAP_PSEUDO, "" },
@@ -134,6 +137,12 @@ static inline bool fs_caps_kernel_is_pseudo(const char* n)
 {
 	const struct fs_cap_entry* e = fs_caps_kernel_by_name(n);
 	return e && (e->flags & FS_CAP_PSEUDO);
+}
+
+static inline bool fs_caps_kernel_supports_nodemon(const char* n)
+{
+	const struct fs_cap_entry* e = fs_caps_kernel_by_name(n);
+	return e && (e->flags & FS_CAP_NODEMON);
 }
 
 static inline bool fs_caps_kernel_is_readonly(const char* n)
