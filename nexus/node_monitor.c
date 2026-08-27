@@ -836,7 +836,10 @@ static inline int32_t nm_dir_vref_for_event(struct nexus_mark *mark,
 	return mark->vref_id;
 }
 
-static int32_t nm_mark_release_child_vref(struct nexus_mark *mark,
+/* Unlinks the cached child vref and hands its kernel reference to the caller,
+ * who drops it once done building messages. Kept separate from the drop
+ * because every listener on a mark needs that same id in its own message. */
+static int32_t nm_mark_take_child_vref(struct nexus_mark *mark,
 	const char *name)
 {
 	struct nm_child_vref *e, *tmp;
@@ -958,6 +961,10 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 		int32_t node_vref_id = -1;
 		int32_t dir_vref_id  = -1;
 		bool dir_vref_tried = false;
+		/* The removed child's vref, taken once per mark and shared by
+		 * its listeners; see the FS_DELETE branch below. */
+		int32_t del_child_vref_id = -1;
+		bool del_child_taken = false;
 
 		fs_mark = iter_info->marks[type];
 		if (!fs_mark)
@@ -1086,7 +1093,16 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 							"virtual:directory omitted\n");
 				}
 
-				child_vref_id = nm_mark_release_child_vref(mark, name);
+				/* Taken per listener, the first one got the id
+				 * and the rest got -1, so their "virtual:node"
+				 * field went missing; BPathMonitor drops any
+				 * removal message lacking it. */
+				if (!del_child_taken) {
+					del_child_vref_id =
+						nm_mark_take_child_vref(mark, name);
+					del_child_taken = true;
+				}
+				child_vref_id = del_child_vref_id;
 
 				kmsg_init(&msg, buf, sizeof(buf), B_NODE_MONITOR);
 				kmsg_add_int32(&msg, "opcode", B_ENTRY_REMOVED);
@@ -1352,6 +1368,11 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 			}
 		}
 
+		/* Every message carrying it took its own reference in
+		 * queue_notification() by now, so the cache's can go. */
+		if (del_child_taken && del_child_vref_id >= 0)
+			nexus_vref_drop_kernel_ref(del_child_vref_id);
+
 		kfree(snap);
 		snap = NULL;
 	}
@@ -1379,6 +1400,9 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 			struct listener_snapshot *psnap = NULL;
 			int psnap_count = 0, pi;
 			struct nexus_listener *l;
+			/* Same one-take-per-mark rule as the main loop above. */
+			int32_t pdel_child_vref_id = -1;
+			bool pdel_child_taken = false;
 
 			spin_lock_irqsave(&parent_mark->lock, hlflags);
 			list_for_each_entry(l,
@@ -1459,8 +1483,13 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 
 					pdvref = nm_dir_vref_for_event(parent_mark, dir);
 
-					cvref = nm_mark_release_child_vref(
-						parent_mark, name);
+					if (!pdel_child_taken) {
+						pdel_child_vref_id =
+							nm_mark_take_child_vref(
+								parent_mark, name);
+						pdel_child_taken = true;
+					}
+					cvref = pdel_child_vref_id;
 					kmsg_init(&msg2, buf2,
 						sizeof(buf2), B_NODE_MONITOR);
 					kmsg_add_int32(&msg2, "opcode",
@@ -1540,6 +1569,9 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 			 * STAT storm. Listeners that want a child's stat should
 			 * install a per-file watch, not rely on parent fan-out. */
 		}
+
+			if (pdel_child_taken && pdel_child_vref_id >= 0)
+				nexus_vref_drop_kernel_ref(pdel_child_vref_id);
 
 			kfree(psnap);
 		}
