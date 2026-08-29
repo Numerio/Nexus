@@ -70,13 +70,30 @@ static int32_t sem_reported_count(struct nexus_sem *sem)
 	return count;
 }
 
+static void sem_link_waiter(struct nexus_sem *sem, struct nexus_sem_waiter *w)
+{
+	list_add_tail(&w->list, &sem->waiters);
+	sem->waiting_count += w->count;
+}
+
+static void sem_unlink_waiter(struct nexus_sem *sem, struct nexus_sem_waiter *w)
+{
+	list_del_init(&w->list);
+	sem->waiting_count -= w->count;
+}
+
+static int32_t sem_unreserved_count(struct nexus_sem *sem)
+{
+	return sem->count - sem->waiting_count;
+}
+
 static void wake_all_waiters_error(struct nexus_sem *sem, status_t err)
 {
 	struct nexus_sem_waiter *w, *tmp;
 	list_for_each_entry_safe(w, tmp, &sem->waiters, list) {
 		w->status = err;
 		w->woken = true;
-		list_del_init(&w->list);
+		sem_unlink_waiter(sem, w);
 		wake_up_process(w->task);
 	}
 }
@@ -227,7 +244,7 @@ static int nexus_acquire_sem(sem_id id, int32_t count, uint32_t flags,
 	waiter.count = count;
 	waiter.status = B_OK;
 	waiter.woken = false;
-	list_add_tail(&waiter.list, &sem->waiters);
+	sem_link_waiter(sem, &waiter);
 
 	int wait_state = (flags & B_CAN_INTERRUPT)
 		? TASK_INTERRUPTIBLE : TASK_KILLABLE;
@@ -270,7 +287,7 @@ static int nexus_acquire_sem(sem_id id, int32_t count, uint32_t flags,
 
 	set_current_state(TASK_RUNNING);
 	if (!list_empty(&waiter.list))
-		list_del(&waiter.list);
+		sem_unlink_waiter(sem, &waiter);
 
 out_unlock:
 	spin_unlock_irqrestore(&sem->lock, iflags);
@@ -316,7 +333,7 @@ static int nexus_release_sem(sem_id id, int32_t count, uint32_t flags)
 			sem->latest_holder = w->task->pid;
 			w->status = unblock_status;
 			w->woken = true;
-			list_del_init(&w->list);
+			sem_unlink_waiter(sem, w);
 			wake_up_process(w->task);
 		}
 	} else {
@@ -330,7 +347,7 @@ static int nexus_release_sem(sem_id id, int32_t count, uint32_t flags)
 			sem->latest_holder = w->task->pid;
 			w->status = B_OK;
 			w->woken = true;
-			list_del_init(&w->list);
+			sem_unlink_waiter(sem, w);
 			wake_up_process(w->task);
 		}
 
@@ -357,7 +374,7 @@ static int nexus_get_sem_count(sem_id id, int32_t *count)
 		goto out;
 	}
 	spin_lock(&sem->lock);
-	*count = sem_reported_count(sem);
+	*count = sem_unreserved_count(sem);
 	spin_unlock(&sem->lock);
 out:
 	spin_unlock_irqrestore(&sem_idr_lock, flags);
@@ -381,10 +398,11 @@ static int nexus_get_sem_info(sem_id id, struct nexus_sem_info *info)
 	strncpy(info->name, sem->name, B_OS_NAME_LENGTH);
 	info->name[B_OS_NAME_LENGTH - 1] = '\0';
 	spin_lock(&sem->lock);
-	info->count = sem_reported_count(sem);
-	spin_unlock(&sem->lock);
-	info->team = sem->owner;
+	info->count = sem_unreserved_count(sem);
 	info->latest_holder = sem->latest_holder;
+	spin_unlock(&sem->lock);
+
+	info->team = sem->owner;
 out:
 	spin_unlock_irqrestore(&sem_idr_lock, flags);
 	return ret;
@@ -408,7 +426,7 @@ static int nexus_get_next_sem_info(team_id team, int32_t cookie,
 		strncpy(out->info.name, sem->name, B_OS_NAME_LENGTH);
 		out->info.name[B_OS_NAME_LENGTH - 1] = '\0';
 		spin_lock(&sem->lock);
-		out->info.count = sem_reported_count(sem);
+		out->info.count = sem_unreserved_count(sem);
 		spin_unlock(&sem->lock);
 		out->info.team = sem->owner;
 		out->info.latest_holder = sem->latest_holder;

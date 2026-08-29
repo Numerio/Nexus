@@ -160,6 +160,7 @@ struct nexus_sem {
 
 	char                	name[B_OS_NAME_LENGTH];
 	int32_t             	count;
+	int32_t             	waiting_count;
 	thread_id           	latest_holder;
 	bool                	deleted;
 
