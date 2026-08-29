@@ -59,17 +59,6 @@ static void nexus_sem_id_free(int id)
 	ida_free(&nexus_sem_slot_ida, slot);
 }
 
-static int32_t sem_reported_count(struct nexus_sem *sem)
-{
-	struct nexus_sem_waiter *w;
-	int32_t count = sem->count;
-
-	list_for_each_entry(w, &sem->waiters, list)
-		count -= w->count;
-
-	return count;
-}
-
 static void sem_link_waiter(struct nexus_sem *sem, struct nexus_sem_waiter *w)
 {
 	list_add_tail(&w->list, &sem->waiters);
