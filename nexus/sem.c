@@ -214,7 +214,11 @@ static int nexus_acquire_sem(sem_id id, int32_t count, uint32_t flags,
 		goto out_unlock;
 	}
 
-	if (sem->count >= count) {
+	/*
+	 * Only unreserved capacity is up for grabs so a stream of acquires
+	 * avoid to starve it.
+	 */
+	if (sem_unreserved_count(sem) >= count) {
 		sem->count -= count;
 		sem->latest_holder = current->pid;
 		spin_unlock_irqrestore(&sem->lock, iflags);
@@ -272,7 +276,8 @@ static int nexus_acquire_sem(sem_id id, int32_t count, uint32_t flags,
 			break;
 		}
 
-		if (sem->count >= count) {
+		if (list_is_first(&waiter.list, &sem->waiters)
+			&& sem->count >= count) {
 			sem->count -= count;
 			sem->latest_holder = current->pid;
 			ret = B_OK;
