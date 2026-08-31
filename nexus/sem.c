@@ -76,6 +76,22 @@ static int32_t sem_unreserved_count(struct nexus_sem *sem)
 	return sem->count - sem->waiting_count;
 }
 
+static void sem_wake_eligible_waiters(struct nexus_sem *sem)
+{
+	struct nexus_sem_waiter *w, *tmp;
+
+	list_for_each_entry_safe(w, tmp, &sem->waiters, list) {
+		if (sem->count < w->count)
+			break;
+		sem->count -= w->count;
+		sem->latest_holder = w->task->pid;
+		w->status = B_OK;
+		w->woken = true;
+		sem_unlink_waiter(sem, w);
+		wake_up_process(w->task);
+	}
+}
+
 static void wake_all_waiters_error(struct nexus_sem *sem, status_t err)
 {
 	struct nexus_sem_waiter *w, *tmp;
@@ -204,8 +220,8 @@ static int nexus_acquire_sem(sem_id id, int32_t count, uint32_t flags,
 	}
 
 	/*
-	 * Only unreserved capacity is up for grabs so a stream of acquires
-	 * avoid to starve it.
+	 * Only unreserved capacity is up for grabs, so a stream of new
+	 * acquirers cannot starve the waiters already queued.
 	 */
 	if (sem_unreserved_count(sem) >= count) {
 		sem->count -= count;
@@ -280,8 +296,10 @@ static int nexus_acquire_sem(sem_id id, int32_t count, uint32_t flags,
 	}
 
 	set_current_state(TASK_RUNNING);
-	if (!list_empty(&waiter.list))
+	if (!list_empty(&waiter.list)) {
 		sem_unlink_waiter(sem, &waiter);
+		sem_wake_eligible_waiters(sem);
+	}
 
 out_unlock:
 	spin_unlock_irqrestore(&sem->lock, iflags);
@@ -334,16 +352,7 @@ static int nexus_release_sem(sem_id id, int32_t count, uint32_t flags)
 		int32_t initial_count = sem->count;
 		sem->count += count;
 
-		list_for_each_entry_safe(w, tmp, &sem->waiters, list) {
-			if (sem->count < w->count)
-				break;
-			sem->count -= w->count;
-			sem->latest_holder = w->task->pid;
-			w->status = B_OK;
-			w->woken = true;
-			sem_unlink_waiter(sem, w);
-			wake_up_process(w->task);
-		}
+		sem_wake_eligible_waiters(sem);
 
 		if ((flags & B_RELEASE_IF_WAITING_ONLY) && sem->count > initial_count)
 			sem->count = initial_count;
@@ -421,9 +430,9 @@ static int nexus_get_next_sem_info(team_id team, int32_t cookie,
 		out->info.name[B_OS_NAME_LENGTH - 1] = '\0';
 		spin_lock(&sem->lock);
 		out->info.count = sem_unreserved_count(sem);
+		out->info.latest_holder = sem->latest_holder;
 		spin_unlock(&sem->lock);
 		out->info.team = sem->owner;
-		out->info.latest_holder = sem->latest_holder;
 		out->cookie = id;
 		spin_unlock_irqrestore(&sem_idr_lock, flags);
 		return B_OK;
