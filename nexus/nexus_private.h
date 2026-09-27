@@ -63,6 +63,13 @@ struct nexus_thread {
 
 	thread_id				id;
 
+	/* Incarnation stamp: bumped from a global counter at every record
+	 * creation, so two records that ever shared one tid carry different
+	 * generations. Always in [1, 2^31-1]: never 0 (0 means "no record"),
+	 * never negative, so an int32_t consumer checking "< 0" cannot be
+	 * fooled by a valid generation (the PR #46 sign bug class). */
+	int32_t					generation;
+
 	char					name[B_OS_NAME_LENGTH];
 
 	bool					thread_resumed;

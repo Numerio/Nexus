@@ -39,6 +39,18 @@ typedef int64_t bigtime_t;
 #define NEXUS_THREAD_CLONE_EXECUTED	_IO (NEXUS_MAGIC, 5)
 #define NEXUS_THREAD_RESUME			_IO (NEXUS_MAGIC, 6)
 #define NEXUS_THREAD_SET_RETURN_CODE _IO (NEXUS_MAGIC, 7)
+/* Creator-side registration: the creator calls this with the tid the kernel
+ * handed back from clone(), in the same operation that created the thread.
+ * A thread that exists is then a thread nexus knows: WAITFOR never has to
+ * guess, retry, or consult /proc. Returns the registered tid, or a negative
+ * status. */
+#define NEXUS_THREAD_REGISTER		_IO (NEXUS_MAGIC, 2)
+/* Generation surface for tid recycling: returns the incarnation stamp of the
+ * record currently registered under a tid, or a negative status if the tid is
+ * unknown. The value is always in [1, 2^31-1] so a caller checking "< 0"
+ * (error) can never be fooled by a legitimate generation -- including
+ * consumer code that stores it in a signed 32-bit int. */
+#define NEXUS_THREAD_GET_GENERATION	_IO (NEXUS_MAGIC, 8)
 
 #define NEXUS_PORT_CREATE        _IOWR(NEXUS_MAGIC, 10, struct nexus_port_create)
 #define NEXUS_PORT_CLOSE         _IOWR(NEXUS_MAGIC, 11, struct nexus_port_id)

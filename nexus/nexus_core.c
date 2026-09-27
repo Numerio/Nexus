@@ -8,6 +8,7 @@
 
 #include <linux/cdev.h>
 #include <linux/fs.h>
+#include <linux/atomic.h>
 #include <linux/kref.h>
 #include <linux/list.h>
 #include <linux/module.h>
@@ -43,6 +44,74 @@ EXPORT_SYMBOL(nexus_teams);
 
 DEFINE_IDR(nexus_port_idr);
 static DEFINE_IDR(nexus_teams_idr);
+
+/* Global tid -> struct nexus_thread index of every registered record.
+ * WAITFOR and GET_GENERATION resolve through it: a tid is either registered
+ * (known, resolvable) or unknown -- there is no third state to guess about.
+ * Occupancy rule: a tid maps to its OLDEST still-retained record; a later
+ * nexus_thread_init() for an already-mapped tid (e.g. a fork child opening
+ * its own team while the creator-registered record lives in the parent's
+ * team) stays unindexed and is reachable through its team only. */
+static DEFINE_IDR(nexus_threads_idr);
+
+/* Global incarnation counter for generation stamps. */
+static atomic64_t nexus_thread_generation_ctr = ATOMIC64_INIT(0);
+
+/* Always in [1, 2^31-1]: never 0 (0 would read as "no record"), never
+ * negative (a signed-int consumer checking "< 0" must only ever see real
+ * errors there). Wraps after 2^31 incarnations, which only aliases two
+ * incarnations 2^31 apart -- the recycling window itself is far shorter. */
+static int32_t nexus_thread_next_generation(void)
+{
+	int64_t gen = atomic64_inc_return(&nexus_thread_generation_ctr)
+		& 0x7fffffff;
+	return (gen == 0) ? 1 : (int32_t)gen;
+}
+
+/* All callers hold nexus_main_lock: registration, retirement and lookup are
+ * serialized against each other, so the indexed pointer is always the live
+ * record for the tid while the lock is held. */
+static struct nexus_thread* nexus_thread_lookup(int32_t tid)
+{
+	return idr_find(&nexus_threads_idr, tid);
+}
+
+static int nexus_thread_index(struct nexus_thread *thread)
+{
+	int ret = idr_alloc(&nexus_threads_idr, thread,
+		thread->id, thread->id + 1, GFP_KERNEL);
+	if (ret < 0 && idr_find(&nexus_threads_idr, thread->id) != NULL) {
+		/* Slot occupied by an older retained record for the same tid
+		 * (see occupancy rule above): keep the older one indexed. */
+		return 0;
+	}
+	return ret;
+}
+
+/* Drop a record's index entry. Called ONLY at retirement sites (where the
+ * record leaves its team's rbtree, or the team itself dies), never from
+ * nexus_thread_destroy: retirement is serialized under nexus_main_lock, so
+ * an erased entry can never belong to a newer record for the same tid.
+ * Returns true if this record was the indexed one. */
+static bool nexus_thread_unindex(struct nexus_thread *thread)
+{
+	if (idr_find(&nexus_threads_idr, thread->id) != thread)
+		return false;
+	idr_remove(&nexus_threads_idr, thread->id);
+	return true;
+}
+
+/* Retire a record leaving its team (recycle or team teardown): drop the
+ * index entry plus the tree-membership and index references. Safe for
+ * never-indexed records (e.g. a fork child's own-team main record whose tid
+ * slot is held by the creator-registered record). */
+static void nexus_thread_retire(struct nexus_thread *thread)
+{
+	bool indexed = nexus_thread_unindex(thread);
+	kref_put(&thread->ref_count, nexus_thread_destroy);
+	if (indexed)
+		kref_put(&thread->ref_count, nexus_thread_destroy);
+}
 
 struct nexus_team* nexus_find_team(int32_t id)
 {
@@ -103,6 +172,48 @@ static void nexus_thread_exit_work(struct callback_head *head)
 		nexus_team_destroy(orphan_team);
 
 	mutex_unlock(&nexus_main_lock);
+}
+
+/* Queue the exit hook for a thread on the given task. Idempotent via
+ * exit_hook_installed. Returns false if the task is already exiting and the
+ * hook could not be queued -- the caller must then finish the record itself
+ * (see nexus_thread_arm_exit_or_finish) so waiters can never hang. */
+static bool nexus_thread_arm_exit_hook(struct nexus_thread *thread,
+	struct task_struct *task)
+{
+	if (thread->exit_hook_installed)
+		return true;
+
+	thread->exit_hook_installed = true;
+	kref_get(&thread->ref_count);
+	init_task_work(&thread->exit_work, nexus_thread_exit_work);
+	if (task_work_add(task, &thread->exit_work, TWA_NONE) == 0)
+		return true;
+
+	thread->exit_hook_installed = false;
+	kref_put(&thread->ref_count, nexus_thread_destroy);
+	return false;
+}
+
+/* Arm the exit hook; if the task is already exiting, finish the record right
+ * away with a synthesized status instead. A thread that died before the hook
+ * could be armed then still resolves cleanly through WAITFOR (immediate
+ * B_ERROR, not a hang and not B_BAD_THREAD_ID). Caller holds nexus_main_lock. */
+static void nexus_thread_arm_exit_or_finish(struct nexus_thread *thread,
+	struct task_struct *task)
+{
+	if (nexus_thread_arm_exit_hook(thread, task))
+		return;
+
+	if (!thread->has_thread_exited) {
+		if (!thread->has_return_code)
+			thread->exit_status = B_ERROR;
+		thread->has_thread_exited = true;
+		wake_up_all(&thread->thread_exit);
+		wake_up_all(&thread->thread_suspended);
+		wake_up_all(&thread->thread_has_newborn);
+		wake_up_all(&thread->buffer_read);
+	}
 }
 
 /* Team-exit callback list */
@@ -233,11 +344,11 @@ void nexus_team_destroy(struct nexus_team *team)
 		rb_erase(&thread->node, &team->threads);
 		RB_CLEAR_NODE(&thread->node);
 		thread->team = NULL;
-		kref_put(&thread->ref_count, nexus_thread_destroy);
+		nexus_thread_retire(thread);
 	}
 
 	team->main_thread->team = NULL;
-	kref_put(&team->main_thread->ref_count, nexus_thread_destroy);
+	nexus_thread_retire(team->main_thread);
 	team->main_thread = NULL;
 	kfree(team);
 }
@@ -278,6 +389,14 @@ struct nexus_thread* nexus_thread_init(struct nexus_team *team, pid_t id, const 
 		thread->newborn_src = NEXUS_NEWBORN_SRC_NONE;
 		thread->thread_resumed = false;
 		thread->exit_hook_installed = false;
+		thread->generation = nexus_thread_next_generation();
+
+		/* A record that cannot be resolved through the global index
+		 * must not exist: WAITFOR's strictness depends on it. */
+		if (nexus_thread_index(thread) < 0) {
+			kfree(thread);
+			return NULL;
+		}
 	}
 	return thread;
 }
@@ -339,6 +458,9 @@ static struct nexus_thread* find_thread(struct nexus_team *team, const char *nam
         thread->child_thread = 0;
         thread->newborn_src = NEXUS_NEWBORN_SRC_NONE;
         thread->thread_resumed = false;
+        /* Re-arming a record is a new incarnation: stamp it as such so a
+         * generation consumer can never confuse it with the old one. */
+        thread->generation = nexus_thread_next_generation();
     }
     return thread;
 }
@@ -359,8 +481,23 @@ static struct nexus_thread* register_thread(struct nexus_team *team, pid_t pid) 
 			p = &(*p)->rb_right;
 		else if (pid < thread->id)
 			p = &(*p)->rb_left;
-		else
-			return thread;
+		else {
+			if (!thread->has_thread_exited)
+				return thread;
+
+			/* The record under this tid has exited; a live task
+			 * cannot still own it (the exit work runs before the
+			 * pid is released), so this is a recycled tid.
+			 * Retire the stale incarnation -- its waiters were
+			 * woken at its exit and its state is frozen -- and
+			 * register a fresh one that inherits nothing. */
+			pr_warn_ratelimited("nexus: recycled tid=%d in team=%d: stale record (gen=%d) retired\n",
+				(int)pid, (int)team->id, thread->generation);
+			rb_erase(&thread->node, &team->threads);
+			RB_CLEAR_NODE(&thread->node);
+			nexus_thread_retire(thread);
+			return register_thread(team, pid);
+		}
 	}
 
 	thread = nexus_thread_init(team, pid, NULL);
@@ -370,12 +507,8 @@ static struct nexus_thread* register_thread(struct nexus_team *team, pid_t pid) 
 	rb_link_node(&thread->node, parent, p);
 	rb_insert_color(&thread->node, &team->threads);
 
-	if (pid == current->pid) {
-		kref_get(&thread->ref_count);
-		init_task_work(&thread->exit_work, nexus_thread_exit_work);
-		if (task_work_add(current, &thread->exit_work, TWA_NONE) != 0)
-			kref_put(&thread->ref_count, nexus_thread_destroy);
-	}
+	if (pid == current->pid)
+		nexus_thread_arm_exit_or_finish(thread, current);
 
 	return thread;
 }
@@ -460,6 +593,16 @@ static long nexus_wait_newborn_sync(pid_t child_pid)
 
 	child_team->open_count = 0;
 
+	/* The pre-created team holds no fd of its own: without an exit hook
+	 * its orphan cleanup (nexus_thread_exit_work) can never run, and a
+	 * child that dies before its first open() leaves a stale
+	 * pre-registration behind (the PR #47 hang). Arming the hook ties the
+	 * team's lifetime to the child's lifetime. */
+	if (child_team->main_thread != NULL
+			&& child_task->pid == child_task->tgid)
+		nexus_thread_arm_exit_or_finish(child_team->main_thread,
+			child_task);
+
 	ret = child_pid;
 	put_task_struct(child_task);
 	return ret;
@@ -502,15 +645,18 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		thread = find_thread(team, NULL);
 		if (thread != NULL && thread->id == current->pid
 				&& thread->has_thread_exited && cmd == NEXUS_THREAD_SPAWN) {
-			pr_warn_ratelimited("nexus: SPAWN on recycled tid=%d in team=%d, reusing record\n",
-				current->pid, team->id);
+			/* SPAWN on a recycled tid: retire the stale incarnation
+			 * (its waiters were woken at its exit) and register a
+			 * fresh one below. */
+			pr_warn_ratelimited("nexus: SPAWN on recycled tid=%d in team=%d, stale record (gen=%d) retired\n",
+				current->pid, team->id, thread->generation);
 			rb_erase(&thread->node, &team->threads);
 			RB_CLEAR_NODE(&thread->node);
-			thread->team = NULL;
-			kref_put(&thread->ref_count, nexus_thread_destroy);
+			nexus_thread_retire(thread);
 			thread = NULL;
 		}
-		if (thread == NULL || thread->id != current->pid) {
+		if (thread == NULL || thread->id != current->pid
+				|| cmd == NEXUS_THREAD_SPAWN) {
 			if (cmd == NEXUS_THREAD_SPAWN) {
 				struct nexus_thread_spawn spawn_data;
 				if (copy_from_user(&spawn_data,
@@ -520,17 +666,19 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 					return -EFAULT;
 				}
 
-				struct nexus_thread *self_new =
-					nexus_thread_spawn(team, spawn_data.name);
-				ret = (self_new != NULL) ? 0 : -ENOMEM;
-				if (self_new != NULL) {
-					kref_get(&self_new->ref_count);
-					init_task_work(&self_new->exit_work,
-						nexus_thread_exit_work);
-					if (task_work_add(current, &self_new->exit_work,
-							TWA_NONE) != 0)
-						kref_put(&self_new->ref_count,
-							nexus_thread_destroy);
+				/* Register ourselves unless the creator already
+				 * did it in the same operation that created us
+				 * (creator-side registration): then this is a
+				 * no-op and we only announce + gate below. */
+				if (thread == NULL || thread->id != current->pid) {
+					struct nexus_thread *self_new =
+						nexus_thread_spawn(team, spawn_data.name);
+					ret = (self_new != NULL) ? 0 : -ENOMEM;
+					if (self_new != NULL)
+						nexus_thread_arm_exit_or_finish(
+							self_new, current);
+				} else {
+					ret = B_OK;
 				}
 
 				task = get_pid_task(
@@ -791,7 +939,6 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 
 		case NEXUS_THREAD_WAITFOR: {
 			struct nexus_thread_waitfor_req user_data;
-			struct nexus_team *wf_team;
 			struct nexus_thread *dest_thread = NULL;
 			struct pid *_pid_ref;
 			struct task_struct *task;
@@ -809,27 +956,35 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 					status = B_BAD_THREAD_ID;
 					break;
 				}
+				/* Strict resolution: a tid is either registered
+				 * with nexus (creator-side registration or the
+				 * thread's own first ioctl) or unknown. Unknown
+				 * means "never created or fully retired": fail
+				 * immediately, no guessing, no retries. */
+				dest_thread = nexus_thread_lookup(
+						(int32_t)user_data.receiver);
+				if (dest_thread == NULL
+						|| dest_thread->team != team) {
+					/* Unknown tid, or a record of another
+					 * team: not ours to wait on. */
+					status = B_BAD_THREAD_ID;
+					break;
+				}
+				/* When the target task is still alive it must
+				 * share our address space. A NULL mm means the
+				 * task is a zombie (already exited): the exit
+				 * status is then served from its record. */
 				_pid_ref = find_get_pid((pid_t)user_data.receiver);
 				task = get_pid_task(_pid_ref, PIDTYPE_PID);
 				put_pid(_pid_ref);
-				if (task == NULL) { status = B_BAD_THREAD_ID; break; }
-				if (task->mm != current->mm) {
+				if (task != NULL) {
+					if (task->mm != NULL
+							&& task->mm != current->mm) {
+						put_task_struct(task);
+						status = B_BAD_THREAD_ID;
+						break;
+					}
 					put_task_struct(task);
-					status = B_BAD_THREAD_ID;
-					break;
-				}
-				wf_team = idr_find(&nexus_teams_idr, task->tgid);
-				if (wf_team != NULL) {
-					if (task->pid == wf_team->id)
-						dest_thread = wf_team->main_thread;
-					else
-						dest_thread = find_thread_by_id(wf_team,
-							user_data.receiver);
-				}
-				put_task_struct(task);
-				if (dest_thread == NULL) {
-					status = B_BAD_THREAD_ID;
-					break;
 				}
 				kref_get(&dest_thread->ref_count);
 				mutex_unlock(&nexus_main_lock);
@@ -1011,6 +1166,96 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			ret = B_OK;
 			break;
 
+		case NEXUS_THREAD_REGISTER: {
+			/* Creator-side registration: the creator hands nexus
+			 * the tid it received from clone(), in the same
+			 * operation that created the thread. From here on a
+			 * thread that exists is a thread nexus knows: WAITFOR
+			 * resolves it strictly, without retries or /proc. */
+			thread_id child_tid = (thread_id)arg;
+			struct pid *_pid_ref;
+			struct task_struct *child_task;
+			struct nexus_thread *child_record;
+			struct task_struct *parent;
+			bool same_mm, is_child;
+
+			if (child_tid <= 0 || child_tid == current->pid) {
+				ret = B_BAD_THREAD_ID;
+				break;
+			}
+
+			_pid_ref = find_get_pid((pid_t)child_tid);
+			child_task = get_pid_task(_pid_ref, PIDTYPE_PID);
+			put_pid(_pid_ref);
+			if (child_task == NULL) {
+				/* Never created, or created, exited and fully
+				 * reaped: unknown, and honestly reported. */
+				ret = B_BAD_THREAD_ID;
+				break;
+			}
+
+			/* Only the creator may register: the target must
+			 * share our address space (spawn_thread-style
+			 * threads) or be our direct child (fork-style). */
+			rcu_read_lock();
+			parent = rcu_dereference(child_task->real_parent);
+			is_child = (parent != NULL)
+				&& (parent->tgid == current->tgid);
+			rcu_read_unlock();
+			same_mm = (child_task->mm != NULL)
+				&& (child_task->mm == current->mm);
+
+			if (!same_mm && !is_child) {
+				put_task_struct(child_task);
+				ret = B_BAD_THREAD_ID;
+				break;
+			}
+
+			/* Register in the caller's team, keyed by the child
+			 * tid: the record outlives the child's exit (so
+			 * post-mortem WAITFOR serves the real status) and no
+			 * pre-created child team is needed, so nothing can go
+			 * stale (the PR #47 hang is structurally absent). */
+			child_record = register_thread(team, (pid_t)child_tid);
+			if (child_record == NULL) {
+				put_task_struct(child_task);
+				ret = B_NO_MEMORY;
+				break;
+			}
+
+			/* If the child is already exiting, the record is
+			 * finished right away with a synthesized status:
+			 * WAITFOR then returns cleanly instead of hanging or
+			 * lying with B_BAD_THREAD_ID. */
+			nexus_thread_arm_exit_or_finish(child_record, child_task);
+			put_task_struct(child_task);
+
+			ret = child_tid;
+			break;
+		}
+
+		case NEXUS_THREAD_GET_GENERATION: {
+			/* Incarnation stamp of a registered tid: changes on
+			 * every recycle. Always in [1, 2^31-1], so a caller
+			 * checking "< 0" sees real errors only. */
+			thread_id gen_tid = (thread_id)arg;
+			struct nexus_thread *gen_thread;
+
+			if (gen_tid <= 0) {
+				ret = B_BAD_THREAD_ID;
+				break;
+			}
+
+			gen_thread = nexus_thread_lookup((int32_t)gen_tid);
+			if (gen_thread == NULL || gen_thread->team != team) {
+				ret = B_BAD_THREAD_ID;
+				break;
+			}
+
+			ret = gen_thread->generation;
+			break;
+		}
+
 		case NEXUS_THREAD_SET_RETURN_CODE:
 			thread->exit_status = (int32_t)(long)arg;
 			thread->has_return_code = true;
@@ -1069,7 +1314,6 @@ exit:
 static int nexus_open(struct inode *nodp, struct file *filp)
 {
 	struct nexus_team* team = NULL;
-	bool install_hook = false;
 
 	mutex_lock(&nexus_main_lock);
 	team = nexus_team_init();
@@ -1078,19 +1322,9 @@ static int nexus_open(struct inode *nodp, struct file *filp)
 		return -ENOMEM;
 	}
 
-	if (current->pid == team->id && !team->main_thread->exit_hook_installed) {
-		team->main_thread->exit_hook_installed = true;
-		install_hook = true;
-	}
+	if (current->pid == team->id)
+		nexus_thread_arm_exit_or_finish(team->main_thread, current);
 	mutex_unlock(&nexus_main_lock);
-
-	if (install_hook) {
-		kref_get(&team->main_thread->ref_count);
-		init_task_work(&team->main_thread->exit_work, nexus_thread_exit_work);
-		if (task_work_add(current, &team->main_thread->exit_work, TWA_NONE) != 0) {
-			kref_put(&team->main_thread->ref_count, nexus_thread_destroy);
-		}
-	}
 
 	filp->private_data = (void*)team;
 
