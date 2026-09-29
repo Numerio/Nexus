@@ -12,6 +12,7 @@
 #include <linux/semaphore.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <linux/string.h>
 #include <linux/uaccess.h>
 
 #include "errors.h"
@@ -398,7 +399,7 @@ static int nexus_get_sem_info(sem_id id, struct nexus_sem_info *info)
 	}
 
 	info->sem = sem->id;
-	strncpy(info->name, sem->name, B_OS_NAME_LENGTH);
+	strscpy(info->name, sem->name, B_OS_NAME_LENGTH);
 	info->name[B_OS_NAME_LENGTH - 1] = '\0';
 	spin_lock(&sem->lock);
 	info->count = sem_unreserved_count(sem);
@@ -426,7 +427,7 @@ static int nexus_get_next_sem_info(team_id team, int32_t cookie,
 			continue;
 
 		out->info.sem = sem->id;
-		strncpy(out->info.name, sem->name, B_OS_NAME_LENGTH);
+		strscpy(out->info.name, sem->name, B_OS_NAME_LENGTH);
 		out->info.name[B_OS_NAME_LENGTH - 1] = '\0';
 		spin_lock(&sem->lock);
 		out->info.count = sem_unreserved_count(sem);

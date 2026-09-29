@@ -17,6 +17,7 @@
 #include <linux/rbtree.h>
 #include <linux/kallsyms.h>
 #include <linux/slab.h>
+#include <linux/string.h>
 #include <linux/uaccess.h>
 #include <linux/version.h>
 #include <linux/signal.h>
@@ -273,7 +274,8 @@ static struct nexus_team* nexus_team_init_for(pid_t tgid)
 			return NULL;
 		}
 
-		strncpy(team->main_thread->name, "main", 4);
+		strscpy(team->main_thread->name, "main",
+			sizeof(team->main_thread->name));
 		team->ports = RB_ROOT;
 		team->threads = RB_ROOT;
 

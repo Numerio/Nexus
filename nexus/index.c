@@ -17,10 +17,57 @@
 #include <linux/namei.h>
 #include <linux/stat.h>
 #include <linux/mnt_idmapping.h>
+#include <linux/version.h>
 
 #include "index.h"
 #include "nexus.h"
 #include "volume.h"
+
+/* Linux 7.2 reworked the directory-modification VFS helpers: lookup_one_len()
+ * is gone, vfs_mkdir() returns a dentry, vfs_create() takes the parent dentry.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0)
+static inline struct dentry *nexus_lookup_one(const char *name,
+					       struct dentry *base)
+{
+	struct qstr q = QSTR(name);
+
+	return lookup_one(&nop_mnt_idmap, &q, base);
+}
+
+static inline int nexus_vfs_mkdir(struct inode *dir, struct dentry *dentry,
+				   umode_t mode)
+{
+	struct dentry *res;
+
+	res = vfs_mkdir(&nop_mnt_idmap, dir, dentry, mode, NULL);
+	return IS_ERR(res) ? PTR_ERR(res) : 0;
+}
+
+static inline int nexus_vfs_create(struct inode *dir, struct dentry *dentry,
+				    umode_t mode)
+{
+	return vfs_create(&nop_mnt_idmap, dentry, mode, NULL);
+}
+#else
+static inline struct dentry *nexus_lookup_one(const char *name,
+					       struct dentry *base)
+{
+	return lookup_one_len(name, base, strlen(name));
+}
+
+static inline int nexus_vfs_mkdir(struct inode *dir, struct dentry *dentry,
+				   umode_t mode)
+{
+	return vfs_mkdir(&nop_mnt_idmap, dir, dentry, mode);
+}
+
+static inline int nexus_vfs_create(struct inode *dir, struct dentry *dentry,
+				    umode_t mode)
+{
+	return vfs_create(&nop_mnt_idmap, dir, dentry, mode, false);
+}
+#endif
 
 #define idx_err(fmt, ...)  pr_err("nexus_idx: ERROR: " fmt, ##__VA_ARGS__)
 #define idx_warn(fmt, ...) pr_warn("nexus_idx: WARN: "  fmt, ##__VA_ARGS__)
@@ -129,7 +176,7 @@ static int ensure_dir(const char *path)
 		return ret;
 
 	inode_lock(d_inode(parent_path.dentry));
-	child = lookup_one_len(basename, parent_path.dentry, strlen(basename));
+	child = nexus_lookup_one(basename, parent_path.dentry);
 	if (IS_ERR(child)) {
 		ret = PTR_ERR(child);
 		goto out_unlock;
@@ -141,8 +188,7 @@ static int ensure_dir(const char *path)
 		goto out_unlock;
 	}
 
-	ret = vfs_mkdir(&nop_mnt_idmap, d_inode(parent_path.dentry),
-			child, 0755);
+	ret = nexus_vfs_mkdir(d_inode(parent_path.dentry), child, 0755);
 	dput(child);
 
 out_unlock:
@@ -324,8 +370,7 @@ long nexus_index_ioctl_create(unsigned long arg)
 
 	inode_lock(d_inode(parent_path.dentry));
 
-	marker_dentry = lookup_one_len(req.name, parent_path.dentry,
-				       strlen(req.name));
+	marker_dentry = nexus_lookup_one(req.name, parent_path.dentry);
 	if (IS_ERR(marker_dentry)) {
 		ret = PTR_ERR(marker_dentry);
 		goto out_parent_unlock;
@@ -336,8 +381,8 @@ long nexus_index_ioctl_create(unsigned long arg)
 		goto out_dput;
 	}
 
-	ret = vfs_create(&nop_mnt_idmap, d_inode(parent_path.dentry),
-			 marker_dentry, 0644, false);
+	ret = nexus_vfs_create(d_inode(parent_path.dentry), marker_dentry,
+				0644);
 	if (ret)
 		goto out_dput;
 
@@ -403,8 +448,7 @@ long nexus_index_ioctl_remove(unsigned long arg)
 
 	inode_lock(d_inode(parent_path.dentry));
 
-	marker_dentry = lookup_one_len(req.name, parent_path.dentry,
-				       strlen(req.name));
+	marker_dentry = nexus_lookup_one(req.name, parent_path.dentry);
 	if (IS_ERR(marker_dentry)) {
 		ret = PTR_ERR(marker_dentry);
 		goto out_parent_unlock;

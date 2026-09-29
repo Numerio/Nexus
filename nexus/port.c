@@ -15,6 +15,7 @@
 #include <linux/mutex.h>
 #include <linux/rbtree.h>
 #include <linux/slab.h>
+#include <linux/string.h>
 #include <linux/uaccess.h>
 #include <linux/wait.h>
 
@@ -257,7 +258,7 @@ long nexus_get_next_port_for_team(unsigned long arg)
 		req.info.capacity   = p->capacity;
 		req.info.queue_count = p->read_count;
 		req.info.total_count = p->total_count;
-		strncpy(req.info.name, p->name, B_OS_NAME_LENGTH);
+		strscpy(req.info.name, p->name, B_OS_NAME_LENGTH);
 		req.info.name[B_OS_NAME_LENGTH - 1] = '\0';
 		req.ret = B_OK;
 		break;
