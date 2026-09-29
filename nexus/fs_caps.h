@@ -59,7 +59,10 @@ static const struct fs_cap_entry fs_caps_entries[] = {
 	{ "fuseblk",       0x65735546u, FS_CAP_PERSISTENT | FS_CAP_ATTR | FS_CAP_NODEMON, "NTFS File System" },
 	{ "hfs",           0x00004244u, FS_CAP_PERSISTENT | FS_CAP_ATTR | FS_CAP_NODEMON, "HFS File System" },
 	{ "hfsplus",       0x0000482bu, FS_CAP_PERSISTENT | FS_CAP_ATTR | FS_CAP_NODEMON, "HFS+ File System" },
-	{ "bfs",           0x42465331u, FS_CAP_PERSISTENT | FS_CAP_ATTR | FS_CAP_QUERY | FS_CAP_NODEMON, "Be File System" },
+	/* On Linux "bfs" is the SCO UnixWare Boot File System, so the Be File
+	   System must be registered under the name mount(2) and blkid use.
+	   The befs driver is read-only; there is no mkfs.befs. */
+	{ "befs",          0x42465331u, FS_CAP_PERSISTENT | FS_CAP_ATTR | FS_CAP_QUERY | FS_CAP_NODEMON | FS_CAP_READONLY, "Be File System" },
 	{ "iso9660",       0x00009660u, FS_CAP_PERSISTENT | FS_CAP_READONLY, "ISO9660 File System" },
 	{ "udf",           0x15013346u, FS_CAP_PERSISTENT, "UDF File System" },
 	{ "squashfs",      0x73717368u, FS_CAP_PERSISTENT | FS_CAP_READONLY | FS_CAP_ATTR, "SquashFS File System" },
@@ -114,6 +117,7 @@ static const struct fs_cap_alias fs_caps_aliases[] = {
 	{ "overlayfs", "overlay" },
 	{ "nfs4",      "nfs" },
 	{ "smbfs",     "cifs" },
+	{ "bfs",       "befs" },   /* Haiku's name for it */
 	{ 0, 0 }
 };
 
