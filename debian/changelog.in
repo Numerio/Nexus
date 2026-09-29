@@ -1,0 +1,5 @@
+nexus-dkms (@NEXUS_DEB_VERSION@) trixie; urgency=medium
+
+  * Build from @NEXUS_GIT_SHA@.
+
+ -- Dario Casalinuovo <b.vitruvio@gmail.com>  @NEXUS_DEB_DATE@
