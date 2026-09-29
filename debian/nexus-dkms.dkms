@@ -10,4 +10,7 @@ BUILT_MODULE_NAME[2]="nexus_node_monitor"
 BUILT_MODULE_LOCATION[2]="nexus"
 DEST_MODULE_LOCATION[2]="/updates"
 AUTOINSTALL="YES"
-MAKE[0]="'make' -j$parallel_jobs -C nexus KERNEL_SRC=$kernel_source_dir"
+# kbuild only honours MO= from 7.x on: the modules land in nexus/ on 6.12 and
+# nexus/build/ on 7.2, and BUILT_MODULE_LOCATION can only name one. Move them
+# into the declared location; the copy is a no-op where they already are.
+MAKE[0]="'make' -j$parallel_jobs -C nexus KERNEL_SRC=$kernel_source_dir && { cp -f nexus/build/*.ko nexus/ 2>/dev/null || true; }"
