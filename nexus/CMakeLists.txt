@@ -66,11 +66,13 @@ set(NEXUS_DEB_VERSION
 	"${NEXUS_PKG_EPOCH}:${PROJECT_VERSION}+git${NEXUS_PKG_REV}.${NEXUS_GIT_SHA}")
 message(STATUS "nexus-dkms version: ${NEXUS_DEB_VERSION}")
 
-# dpkg-buildpackage reads debian/changelog from the source tree, so this
-# is generated in place rather than into the build dir.
+# dpkg-buildpackage reads debian/changelog from the source tree. Generate
+# it into the build dir and copy it in at build time: `ninja clean` removes
+# the in-tree copy and does not reconfigure.
+set(NEXUS_CHANGELOG "${CMAKE_CURRENT_BINARY_DIR}/changelog")
 configure_file(
 	"${CMAKE_CURRENT_SOURCE_DIR}/../debian/changelog.in"
-	"${CMAKE_CURRENT_SOURCE_DIR}/../debian/changelog"
+	"${NEXUS_CHANGELOG}"
 	@ONLY)
 
 # dpkg leaves the epoch out of filenames.
@@ -107,6 +109,7 @@ add_custom_command(
 	COMMAND ${CMAKE_COMMAND} -E echo "Building nexus-dkms package..."
 	# Older builds left behind get installed too: the image runs dpkg -i *.deb.
 	COMMAND bash "-c" "rm -f ../nexus-dkms_* ${CMAKE_BINARY_DIR}/nexus-dkms_*"
+	COMMAND ${CMAKE_COMMAND} -E copy "${NEXUS_CHANGELOG}" debian/changelog
 	COMMAND bash "-c" "dpkg-buildpackage -uc -us"
 	COMMAND bash "-c" "mv ../nexus-dkms_${NEXUS_DEB_FILEVER}* ${CMAKE_BINARY_DIR}"
 	WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../"
