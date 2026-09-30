@@ -22,6 +22,8 @@
 #include <linux/version.h>
 #include <linux/signal.h>
 #include <linux/task_work.h>
+#include <linux/tracepoint.h>
+#include <linux/hashtable.h>
 #include <linux/wait.h>
 
 #include "errors.h"
@@ -77,11 +79,18 @@ static struct nexus_thread* nexus_thread_lookup(int32_t tid)
 	return idr_find(&nexus_threads_idr, tid);
 }
 
+/* The index entry holds a reference: nexus_thread_retire() drops it along
+ * with the tree's. Without it, retire over-put and freed a record whose exit
+ * hook was still pending (refcount underflow in nexus_thread_exit_work). */
 static int nexus_thread_index(struct nexus_thread *thread)
 {
 	int ret = idr_alloc(&nexus_threads_idr, thread,
 		thread->id, thread->id + 1, GFP_KERNEL);
-	if (ret < 0 && idr_find(&nexus_threads_idr, thread->id) != NULL) {
+	if (ret >= 0) {
+		kref_get(&thread->ref_count);
+		return 0;
+	}
+	if (idr_find(&nexus_threads_idr, thread->id) != NULL) {
 		/* Slot occupied by an older retained record for the same tid
 		 * (see occupancy rule above): keep the older one indexed. */
 		return 0;
@@ -175,20 +184,85 @@ static void nexus_thread_exit_work(struct callback_head *head)
 	mutex_unlock(&nexus_main_lock);
 }
 
-/* Queue the exit hook for a thread on the given task. Idempotent via
- * exit_hook_installed. Returns false if the task is already exiting and the
- * hook could not be queued -- the caller must then finish the record itself
- * (see nexus_thread_arm_exit_or_finish) so waiters can never hang. */
+/* Exit detection. The record is parked in a pid-keyed table (holding a
+ * ref) and the sched_process_exit probe, which runs in do_exit() before
+ * exit_task_work(), hands it to task_work there. nexus_thread_exit_work()
+ * therefore only ever runs at real exit, in sleepable context, with the
+ * real exit_code. Queuing the task_work directly at arm time is wrong:
+ * TWA_NONE work also runs on the task's next return to user mode (rseq sets
+ * TIF_NOTIFY_RESUME on every reschedule) and marked live threads exited --
+ * wait_for_thread() returning at once with status 0 (Nexus #12). */
+static DEFINE_HASHTABLE(nexus_exit_hash, 8);
+static DEFINE_SPINLOCK(nexus_exit_lock);
+static struct tracepoint *nexus_exit_tp;
+
+/* Only the task argument is used; kernels that also pass group_dead call
+ * this with an extra argument, which the calling convention ignores. */
+static void nexus_exit_probe(void *data, struct task_struct *task)
+{
+	struct nexus_thread *thread;
+	struct hlist_node *tmp;
+	pid_t pid = task->pid;
+
+	/* Pairs with the barrier in nexus_thread_arm_exit_hook(): PF_EXITING
+	 * is set before this runs. */
+	smp_mb();
+	if (hlist_empty(&nexus_exit_hash[hash_min(pid, HASH_BITS(nexus_exit_hash))]))
+		return;
+
+	spin_lock(&nexus_exit_lock);
+	hash_for_each_possible_safe(nexus_exit_hash, thread, tmp, exit_node, pid) {
+		if (thread->exit_pid != pid)
+			continue;
+		hash_del(&thread->exit_node);
+		WARN_ON_ONCE(task_work_add(task, &thread->exit_work, TWA_NONE));
+	}
+	spin_unlock(&nexus_exit_lock);
+}
+
+static void nexus_find_exit_tp(struct tracepoint *tp, void *priv)
+{
+	if (strcmp(tp->name, "sched_process_exit") == 0)
+		*(struct tracepoint **)priv = tp;
+}
+
+/* Arm exit detection for a thread on the given task. Idempotent via
+ * exit_hook_installed. Returns false if the task is already exiting and
+ * the probe may have been missed -- the caller must then finish the record
+ * itself (see nexus_thread_arm_exit_or_finish) so waiters can never hang. */
 static bool nexus_thread_arm_exit_hook(struct nexus_thread *thread,
 	struct task_struct *task)
 {
+	bool reclaimed = false;
+
 	if (thread->exit_hook_installed)
 		return true;
+	if (READ_ONCE(task->flags) & PF_EXITING)
+		return false;
 
 	thread->exit_hook_installed = true;
+	thread->exit_pid = task->pid;
 	kref_get(&thread->ref_count);
 	init_task_work(&thread->exit_work, nexus_thread_exit_work);
-	if (task_work_add(task, &thread->exit_work, TWA_NONE) == 0)
+
+	spin_lock(&nexus_exit_lock);
+	hash_add(nexus_exit_hash, &thread->exit_node, thread->exit_pid);
+	spin_unlock(&nexus_exit_lock);
+
+	/* If the task started exiting meanwhile the probe may already have
+	 * run; whoever unhashes the record owns it. */
+	smp_mb();
+	if (!(READ_ONCE(task->flags) & PF_EXITING))
+		return true;
+
+	spin_lock(&nexus_exit_lock);
+	if (hash_hashed(&thread->exit_node)) {
+		hash_del(&thread->exit_node);
+		reclaimed = true;
+	}
+	spin_unlock(&nexus_exit_lock);
+
+	if (!reclaimed)
 		return true;
 
 	thread->exit_hook_installed = false;
@@ -1410,6 +1484,17 @@ static int nexus_init(void)
 		goto error;
 	}
 
+	for_each_kernel_tracepoint(nexus_find_exit_tp, &nexus_exit_tp);
+	ret = nexus_exit_tp != NULL
+		? tracepoint_probe_register(nexus_exit_tp, nexus_exit_probe, NULL)
+		: -ENOENT;
+	if (ret < 0) {
+		pr_err("nexus: cannot hook sched_process_exit: %d\n", ret);
+		nexus_vref_exit();
+		nexus_sem_exit();
+		goto error;
+	}
+
 	printk(KERN_INFO "nexus: loaded (sync-newborn+tid-recycle)\n");
 	return 0;
 
@@ -1420,6 +1505,21 @@ error:
 
 static void nexus_exit(void)
 {
+	struct nexus_thread *thread;
+	struct hlist_node *tmp;
+	int bkt;
+
+	tracepoint_probe_unregister(nexus_exit_tp, nexus_exit_probe, NULL);
+	tracepoint_synchronize_unregister();
+
+	/* No opener can be left, so nothing waits on these records. */
+	mutex_lock(&nexus_main_lock);
+	hash_for_each_safe(nexus_exit_hash, bkt, tmp, thread, exit_node) {
+		hash_del(&thread->exit_node);
+		kref_put(&thread->ref_count, nexus_thread_destroy);
+	}
+	mutex_unlock(&nexus_main_lock);
+
 	nexus_vref_exit();
 	nexus_sem_exit();
 	nexus_cleanup_dev(1);

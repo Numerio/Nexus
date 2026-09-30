@@ -78,6 +78,10 @@ struct nexus_thread {
 	bool					has_return_code;
 
 	bool					exit_hook_installed;
+	/* Pending-exit table link and the pid it waits on; see
+	 * nexus_thread_arm_exit_hook(). */
+	struct hlist_node		exit_node;
+	pid_t					exit_pid;
 
 	thread_id				child_thread;
 
