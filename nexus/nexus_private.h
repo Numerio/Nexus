@@ -73,7 +73,6 @@ struct nexus_thread {
 	char					name[B_OS_NAME_LENGTH];
 
 	bool					thread_resumed;
-	bool					thread_wait_newborn;
 	bool					has_thread_exited;
 	bool					has_return_code;
 
@@ -83,10 +82,8 @@ struct nexus_thread {
 	struct hlist_node		exit_node;
 	pid_t					exit_pid;
 
-	thread_id				child_thread;
 
 	wait_queue_head_t		thread_suspended;
-	wait_queue_head_t		thread_has_newborn;
 	wait_queue_head_t		thread_exit;
 
 	struct semaphore		sem_read;
@@ -104,14 +101,10 @@ struct nexus_thread {
 	int32_t					unblock_code;
 	int32_t					exit_status;
 
-	int32_t					newborn_src;
 
 	struct nexus_team*		team;
 };
 
-#define NEXUS_NEWBORN_SRC_NONE		0
-#define NEXUS_NEWBORN_SRC_SPAWN		1
-#define NEXUS_NEWBORN_SRC_CLONE		2
 
 struct nexus_vref;
 

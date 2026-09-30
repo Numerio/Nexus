@@ -35,22 +35,17 @@ typedef int64_t bigtime_t;
 #define NEXUS_THREAD_WRITE         _IOWR(NEXUS_MAGIC, 21, struct nexus_thread_rw)
 #define NEXUS_THREAD_HAS_DATA      _IOWR(NEXUS_MAGIC, 22, struct nexus_thread_rw)
 #define NEXUS_THREAD_WAITFOR       _IOWR(NEXUS_MAGIC, 23, struct nexus_thread_waitfor_req)
-#define NEXUS_THREAD_WAIT_NEWBORN	_IO (NEXUS_MAGIC, 4)
+/* A load_image child, before exec: parks until the creator's resume_thread(). */
 #define NEXUS_THREAD_CLONE_EXECUTED	_IO (NEXUS_MAGIC, 5)
 #define NEXUS_THREAD_RESUME			_IO (NEXUS_MAGIC, 6)
 #define NEXUS_THREAD_SET_RETURN_CODE _IO (NEXUS_MAGIC, 7)
-/* Creator-side registration: the creator calls this with the tid the kernel
- * handed back from clone(), in the same operation that created the thread.
- * A thread that exists is then a thread nexus knows: WAITFOR never has to
- * guess, retry, or consult /proc. Returns the registered tid, or a negative
- * status. */
+/* Creator-side registration, right after clone(): the thread (a tid in our
+ * address space) is known to nexus before its id is handed out, and a
+ * resume_thread() issued straight away is kept; for a child process
+ * (load_image) its team is pre-created instead. Threads nexus never saw this
+ * way are registered on first contact (their own first call, or being
+ * waited on, resumed or sent data). Returns the tid, or a negative status. */
 #define NEXUS_THREAD_REGISTER		_IO (NEXUS_MAGIC, 2)
-/* Generation surface for tid recycling: returns the incarnation stamp of the
- * record currently registered under a tid, or a negative status if the tid is
- * unknown. The value is always in [1, 2^31-1] so a caller checking "< 0"
- * (error) can never be fooled by a legitimate generation -- including
- * consumer code that stores it in a signed 32-bit int. */
-#define NEXUS_THREAD_GET_GENERATION	_IO (NEXUS_MAGIC, 8)
 
 #define NEXUS_PORT_CREATE        _IOWR(NEXUS_MAGIC, 10, struct nexus_port_create)
 #define NEXUS_PORT_CLOSE         _IOWR(NEXUS_MAGIC, 11, struct nexus_port_id)
@@ -133,7 +128,6 @@ void nexus_unregister_team_exit(nexus_team_notify_fn fn);
 
 struct nexus_thread_spawn {
 	const char*				name;
-	thread_id				father;
 };
 
 struct nexus_thread_set_name_req {
