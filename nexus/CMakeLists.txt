@@ -35,6 +35,21 @@ execute_process(
 if(NOT NEXUS_GIT_SHA)
 	set(NEXUS_GIT_SHA "unknown")
 endif()
+
+# The sha is read at configure time: reconfigure whenever HEAD moves, or a
+# build mixes two versions (changelog vs. file names).
+execute_process(
+	COMMAND git rev-parse --absolute-git-dir
+	WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+	OUTPUT_VARIABLE NEXUS_GIT_DIR
+	OUTPUT_STRIP_TRAILING_WHITESPACE
+	ERROR_QUIET)
+foreach(_head HEAD logs/HEAD)
+	if(NEXUS_GIT_DIR AND EXISTS "${NEXUS_GIT_DIR}/${_head}")
+		set_property(DIRECTORY APPEND PROPERTY
+			CMAKE_CONFIGURE_DEPENDS "${NEXUS_GIT_DIR}/${_head}")
+	endif()
+endforeach()
 execute_process(
 	COMMAND git log -1 --format=%cD
 	WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
@@ -90,8 +105,9 @@ add_custom_command(
 	TARGET nexus
 	POST_BUILD
 	COMMAND ${CMAKE_COMMAND} -E echo "Building nexus-dkms package..."
+	# Older builds left behind get installed too: the image runs dpkg -i *.deb.
+	COMMAND bash "-c" "rm -f ../nexus-dkms_* ${CMAKE_BINARY_DIR}/nexus-dkms_*"
 	COMMAND bash "-c" "dpkg-buildpackage -uc -us"
-	#TODO this should be done more cleanly
 	COMMAND bash "-c" "mv ../nexus-dkms_${NEXUS_DEB_FILEVER}* ${CMAKE_BINARY_DIR}"
 	WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../"
 )
