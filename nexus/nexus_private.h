@@ -12,6 +12,7 @@
 #include <linux/list.h>
 #include <linux/mutex.h>
 #include <linux/path.h>
+#include <linux/sched.h>
 
 
 #define B_INFINITE_TIMEOUT	(9223372036854775807LL)
@@ -33,6 +34,14 @@ enum {
 #define B_CAN_INTERRUPT        0x01
 #define B_KILL_CAN_INTERRUPT   0x20
 #define B_DO_NOT_RESCHEDULE    0x02
+
+/* A sleep that only a fatal signal ends and that does not block system
+ * suspend: the freezer counts the sleeper as frozen. */
+#ifdef TASK_FREEZABLE
+#define NEXUS_WAIT_KILLABLE	(TASK_KILLABLE | TASK_FREEZABLE)
+#else
+#define NEXUS_WAIT_KILLABLE	TASK_KILLABLE
+#endif
 
 #define B_NAME_NOT_FOUND -2147454966
 

@@ -258,6 +258,11 @@ static int nexus_acquire_sem(sem_id id, int32_t count, uint32_t flags,
 
 	int wait_state = (flags & B_CAN_INTERRUPT)
 		? TASK_INTERRUPTIBLE : TASK_KILLABLE;
+#ifdef TASK_FREEZABLE
+	// No lock is held across schedule(), so a waiter can count as frozen;
+	// otherwise app_server's cursor thread blocks system suspend.
+	wait_state |= TASK_FREEZABLE;
+#endif
 
 	for (;;) {
 		set_current_state(wait_state);

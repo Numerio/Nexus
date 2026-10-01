@@ -800,8 +800,8 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				if (!thread->thread_resumed) {
 					kref_get(&thread->ref_count);
 					mutex_unlock(&nexus_main_lock);
-					wait_event_interruptible(thread->thread_suspended,
-						thread->thread_resumed);
+					wait_event_state(thread->thread_suspended,
+						thread->thread_resumed, NEXUS_WAIT_KILLABLE);
 					mutex_lock(&nexus_main_lock);
 					kref_put(&thread->ref_count, nexus_thread_destroy);
 				}
@@ -853,9 +853,16 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 					break;
 				}
 				mutex_unlock(&nexus_main_lock);
-				wait_event_interruptible(thread->buffer_read,
+				int wret = wait_event_interruptible(thread->buffer_read,
 					thread->buffer_ready != 0);
 				mutex_lock(&nexus_main_lock);
+				if (wret != 0 && thread->buffer_ready == 0) {
+					/* A signal or the freezer, before any data: give
+					 * sem_read back, as the sender would have. */
+					up(&thread->sem_read);
+					status = B_INTERRUPTED;
+					break;
+				}
 				if (copy_to_user(user_data.buffer, thread->buffer,
 						min(user_data.size, thread->buffer_size))) {
 					status = B_BAD_VALUE;
@@ -1090,8 +1097,8 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			if (!thread->thread_resumed) {
 				kref_get(&thread->ref_count);
 				mutex_unlock(&nexus_main_lock);
-				wait_event_interruptible(thread->thread_suspended,
-					 thread->thread_resumed);
+				wait_event_state(thread->thread_suspended,
+					thread->thread_resumed, NEXUS_WAIT_KILLABLE);
 				mutex_lock(&nexus_main_lock);
 				kref_put(&thread->ref_count, nexus_thread_destroy);
 			}
