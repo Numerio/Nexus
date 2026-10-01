@@ -798,12 +798,18 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 
 				/* Spawned threads start suspended. */
 				if (!thread->thread_resumed) {
+					int wret;
+
 					kref_get(&thread->ref_count);
 					mutex_unlock(&nexus_main_lock);
-					wait_event_state(thread->thread_suspended,
-						thread->thread_resumed, NEXUS_WAIT_KILLABLE);
+					wret = wait_event_state(thread->thread_suspended,
+						thread->thread_resumed, NEXUS_WAIT_PARK);
 					mutex_lock(&nexus_main_lock);
 					kref_put(&thread->ref_count, nexus_thread_destroy);
+					if (wret != 0) {
+						mutex_unlock(&nexus_main_lock);
+						return -ERESTARTNOINTR;
+					}
 				}
 
 				mutex_unlock(&nexus_main_lock);
@@ -1095,12 +1101,18 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			 * creator's resume_thread(). Its team was pre-created
 			 * by REGISTER, so an early resume is not lost. */
 			if (!thread->thread_resumed) {
+				int wret;
+
 				kref_get(&thread->ref_count);
 				mutex_unlock(&nexus_main_lock);
-				wait_event_state(thread->thread_suspended,
-					thread->thread_resumed, NEXUS_WAIT_KILLABLE);
+				wret = wait_event_state(thread->thread_suspended,
+					thread->thread_resumed, NEXUS_WAIT_PARK);
 				mutex_lock(&nexus_main_lock);
 				kref_put(&thread->ref_count, nexus_thread_destroy);
+				if (wret != 0) {
+					mutex_unlock(&nexus_main_lock);
+					return -ERESTARTNOINTR;
+				}
 			}
 
 			mutex_unlock(&nexus_main_lock);

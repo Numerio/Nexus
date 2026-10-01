@@ -256,11 +256,13 @@ static int nexus_acquire_sem(sem_id id, int32_t count, uint32_t flags,
 	waiter.woken = false;
 	sem_link_waiter(sem, &waiter);
 
-	int wait_state = (flags & B_CAN_INTERRUPT)
-		? TASK_INTERRUPTIBLE : TASK_KILLABLE;
+	/*
+	 * Interruptible even without B_CAN_INTERRUPT: the cgroup v2 freezer
+	 * (systemd freezing user.slice before suspend) only wakes interruptible
+	 * sleepers. libroot2 repeats the wait unless B_CAN_INTERRUPT is set.
+	 */
+	int wait_state = TASK_INTERRUPTIBLE;
 #ifdef TASK_FREEZABLE
-	// No lock is held across schedule(), so a waiter can count as frozen;
-	// otherwise app_server's cursor thread blocks system suspend.
 	wait_state |= TASK_FREEZABLE;
 #endif
 
