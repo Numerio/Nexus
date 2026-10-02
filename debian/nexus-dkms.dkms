@@ -10,6 +10,8 @@ BUILT_MODULE_NAME[2]="nexus_node_monitor"
 BUILT_MODULE_LOCATION[2]="nexus"
 DEST_MODULE_LOCATION[2]="/updates"
 AUTOINSTALL="YES"
+# Builds from 6.4 up. No MAX: a ceiling would block Debian testing.
+BUILD_EXCLUSIVE_KERNEL_MIN="6.4"
 # kbuild only honours MO= from 7.x on: the modules land in nexus/ on 6.12 and
 # nexus/build/ on 7.2, and BUILT_MODULE_LOCATION can only name one. Move them
 # into the declared location; the copy is a no-op where they already are.

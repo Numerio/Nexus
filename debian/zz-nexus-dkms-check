@@ -1,0 +1,97 @@
+#!/bin/sh
+#
+# Copyright 2026, Dario Casalinuovo. All rights reserved.
+# Distributed under the terms of the MIT License.
+#
+# Kernel postinst hook, after dkms: warn and leave a desktop marker when
+# nexus modules are missing for the new kernel. Always exits 0.
+#
+# Args: kernel version, or the running kernel. NEXUS_CHECK_ROOT prefixes
+# every path for tests and skips the live dpkg/dkms checks.
+
+set -u
+
+kern="${1:-}"
+[ -n "$kern" ] || kern="$(uname -r)"
+
+# Optional scratch root for tests; empty = the real system.
+root="${NEXUS_CHECK_ROOT:-}"
+marker="${root}/var/lib/vos/nexus-dkms.missing-module"
+
+# Drop a marker for this kernel or for one no longer installed.
+_clear_marker() {
+	[ -f "$marker" ] || return 0
+	_mkern=$(sed -n 's/.*for kernel \([^:]*\):.*/\1/p' <"$marker" 2>/dev/null)
+	[ -n "$_mkern" ] || return 0
+	if [ "$_mkern" = "$kern" ] \
+			|| [ ! -d "${root}/lib/modules/${_mkern}" ]; then
+		rm -f "$marker" 2>/dev/null || true
+	fi
+	return 0
+}
+
+if [ -n "$root" ]; then
+	# Scratch root: "installed" = the dkms source or build tree is there.
+	if [ ! -e "${root}/usr/src/nexus-1" ] \
+			&& [ ! -e "${root}/var/lib/dkms/nexus" ]; then
+		exit 0
+	fi
+else
+	# nexus-dkms not installed: nothing to check.
+	if ! dpkg-query -W -f='${Status}' nexus-dkms 2>/dev/null \
+			| grep -q 'install ok installed'; then
+		exit 0
+	fi
+
+	# Prefer live dkms: a built-and-installed module means the files are
+	# under /lib/modules and /var/lib/dkms already.
+	if command -v dkms >/dev/null 2>&1 \
+			&& dkms status -m nexus -k "$kern" 2>/dev/null \
+			| grep -q installed; then
+		_clear_marker
+		exit 0
+	fi
+fi
+
+# Modules nexus-dkms builds; V\OS needs all three.
+mods="nexus area nexus_node_monitor"
+missing=""
+
+# Debian compresses modules, so accept any .ko* under the dkms locations.
+_mod_present() {
+	_m="$1"
+	for _dir in updates updates/dkms extra; do
+		for _ext in ko ko.xz ko.zst ko.gz; do
+			[ -f "${root}/lib/modules/${kern}/${_dir}/${_m}.${_ext}" ] \
+				&& return 0
+		done
+	done
+	find "${root}/var/lib/dkms/nexus" -path "*${kern}*" \
+		-name "${_m}.ko*" 2>/dev/null | grep -q . && return 0
+	return 1
+}
+
+for _m in $mods; do
+	_mod_present "$_m" || missing="$missing $_m"
+done
+if [ -z "$missing" ]; then
+	_clear_marker
+	exit 0
+fi
+missing="${missing# }"
+
+_loud() {
+	printf 'nexus-dkms: %s\n' "$*" >&2
+	logger -s -t nexus-dkms -- "$*" 2>/dev/null || true
+}
+
+_loud "no modules for kernel ${kern}: missing: ${missing} - dkms build \
+failed or was skipped - V\\OS IPC will be missing"
+
+# Marker for the desktop to show.
+mkdir -p "${root}/var/lib/vos" 2>/dev/null || true
+printf '%s\n' \
+	"nexus-dkms: missing modules for kernel ${kern}: ${missing}" \
+	> "$marker" 2>/dev/null || true
+
+exit 0
