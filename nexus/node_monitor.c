@@ -1813,7 +1813,6 @@ static int nexus_start_watching(struct nexus_watch_fd __user *exchange)
 	struct nexus_watch_fd req;
 	struct nexus_mark *mark;
 	struct nexus_listener *listener;
-	struct fd f;
 	struct file *file;
 	struct inode *inode;
 	const char *fs_name;
@@ -1846,17 +1845,19 @@ static int nexus_start_watching(struct nexus_watch_fd __user *exchange)
 		return -EINVAL;
 	}
 
-	f = fdget(req.fd);
-	file = FD_FILE(f);
+	/* Raw: a watch needs no access, and a vref reopened from a stream
+	 * file comes back O_PATH, which fget() refuses. */
+	file = fget_raw(req.fd);
 	if (!file) {
-		nm_err("nexus_start_watching: bad fd=%d\n", req.fd);
+		nm_err("nexus_start_watching: bad fd=%d from %d(%s)\n", req.fd,
+			current->tgid, current->comm);
 		return -EBADF;
 	}
 
 	inode = file_inode(file);
 	if (!inode) {
 		nm_err("nexus_start_watching: no inode for fd=%d\n", req.fd);
-		fdput(f);
+		fput(file);
 		return -EINVAL;
 	}
 
@@ -1869,19 +1870,19 @@ static int nexus_start_watching(struct nexus_watch_fd __user *exchange)
 		&& !fs_caps_kernel_supports_nodemon(fs_name)) {
 		nm_dbg("nexus_start_watching: '%s' has no node-monitor support\n",
 			fs_name);
-		fdput(f);
+		fput(file);
 		return -EOPNOTSUPP;
 	}
 
 	mark = find_or_create_mark(inode, flags_to_fsnotify_mask(req.flags));
 	if (IS_ERR(mark)) {
-		fdput(f);
+		fput(file);
 		return PTR_ERR(mark);
 	}
 
 	if ((req.flags & B_WATCH_CHILDREN) && !mark->is_dir) {
 		nm_err("nexus_start_watching: B_WATCH_CHILDREN on non-directory\n");
-		fdput(f);
+		fput(file);
 		fsnotify_put_mark(&mark->fs_mark);
 		return -ENOTDIR;
 	}
@@ -1889,7 +1890,7 @@ static int nexus_start_watching(struct nexus_watch_fd __user *exchange)
 	listener = kzalloc(sizeof(*listener), GFP_KERNEL);
 	if (!listener) {
 		nm_err("nexus_start_watching: failed to allocate listener\n");
-		fdput(f);
+		fput(file);
 		fsnotify_put_mark(&mark->fs_mark);
 		return -ENOMEM;
 	}
@@ -2088,7 +2089,7 @@ static int nexus_start_watching(struct nexus_watch_fd __user *exchange)
 		atomic_read(&stat_watches));
 #endif
 
-	fdput(f);
+	fput(file);
 	fsnotify_put_mark(&mark->fs_mark);
 	return 0;
 }
