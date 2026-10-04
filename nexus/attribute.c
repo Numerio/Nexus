@@ -474,7 +474,14 @@ long nexus_attr_ioctl_write(unsigned long arg)
 
 	if (req.buf_len > (64ULL * 1024 * 1024)) {
 		ret = -EINVAL;
-		goto out_fput;
+		goto out_user_buf;
+	}
+	/* pos is a byte offset into the attr payload; a fuzzed huge pos
+	 * must not drive kvmalloc past INT_MAX (WARN_ON in __kvmalloc). */
+	if (req.pos < 0 ||
+	    (u64)req.pos + (u64)req.buf_len > (64ULL * 1024 * 1024)) {
+		ret = -EINVAL;
+		goto out_user_buf;
 	}
 
 	user_buf = kvmalloc(req.buf_len ? req.buf_len : 1, GFP_KERNEL);
