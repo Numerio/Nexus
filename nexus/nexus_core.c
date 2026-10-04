@@ -135,6 +135,21 @@ struct nexus_team* nexus_find_team(int32_t id)
 // TODO fine-grained locking through spinlocks
 // TODO per-team lock
 
+/* Channel semaphores start at 1. Exit wakes peers, which return any count
+ * they hold; re-arm restores the creation values. */
+static void nexus_thread_rearm_channels(struct nexus_thread *thread)
+{
+	sema_init(&thread->sem_read, 1);
+	sema_init(&thread->sem_write, 1);
+}
+
+static void nexus_thread_release_channels(struct nexus_thread *thread)
+{
+	/* Wake peers parked on this record; each re-checks has_thread_exited
+	 * and ups again to return the count, so semaphores are not inflated. */
+	up(&thread->sem_read);
+	up(&thread->sem_write);
+}
 
 static void nexus_thread_exit_work(struct callback_head *head)
 {
@@ -170,6 +185,7 @@ static void nexus_thread_exit_work(struct callback_head *head)
 	wake_up_all(&thread->thread_exit);
 	wake_up_all(&thread->thread_suspended);
 	wake_up_all(&thread->buffer_read);
+	nexus_thread_release_channels(thread);
 
 	if (thread->team != NULL && thread->team->main_thread == thread
 			&& thread->team->open_count == 0) {
@@ -288,7 +304,8 @@ static void nexus_thread_arm_exit_or_finish(struct nexus_thread *thread,
 		thread->has_thread_exited = true;
 		wake_up_all(&thread->thread_exit);
 		wake_up_all(&thread->thread_suspended);
-			wake_up_all(&thread->buffer_read);
+		wake_up_all(&thread->buffer_read);
+		nexus_thread_release_channels(thread);
 	}
 }
 
@@ -488,11 +505,18 @@ void nexus_thread_destroy(struct kref* ref)
 			thread->exit_status = B_ERROR;
 		wake_up_all(&thread->thread_exit);
 		wake_up_all(&thread->thread_suspended);
-			wake_up_all(&thread->buffer_read);
+		wake_up_all(&thread->buffer_read);
+		nexus_thread_release_channels(thread);
 	}
 
-	if (team != NULL && thread->id != team->id)
+	/* Retirement already erased and cleared the node; rb_erase on a
+	 * cleared node corrupts the team tree. */
+	if (team != NULL && thread->id != team->id
+			&& !RB_EMPTY_NODE(&thread->node)) {
 		rb_erase(&thread->node, &team->threads);
+		RB_CLEAR_NODE(&thread->node);
+	}
+	thread->team = NULL;
 	kfree(thread->buffer);
 	kfree(thread);
 }
@@ -526,11 +550,20 @@ static struct nexus_thread* find_thread(struct nexus_team *team, const char *nam
 			return NULL;
 		}
     } else if (name != NULL && thread->has_thread_exited) {
+        /* Re-arm is a new incarnation: a half-rearmed record keeps the old
+         * exit hook and never detects the new task's exit. */
         thread->has_thread_exited = false;
         thread->has_return_code = false;
         thread->thread_resumed = false;
-        /* Re-arming a record is a new incarnation: stamp it as such so a
-         * generation consumer can never confuse it with the old one. */
+        thread->spawn_pending = false;
+        thread->return_code = B_ERROR;
+        thread->exit_status = 0;
+        thread->exit_hook_installed = false;
+        thread->buffer_ready = 0;
+        thread->buffer_size = 0;
+        thread->sender = -1;
+        thread->unblock_code = -1;
+        nexus_thread_rearm_channels(thread);
         thread->generation = nexus_thread_next_generation();
     }
     return thread;
@@ -859,7 +892,11 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 
 		case NEXUS_THREAD_READ: {
 			struct nexus_thread_rw user_data;
+			struct nexus_thread *self;
 			int32_t status;
+			int sem_ret, wret;
+			bool has_deadline = false;
+			u64 deadline_ns = 0;
 
 			if (copy_from_user(&user_data, (struct __user nexus_thread_rw*)arg,
 					sizeof(user_data))) {
@@ -871,35 +908,148 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 					status = B_BAD_THREAD_ID;
 					break;
 				}
-				if (down_interruptible(&thread->sem_read)) {
-					status = B_INTERRUPTED;
-					break;
-				}
-				mutex_unlock(&nexus_main_lock);
-				int wret = wait_event_interruptible(thread->buffer_read,
-					thread->buffer_ready != 0);
-				mutex_lock(&nexus_main_lock);
-				if (wret != 0 && thread->buffer_ready == 0) {
-					/* A signal or the freezer, before any data: give
-					 * sem_read back, as the sender would have. */
-					up(&thread->sem_read);
-					status = B_INTERRUPTED;
-					break;
-				}
-				if (copy_to_user(user_data.buffer, thread->buffer,
-						min(user_data.size, thread->buffer_size))) {
+				if (user_data.buffer == NULL && user_data.size > 0) {
 					status = B_BAD_VALUE;
 					break;
 				}
-				user_data.sender = thread->sender;
-				user_data.return_code = thread->unblock_code;
-				kfree(thread->buffer);
-				thread->buffer = NULL;
-				thread->buffer_size = 0;
-				thread->buffer_ready = 0;
-				thread->sender = -1;
-				thread->unblock_code = -1;
-				up(&thread->sem_write);
+				/* Never sleep holding nexus_main_lock, or every
+				 * other ioctl blocks on it. */
+				if ((user_data.flags & B_RELATIVE_TIMEOUT) &&
+				    user_data.timeout == 0) {
+					status = B_WOULD_BLOCK;
+					break;
+				}
+				if ((user_data.flags & B_ABSOLUTE_TIMEOUT) ||
+				    ((user_data.flags & B_RELATIVE_TIMEOUT) &&
+				     user_data.timeout > 0 &&
+				     user_data.timeout != B_INFINITE_TIMEOUT)) {
+					has_deadline = true;
+					if (user_data.flags & B_ABSOLUTE_TIMEOUT)
+						deadline_ns = (u64)user_data.timeout * 1000ULL;
+					else
+						deadline_ns = ktime_get_ns() +
+							(u64)user_data.timeout * 1000ULL;
+				}
+
+				/* Finished record with no pending slot: reject
+				 * instead of waiting forever. */
+				if (thread->has_thread_exited &&
+				    thread->buffer_ready == 0) {
+					status = B_BAD_THREAD_ID;
+					break;
+				}
+
+				self = thread;
+				kref_get(&self->ref_count);
+				mutex_unlock(&nexus_main_lock);
+				if (has_deadline) {
+					ktime_t dl = ns_to_ktime((s64)deadline_ns);
+
+					if ((user_data.flags & B_ABSOLUTE_TIMEOUT) &&
+					    ktime_get_ns() >= deadline_ns)
+						sem_ret = -ETIME;
+					else
+						sem_ret = down_timeout(&self->sem_read, dl);
+				} else {
+					sem_ret = down_interruptible(&self->sem_read);
+				}
+				mutex_lock(&nexus_main_lock);
+				if (kref_put(&self->ref_count, nexus_thread_destroy)) {
+					status = B_BAD_THREAD_ID;
+					break;
+				}
+				if (sem_ret) {
+					/* Never took the count. */
+					if (sem_ret == -ETIME)
+						status = B_TIMED_OUT;
+					else
+						status = B_INTERRUPTED;
+					break;
+				}
+				/* Took sem_read. Record may have been recycled or
+				 * exited while the lock was dropped. */
+				if (self->id != current->pid ||
+				    (self->has_thread_exited &&
+				     self->buffer_ready == 0)) {
+					up(&self->sem_read);
+					status = B_BAD_THREAD_ID;
+					break;
+				}
+				mutex_unlock(&nexus_main_lock);
+				if (has_deadline) {
+					ktime_t left = ns_to_ktime((s64)deadline_ns);
+
+					if (ktime_get_ns() >= deadline_ns) {
+						wret = -ETIME;
+					} else {
+						wret = wait_event_hrtimeout(self->buffer_read,
+							self->buffer_ready != 0
+								|| self->has_thread_exited, left);
+					}
+				} else {
+					wret = wait_event_interruptible(self->buffer_read,
+						self->buffer_ready != 0
+							|| self->has_thread_exited);
+				}
+				mutex_lock(&nexus_main_lock);
+				if (self->id != current->pid) {
+					up(&self->sem_read);
+					status = B_BAD_THREAD_ID;
+					break;
+				}
+				if (self->has_thread_exited &&
+				    self->buffer_ready == 0) {
+					up(&self->sem_read);
+					status = B_BAD_THREAD_ID;
+					break;
+				}
+				if (wret != 0 && self->buffer_ready == 0) {
+					/* A signal or the freezer, before any data: give
+					 * sem_read back, as the sender would have. */
+					up(&self->sem_read);
+					if (wret == -ETIME)
+						status = B_TIMED_OUT;
+					else
+						status = B_INTERRUPTED;
+					break;
+				}
+				if (self->buffer == NULL) {
+					/* Flag set without a buffer: drop the slot and
+					 * release the writer so the channel is not wedged. */
+					self->buffer_ready = 0;
+					self->sender = -1;
+					self->unblock_code = -1;
+					up(&self->sem_write);
+					up(&self->sem_read);
+					status = B_BAD_VALUE;
+					break;
+				}
+				if (copy_to_user(user_data.buffer, self->buffer,
+						min(user_data.size, self->buffer_size))) {
+					/* Drop the slot; holding either count after a
+					 * failed copy wedges later traffic. */
+					kfree(self->buffer);
+					self->buffer = NULL;
+					self->buffer_size = 0;
+					self->buffer_ready = 0;
+					self->sender = -1;
+					self->unblock_code = -1;
+					up(&self->sem_write);
+					/* sem_read stays with the reader slot: the next
+					 * writer's up(sem_read) hands it to the next reader. */
+					status = B_BAD_VALUE;
+					break;
+				}
+				user_data.sender = self->sender;
+				user_data.return_code = self->unblock_code;
+				user_data.size = min(user_data.size, self->buffer_size);
+				kfree(self->buffer);
+				self->buffer = NULL;
+				self->buffer_size = 0;
+				self->buffer_ready = 0;
+				self->sender = -1;
+				self->unblock_code = -1;
+				up(&self->sem_write);
 				status = B_OK;
 			} while (0);
 			user_data.ret = status;
@@ -960,8 +1110,19 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 					status = B_INTERRUPTED;
 					break;
 				}
+				/* Dead target with no pending slot: reject instead of
+				 * delivering into a record nobody can consume. */
+				if (dest_thread->has_thread_exited
+						&& dest_thread->buffer_ready == 0) {
+					up(&dest_thread->sem_write);
+					put_task_struct(task);
+					status = B_BAD_THREAD_ID;
+					break;
+				}
 				dest_thread->buffer = kzalloc(user_data.size, GFP_KERNEL);
 				if (dest_thread->buffer == NULL) {
+					/* Error after down() must give sem_write back. */
+					up(&dest_thread->sem_write);
 					put_task_struct(task);
 					status = B_NO_MEMORY;
 					break;
@@ -970,6 +1131,7 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 						user_data.size)) {
 					kfree(dest_thread->buffer);
 					dest_thread->buffer = NULL;
+					up(&dest_thread->sem_write);
 					put_task_struct(task);
 					status = B_BAD_VALUE;
 					break;
