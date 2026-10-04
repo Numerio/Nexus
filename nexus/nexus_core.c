@@ -559,6 +559,8 @@ static struct nexus_thread* find_thread(struct nexus_team *team, const char *nam
         thread->return_code = B_ERROR;
         thread->exit_status = 0;
         thread->exit_hook_installed = false;
+        kfree(thread->buffer);
+        thread->buffer = NULL;
         thread->buffer_ready = 0;
         thread->buffer_size = 0;
         thread->sender = -1;
@@ -943,13 +945,15 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				kref_get(&self->ref_count);
 				mutex_unlock(&nexus_main_lock);
 				if (has_deadline) {
-					ktime_t dl = ns_to_ktime((s64)deadline_ns);
+					u64 now = ktime_get_ns();
 
-					if ((user_data.flags & B_ABSOLUTE_TIMEOUT) &&
-					    ktime_get_ns() >= deadline_ns)
+					/* down_timeout() takes relative jiffies. */
+					if (now >= deadline_ns)
 						sem_ret = -ETIME;
 					else
-						sem_ret = down_timeout(&self->sem_read, dl);
+						sem_ret = down_timeout(&self->sem_read,
+							max_t(long, 1,
+								nsecs_to_jiffies(deadline_ns - now)));
 				} else {
 					sem_ret = down_interruptible(&self->sem_read);
 				}
@@ -977,14 +981,18 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				}
 				mutex_unlock(&nexus_main_lock);
 				if (has_deadline) {
-					ktime_t left = ns_to_ktime((s64)deadline_ns);
+					u64 now = ktime_get_ns();
 
-					if (ktime_get_ns() >= deadline_ns) {
+					/* Relative, and interruptible so the freezer
+					 * can still stop us. */
+					if (now >= deadline_ns) {
 						wret = -ETIME;
 					} else {
-						wret = wait_event_hrtimeout(self->buffer_read,
+						wret = wait_event_interruptible_hrtimeout(
+							self->buffer_read,
 							self->buffer_ready != 0
-								|| self->has_thread_exited, left);
+								|| self->has_thread_exited,
+							ns_to_ktime(deadline_ns - now));
 					}
 				} else {
 					wret = wait_event_interruptible(self->buffer_read,
@@ -1110,10 +1118,9 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 					status = B_INTERRUPTED;
 					break;
 				}
-				/* Dead target with no pending slot: reject instead of
-				 * delivering into a record nobody can consume. */
-				if (dest_thread->has_thread_exited
-						&& dest_thread->buffer_ready == 0) {
+				/* Dead target: exit's up() let us in, but nobody will
+				 * read, and a pending slot must not be overwritten. */
+				if (dest_thread->has_thread_exited) {
 					up(&dest_thread->sem_write);
 					put_task_struct(task);
 					status = B_BAD_THREAD_ID;
