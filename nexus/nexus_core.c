@@ -25,6 +25,9 @@
 #include <linux/tracepoint.h>
 #include <linux/hashtable.h>
 #include <linux/wait.h>
+#include <linux/ktime.h>
+#include <linux/semaphore.h>
+#include <linux/minmax.h>
 
 #include "errors.h"
 #include "nexus_private.h"
@@ -459,6 +462,7 @@ struct nexus_thread* nexus_thread_init(struct nexus_team *team, pid_t id, const 
 		thread->has_return_code = false;
 		thread->return_code = B_ERROR;
 		thread->thread_resumed = false;
+		thread->spawn_pending = false;
 		thread->exit_hook_installed = false;
 		thread->generation = nexus_thread_next_generation();
 
@@ -642,6 +646,13 @@ static long nexus_precreate_child_team(pid_t child_pid)
 	}
 
 	if (idr_find(&nexus_teams_idr, child_task->tgid) != NULL) {
+		/* REGISTER of a load_image child whose team was already
+		 * created (child opened nexus first): still park it. */
+		struct nexus_team *existing;
+
+		existing = idr_find(&nexus_teams_idr, child_task->tgid);
+		if (existing != NULL && existing->main_thread != NULL)
+			existing->main_thread->spawn_pending = true;
 		put_task_struct(child_task);
 		return child_pid;
 	}
@@ -653,6 +664,11 @@ static long nexus_precreate_child_team(pid_t child_pid)
 	}
 
 	child_team->open_count = 0;
+
+	/* load_image children park in CLONE_EXECUTED until resume_thread();
+	 * mark the pre-created main record so the park still happens. */
+	if (child_team->main_thread != NULL)
+		child_team->main_thread->spawn_pending = true;
 
 	/* The pre-created team holds no fd of its own: without an exit hook
 	 * its orphan cleanup (nexus_thread_exit_work) can never run, and a
@@ -797,6 +813,7 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				nexus_thread_arm_exit_or_finish(thread, current);
 
 				/* Spawned threads start suspended. */
+				thread->spawn_pending = true;
 				if (!thread->thread_resumed) {
 					int wret;
 
@@ -1071,6 +1088,7 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				/* Waiting on a never-resumed thread resumes it. */
 				if (!dest_thread->thread_resumed) {
 					dest_thread->thread_resumed = true;
+					dest_thread->spawn_pending = false;
 					wake_up(&dest_thread->thread_suspended);
 				}
 				kref_get(&dest_thread->ref_count);
@@ -1098,8 +1116,14 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 
 		case NEXUS_THREAD_CLONE_EXECUTED:
 			/* A load_image child, before exec: park until the
-			 * creator's resume_thread(). Its team was pre-created
-			 * by REGISTER, so an early resume is not lost. */
+			 * creator's resume_thread(). Only threads registered
+			 * as spawn/load_image children park; an arbitrary
+			 * running thread that issues this ioctl would sleep
+			 * forever with nobody to resume it. */
+			if (!thread->thread_resumed && !thread->spawn_pending) {
+				ret = B_BAD_THREAD_ID;
+				break;
+			}
 			if (!thread->thread_resumed) {
 				int wret;
 
@@ -1153,6 +1177,7 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 
 			if (!dest_thread->thread_resumed) {
 				dest_thread->thread_resumed = true;
+				dest_thread->spawn_pending = false;
 				kref_get(&dest_thread->ref_count);
 				mutex_unlock(&nexus_main_lock);
 				wake_up(&dest_thread->thread_suspended);
@@ -1208,7 +1233,9 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			}
 
 			/* A child process gets its own team, pre-created so that a
-			 * resume_thread() before its first open() is not lost. */
+			 * resume_thread() before its first open() is not lost.
+			 * The pre-created main thread is marked spawn_pending so
+			 * CLONE_EXECUTED still parks load_image children. */
 			if (!same_mm) {
 				put_task_struct(child_task);
 				ret = nexus_precreate_child_team((pid_t)child_tid);
@@ -1226,6 +1253,10 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				ret = B_NO_MEMORY;
 				break;
 			}
+
+			/* Same-mm child is a spawn/load_image thread: park it
+			 * until resume_thread(). */
+			child_record->spawn_pending = true;
 
 			/* Armed here too, so a thread killed before its
 			 * SPAWN still gets its record finished. */

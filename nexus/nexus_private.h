@@ -79,6 +79,9 @@ struct nexus_thread {
 	char					name[B_OS_NAME_LENGTH];
 
 	bool					thread_resumed;
+	/* Spawn/load_image child awaiting resume_thread(); stays false for
+	 * running threads so CLONE_EXECUTED never parks them. */
+	bool					spawn_pending;
 	bool					has_thread_exited;
 	bool					has_return_code;
 
