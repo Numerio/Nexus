@@ -413,7 +413,12 @@ nexus_vref_open(struct nexus_vref_open __user *uarg)
 	if (ret != B_OK)
 		return ret;
 
-	file = dentry_open(&path, open_mode, current_cred());
+	/* dentry_open takes open(2) flags; passing READ|WRITE fmode bits
+	 * reads as an invalid access mode and the fd fails every I/O. */
+	file = dentry_open(&path,
+		(open_mode & FMODE_READ) && (open_mode & FMODE_WRITE) ? O_RDWR
+			: (open_mode & FMODE_WRITE) ? O_WRONLY : O_RDONLY,
+		current_cred());
 
 	if (IS_ERR(file)) {
 		ret = B_NOT_ALLOWED;
