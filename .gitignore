@@ -1,2 +1,8 @@
 debian/changelog
 debian/files
+debian/.debhelper/
+debian/debhelper-build-stamp
+debian/*.debhelper
+debian/*.substvars
+debian/nexus-dkms/
+obj-*/
