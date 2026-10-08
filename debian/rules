@@ -1,6 +1,38 @@
 #!/usr/bin/make -f
 
 include /usr/share/dpkg/pkg-info.mk
+include /usr/share/dpkg/architecture.mk
+
+# The image installs linux-headers-<flavour of its own kernel> right before
+# this package, so the dependency must name that same flavour. A static OR
+# chain ("linux-headers-rt-amd64 | linux-headers-amd64 | ...") cannot do
+# that: apt resolves the first alternative that is simply available in the
+# repo, which is the RT one, and since 2026-10-08 (testing lane, generic
+# kernel) that resolution demanded packages the raw-image phase cannot
+# fetch -- it installs the debs inside chroot_isolated, a network
+# namespace with no routes at all. The raw phase runs in the deb-cache
+# room only. See packages.sh get_kernel_flavour for the mapping.
+#   amd64, trixie image (RT kernel)       -> linux-headers-rt-amd64
+#   amd64, testing image (generic kernel) -> linux-headers-amd64
+#   arm64  (generic linux-image-arm64)    -> linux-headers-arm64
+# A lane or board whose kernel follows another scheme can override
+# VOS_KERNEL_HEADERS_DEP from the environment.
+ifeq ($(DEB_BUILD_ARCH),amd64)
+  # Same default as packages.sh get_kernel_flavour: a suite the caller did
+  # not set is trixie, the RT lane.
+  NEXUS_SUITE := $(if $(VOS_BASE_SUITE),$(VOS_BASE_SUITE),trixie)
+  ifeq ($(NEXUS_SUITE),trixie)
+    NEXUS_HEADERS := linux-headers-rt-amd64
+  else
+    NEXUS_HEADERS := linux-headers-amd64
+  endif
+else
+  NEXUS_HEADERS := linux-headers-arm64
+endif
+VOS_KERNEL_HEADERS_DEP ?= $(NEXUS_HEADERS)
+
+override_dh_gencontrol:
+	dh_gencontrol -- -Vkernel:headers=$(VOS_KERNEL_HEADERS_DEP)
 
 %:
-		dh $@ --with dkms
+	dh $@ --with dkms
