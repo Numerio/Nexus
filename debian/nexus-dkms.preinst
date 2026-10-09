@@ -1,0 +1,42 @@
+#!/bin/sh
+#
+# Copyright 2026, Dario Casalinuovo. All rights reserved.
+# Distributed under the terms of the MIT License.
+#
+# Preinst interlock: nexus-dkms is DKMS-built against the kernel headers that
+# are installed on the target system. It carries no alternative relationship
+# on a specific linux-headers flavour any more (the flavour depends on the
+# lane/arch and the image phase names it explicitly) — so this script
+# enforces at install time the invariant the old dependency used to encode:
+# at least one linux-headers-* source tree must already be present, and the
+# module can be built against it right after.
+#
+# Invariant holds because the image build installs linux-headers-<flavour of
+# its kernel> immediately before this package; anything skipping that order
+# was an image bug and gets a real error here rather than a resolver fight
+# (see debian/rules for the story: nexus-dkms was depends-poisoning foreign
+# arches through one Architecture: all package).
+
+set -u
+
+headers_dir="/usr/src"
+
+probe_headers() {
+	# Any single linux-headers-<kver>-<arch> tree (Debian style: the meta
+	# packages land headers under /usr/src/linux-headers-<ver>/<build>).
+	find "$headers_dir" -maxdepth 1 -mindepth 1 -type d \
+		-name 'linux-headers-*' -print -quit 2>/dev/null
+}
+
+if [ -z "$(probe_headers)" ]; then
+	echo "nexus-dkms: refusing to install." >&2
+	echo "  no kernel headers found under $headers_dir" >&2
+	echo "  the system must install the linux-headers-* flavour of the kernel" >&2
+	echo "  it runs BEFORE this package: DKMS builds the nexus IPC module" >&2
+	echo "  against that source tree and has nowhere else to look." >&2
+	echo "  (On V\\OS images that install order is enforced by the image" >&2
+	echo "  phase itself; on ordinary hosts: apt install linux-headers-\$(uname -r).)" >&2
+	exit 1
+fi
+
+exit 0

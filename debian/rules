@@ -1,38 +1,31 @@
 #!/usr/bin/make -f
 
 include /usr/share/dpkg/pkg-info.mk
-include /usr/share/dpkg/architecture.mk
 
-# The image installs linux-headers-<flavour of its own kernel> right before
-# this package, so the dependency must name that same flavour. A static OR
-# chain ("linux-headers-rt-amd64 | linux-headers-amd64 | ...") cannot do
-# that: apt resolves the first alternative that is simply available in the
-# repo, which is the RT one, and since 2026-10-08 (testing lane, generic
-# kernel) that resolution demanded packages the raw-image phase cannot
-# fetch -- it installs the debs inside chroot_isolated, a network
-# namespace with no routes at all. The raw phase runs in the deb-cache
-# room only. See packages.sh get_kernel_flavour for the mapping.
+# As of 2026-10-09 the kernel-flavour dependency is NOT declared in
+# debian/control any more. The old ${kernel:headers} substitution baked a
+# per-lane flavour (linux-headers-rt-amd64 / linux-headers-amd64 /
+# linux-headers-arm64) into a package whose Architecture: all — the same suite
+# .deb was reused across lanes with the build lane's own flavour, so every
+# other lane failed apt resolution on it: the first arm64 failure after
+# ae5bfe1 was exactly that (nexus-dkms Depends linux-headers-rt-amd64 in an
+# arm64 chroot).
+#
+# The flavour's job is still done, at the place where it is actually known:
+# the image phase installs linux-headers-<flavour of its own kernel> right
+# before this package, and debian/preinst refuses to install nexus-dkms into
+# a system that did not. The packages.sh flavour mapping (and any
+# VOS_KERNEL_HEADERS_DEP override) is therefore no longer consulted here:
+# whichever flavour the caller names, the check simply looks at what IS
+# installed. A lane that still exports VOS_KERNEL_HEADERS_DEP does no harm;
+# the variable is simply dead here and the old mapping recipe below is only
+# kept to document the flavours the image phase expects to find.
 #   amd64, trixie image (RT kernel)       -> linux-headers-rt-amd64
 #   amd64, testing image (generic kernel) -> linux-headers-amd64
 #   arm64  (generic linux-image-arm64)    -> linux-headers-arm64
-# A lane or board whose kernel follows another scheme can override
-# VOS_KERNEL_HEADERS_DEP from the environment.
-ifeq ($(DEB_BUILD_ARCH),amd64)
-  # Same default as packages.sh get_kernel_flavour: a suite the caller did
-  # not set is trixie, the RT lane.
-  NEXUS_SUITE := $(if $(VOS_BASE_SUITE),$(VOS_BASE_SUITE),trixie)
-  ifeq ($(NEXUS_SUITE),trixie)
-    NEXUS_HEADERS := linux-headers-rt-amd64
-  else
-    NEXUS_HEADERS := linux-headers-amd64
-  endif
-else
-  NEXUS_HEADERS := linux-headers-arm64
-endif
-VOS_KERNEL_HEADERS_DEP ?= $(NEXUS_HEADERS)
 
-override_dh_gencontrol:
-	dh_gencontrol -- -Vkernel:headers=$(VOS_KERNEL_HEADERS_DEP)
+# Deliberately no override_dh_gencontrol: the control file carries no
+# substitution, so plain debhelper rules apply.
 
 %:
 	dh $@ --with dkms
