@@ -211,7 +211,9 @@ static void nexus_thread_exit_work(struct callback_head *head)
  * TIF_NOTIFY_RESUME on every reschedule) and marked live threads exited --
  * wait_for_thread() returning at once with status 0 (Nexus #12). */
 static DEFINE_HASHTABLE(nexus_exit_hash, 8);
-static DEFINE_SPINLOCK(nexus_exit_lock);
+/* raw_spinlock_t: the probe runs with preemption disabled, where on
+ * PREEMPT_RT spinlock_t is a sleeping lock (scheduling while atomic). */
+static DEFINE_RAW_SPINLOCK(nexus_exit_lock);
 static struct tracepoint *nexus_exit_tp;
 
 /* Only the task argument is used; kernels that also pass group_dead call
@@ -228,14 +230,14 @@ static void nexus_exit_probe(void *data, struct task_struct *task)
 	if (hlist_empty(&nexus_exit_hash[hash_min(pid, HASH_BITS(nexus_exit_hash))]))
 		return;
 
-	spin_lock(&nexus_exit_lock);
+	raw_spin_lock(&nexus_exit_lock);
 	hash_for_each_possible_safe(nexus_exit_hash, thread, tmp, exit_node, pid) {
 		if (thread->exit_pid != pid)
 			continue;
 		hash_del(&thread->exit_node);
 		WARN_ON_ONCE(task_work_add(task, &thread->exit_work, TWA_NONE));
 	}
-	spin_unlock(&nexus_exit_lock);
+	raw_spin_unlock(&nexus_exit_lock);
 }
 
 static void nexus_find_exit_tp(struct tracepoint *tp, void *priv)
@@ -263,9 +265,9 @@ static bool nexus_thread_arm_exit_hook(struct nexus_thread *thread,
 	kref_get(&thread->ref_count);
 	init_task_work(&thread->exit_work, nexus_thread_exit_work);
 
-	spin_lock(&nexus_exit_lock);
+	raw_spin_lock(&nexus_exit_lock);
 	hash_add(nexus_exit_hash, &thread->exit_node, thread->exit_pid);
-	spin_unlock(&nexus_exit_lock);
+	raw_spin_unlock(&nexus_exit_lock);
 
 	/* If the task started exiting meanwhile the probe may already have
 	 * run; whoever unhashes the record owns it. */
@@ -273,12 +275,12 @@ static bool nexus_thread_arm_exit_hook(struct nexus_thread *thread,
 	if (!(READ_ONCE(task->flags) & PF_EXITING))
 		return true;
 
-	spin_lock(&nexus_exit_lock);
+	raw_spin_lock(&nexus_exit_lock);
 	if (hash_hashed(&thread->exit_node)) {
 		hash_del(&thread->exit_node);
 		reclaimed = true;
 	}
-	spin_unlock(&nexus_exit_lock);
+	raw_spin_unlock(&nexus_exit_lock);
 
 	if (!reclaimed)
 		return true;
