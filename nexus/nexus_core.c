@@ -1286,11 +1286,8 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		}
 
 		case NEXUS_THREAD_CLONE_EXECUTED:
-			/* A load_image child, before exec: park until the
-			 * creator's resume_thread(). Only threads registered
-			 * as spawn/load_image children park; an arbitrary
-			 * running thread that issues this ioctl would sleep
-			 * forever with nobody to resume it. */
+			/* Only spawn/load_image children park until resume_thread();
+			 * any other caller would sleep forever. */
 			if (!thread->thread_resumed && !thread->spawn_pending) {
 				ret = B_BAD_THREAD_ID;
 				break;
@@ -1403,10 +1400,8 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				break;
 			}
 
-			/* A child process gets its own team, pre-created so that a
-			 * resume_thread() before its first open() is not lost.
-			 * The pre-created main thread is marked spawn_pending so
-			 * CLONE_EXECUTED still parks load_image children. */
+			/* Pre-create the child team so an early resume_thread() is
+			 * not lost; its main thread is spawn_pending. */
 			if (!same_mm) {
 				put_task_struct(child_task);
 				ret = nexus_precreate_child_team((pid_t)child_tid);
