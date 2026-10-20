@@ -1286,11 +1286,15 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		}
 
 		case NEXUS_THREAD_CLONE_EXECUTED:
-			/* Only spawn/load_image children park until resume_thread();
-			 * any other caller would sleep forever. */
+			/* Only load_image children call this, as their team's main
+			 * thread. One can get here before its creator's REGISTER (one
+			 * CPU), so it marks itself pending like a spawned thread. */
 			if (!thread->thread_resumed && !thread->spawn_pending) {
-				ret = B_BAD_THREAD_ID;
-				break;
+				if (current->pid != current->tgid) {
+					ret = B_BAD_THREAD_ID;
+					break;
+				}
+				thread->spawn_pending = true;
 			}
 			if (!thread->thread_resumed) {
 				int wret;
