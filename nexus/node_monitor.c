@@ -732,11 +732,17 @@ static int32_t nm_child_vref_mint(struct nexus_mark *mark,
 	struct inode *inode, const char *name)
 {
 	struct vfsmount *mnt;
+	struct dentry *alias = NULL;
 	int32_t id = -1;
 	unsigned int nofs;
 
 	if (!name || !name[0])
 		return -1;
+
+	if (!ev_dentry && inode && inode->i_sb->s_dev == mark->device) {
+		alias = d_find_alias(inode);
+		ev_dentry = alias;
+	}
 
 	/* GFP_NOFS across the create: we may be on the fsnotify callback with
 	 * the originating syscall's inode lock held, so reclaim must not
@@ -754,6 +760,7 @@ static int32_t nm_child_vref_mint(struct nexus_mark *mark,
 	}
 
 	memalloc_nofs_restore(nofs);
+	dput(alias);
 	return id;
 }
 
