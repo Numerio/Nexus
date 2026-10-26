@@ -284,7 +284,7 @@ nexus_vref_create(struct nexus_vref_create __user *uarg)
 	if (copy_from_user(&k, uarg, sizeof(k)))
 		return -EFAULT;
 
-	file = fget(k.fd);
+	file = fget_raw(k.fd);
 	if (!file)
 		return -EBADF;
 
@@ -416,7 +416,9 @@ nexus_vref_open(struct nexus_vref_open __user *uarg)
 	/* dentry_open takes open(2) flags; passing READ|WRITE fmode bits
 	 * reads as an invalid access mode and the fd fails every I/O. */
 	file = dentry_open(&path,
-		(open_mode & FMODE_READ) && (open_mode & FMODE_WRITE) ? O_RDWR
+		d_is_symlink(path.dentry)
+			|| !(open_mode & (FMODE_READ | FMODE_WRITE)) ? O_PATH | O_NOFOLLOW
+			: (open_mode & FMODE_READ) && (open_mode & FMODE_WRITE) ? O_RDWR
 			: (open_mode & FMODE_WRITE) ? O_WRONLY : O_RDONLY,
 		current_cred());
 
