@@ -240,14 +240,14 @@ static int nexus_acquire_sem(sem_id id, int32_t count, uint32_t flags,
 	if (flags & B_ABSOLUTE_TIMEOUT) {
 		has_deadline = true;
 		deadline_ns = (uint64_t)timeout * 1000ULL;
-		if (ktime_get_ns() >= deadline_ns) {
+		if (ktime_get_boottime_ns() >= deadline_ns) {
 			ret = B_TIMED_OUT;
 			goto out_unlock;
 		}
 	} else if ((flags & B_RELATIVE_TIMEOUT) && timeout > 0 &&
 			timeout != B_INFINITE_TIMEOUT) {
 		has_deadline = true;
-		deadline_ns = ktime_get_ns() + (uint64_t)timeout * 1000ULL;
+		deadline_ns = ktime_get_boottime_ns() + (uint64_t)timeout * 1000ULL;
 	}
 
 	waiter.task = current;
@@ -271,7 +271,9 @@ static int nexus_acquire_sem(sem_id id, int32_t count, uint32_t flags,
 		spin_unlock_irqrestore(&sem->lock, iflags);
 
 		if (has_deadline) {
-			ktime_t deadline = ns_to_ktime((int64_t)deadline_ns);
+			u64 now_ns = ktime_get_boottime_ns();
+			ktime_t deadline = ktime_add_ns(ktime_get(),
+				deadline_ns > now_ns ? deadline_ns - now_ns : 0);
 			schedule_hrtimeout_range(&deadline, 0, HRTIMER_MODE_ABS);
 		} else {
 			schedule();
@@ -297,7 +299,7 @@ static int nexus_acquire_sem(sem_id id, int32_t count, uint32_t flags,
 			break;
 		}
 
-		if (has_deadline && ktime_get_ns() >= deadline_ns) {
+		if (has_deadline && ktime_get_boottime_ns() >= deadline_ns) {
 			ret = B_TIMED_OUT;
 			break;
 		}

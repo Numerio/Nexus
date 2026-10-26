@@ -931,7 +931,7 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 					if (user_data.flags & B_ABSOLUTE_TIMEOUT)
 						deadline_ns = (u64)user_data.timeout * 1000ULL;
 					else
-						deadline_ns = ktime_get_ns() +
+						deadline_ns = ktime_get_boottime_ns() +
 							(u64)user_data.timeout * 1000ULL;
 				}
 
@@ -947,7 +947,7 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				kref_get(&self->ref_count);
 				mutex_unlock(&nexus_main_lock);
 				if (has_deadline) {
-					u64 now = ktime_get_ns();
+					u64 now = ktime_get_boottime_ns();
 
 					/* down_timeout() takes relative jiffies. */
 					if (now >= deadline_ns)
@@ -983,7 +983,7 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				}
 				mutex_unlock(&nexus_main_lock);
 				if (has_deadline) {
-					u64 now = ktime_get_ns();
+					u64 now = ktime_get_boottime_ns();
 
 					/* Relative, and interruptible so the freezer
 					 * can still stop us. */

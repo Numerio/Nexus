@@ -8,7 +8,7 @@
 
 static inline bigtime_t system_time(void)
 {
-	return ktime_to_us(ktime_get());
+	return ktime_to_us(ktime_get_boottime());
 }
 
 static long calculate_timeout(bigtime_t timeout, uint32_t flags)
