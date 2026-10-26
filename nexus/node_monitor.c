@@ -863,6 +863,20 @@ static int32_t nm_mark_take_child_vref(struct nexus_mark *mark,
 	return id;
 }
 
+/* Take the cached child vref; for an entry that predates the watch nothing
+ * was cached, so mint an uncached one from the live event path. Either way
+ * the caller owns one kernel reference. */
+static int32_t nm_mark_take_or_mint_child_vref(struct nexus_mark *mark,
+	struct dentry *ev_dentry, struct vfsmount *ev_mnt,
+	struct inode *inode, const char *name)
+{
+	int32_t id = nm_mark_take_child_vref(mark, name);
+
+	if (id < 0)
+		id = nm_child_vref_mint(mark, ev_dentry, ev_mnt, inode, name);
+	return id;
+}
+
 static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 	const void *data, int data_type, struct inode *dir,
 	const struct qstr *file_name, uint32_t cookie,
@@ -1099,7 +1113,8 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 				 * removal message lacking it. */
 				if (!del_child_taken) {
 					del_child_vref_id =
-						nm_mark_take_child_vref(mark, name);
+						nm_mark_take_or_mint_child_vref(mark,
+							ev_dentry, ev_mnt, inode, name);
 					del_child_taken = true;
 				}
 				child_vref_id = del_child_vref_id;
@@ -1485,8 +1500,9 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 
 					if (!pdel_child_taken) {
 						pdel_child_vref_id =
-							nm_mark_take_child_vref(
-								parent_mark, name);
+							nm_mark_take_or_mint_child_vref(
+								parent_mark, ev_dentry,
+								ev_mnt, inode, name);
 						pdel_child_taken = true;
 					}
 					cvref = pdel_child_vref_id;
