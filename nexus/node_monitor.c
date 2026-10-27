@@ -996,8 +996,10 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 		mark = get_nexus_mark(fs_mark);
 		node_vref_id = mark->vref_id;
 
-		if (dir && mark->inode == dir->i_ino &&
-		    mark->device == device)
+		bool mark_is_dir = dir && mark->inode == dir->i_ino &&
+			mark->device == device;
+
+		if (mark_is_dir)
 			parent_in_iter = true;
 
 		nm_dbg_lock("nexus_handle_event: acquiring mark->lock\n");
@@ -1140,7 +1142,10 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 				queue_notification(&msg, port, token);
 			}
 
-			if ((mask & FS_MOVED_FROM)
+			/* The moved entry's own mark sees the move too, with
+			 * the parent as dir: only the directory's mark has
+			 * the right from/to directory. */
+			if ((mask & FS_MOVED_FROM) && mark_is_dir
 				&& (lflags & (B_WATCH_NAME | B_WATCH_DIRECTORY | B_WATCH_CHILDREN))) {
 				struct pending_move *pm;
 				unsigned long mflags;
@@ -1189,7 +1194,7 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 							+ 1);
 			}
 
-			if ((mask & FS_MOVED_TO)
+			if ((mask & FS_MOVED_TO) && mark_is_dir
 				&& (lflags & (B_WATCH_NAME | B_WATCH_DIRECTORY | B_WATCH_CHILDREN))) {
 				char buf[KMSG_BUFFER_SIZE];
 				struct kmsg_builder msg;
