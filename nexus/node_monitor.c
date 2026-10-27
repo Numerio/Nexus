@@ -884,6 +884,94 @@ static int32_t nm_mark_take_or_mint_child_vref(struct nexus_mark *mark,
 	return id;
 }
 
+struct nm_new_name {
+	char name[NAME_MAX + 1];
+};
+
+static bool nm_dir_has_mark(dev_t device, ino_t ino)
+{
+	struct nexus_mark *m;
+	bool found = false;
+	unsigned long flags;
+
+	spin_lock_irqsave(&marks_hash_lock, flags);
+	hlist_for_each_entry(m, &marks_hash[hash_dev_ino(device, ino)],
+			hash_node) {
+		if (m->device == device && m->inode == ino) {
+			found = true;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&marks_hash_lock, flags);
+	return found;
+}
+
+/* MOVED_FROM runs after the rename, so the child's dentry already sits in
+ * the destination. When that directory has no mark no MOVED_TO will ever
+ * reach us: return its vref and the new name so the move can be completed
+ * now. Returns -1 when the destination is watched or unknown. */
+static int32_t nm_move_unwatched_dest(struct nexus_mark *mark,
+	struct dentry *ev_dentry, struct vfsmount *ev_mnt,
+	struct inode *inode, struct nm_new_name *nn)
+{
+	struct dentry *alias = NULL, *child = ev_dentry, *pd;
+	struct vfsmount *mnt = ev_mnt ? ev_mnt : mark->mnt;
+	int32_t id = -1;
+	unsigned int nofs;
+
+	if (!child && inode && inode->i_sb->s_dev == mark->device) {
+		alias = d_find_alias(inode);
+		child = alias;
+	}
+	if (!child || !mnt)
+		goto out;
+
+	pd = dget_parent(child);
+	if (d_inode(pd) && d_inode(pd)->i_ino != mark->inode
+	    && pd->d_sb->s_dev == mark->device
+	    && !nm_dir_has_mark(mark->device, d_inode(pd)->i_ino)) {
+		struct path p = { .mnt = mnt, .dentry = pd };
+
+		nofs = memalloc_nofs_save();
+		id = nexus_vref_create_from_path(&p, NM_CHILD_VREF_MODE);
+		memalloc_nofs_restore(nofs);
+		if (id >= 0) {
+			spin_lock(&child->d_lock);
+			strscpy(nn->name, child->d_name.name, sizeof(nn->name));
+			spin_unlock(&child->d_lock);
+		}
+	}
+	dput(pd);
+out:
+	dput(alias);
+	return id;
+}
+
+static noinline void nm_queue_move_out(dev_t device, int32_t from_dir,
+	const char *from_name, int32_t to_dir, const char *to_name,
+	int32_t child, port_id port, uint32_t token)
+{
+	char buf[KMSG_BUFFER_SIZE];
+	struct kmsg_builder msg;
+	int64_t sentinel = (int64_t)nexus_volume_sentinel_dev();
+
+	kmsg_init(&msg, buf, sizeof(buf), B_NODE_MONITOR);
+	kmsg_add_int32(&msg, "opcode", B_ENTRY_MOVED);
+	kmsg_add_uint64(&msg, "device", (uint64_t)device);
+	kmsg_add_int64(&msg, "node device", (int64_t)device);
+	if (from_dir >= 0)
+		kmsg_add_entryref(&msg, "virtual:from directory", sentinel,
+			(int64_t)from_dir, from_name);
+	kmsg_add_entryref(&msg, "virtual:to directory", sentinel,
+		(int64_t)to_dir, to_name);
+	if (child >= 0)
+		kmsg_add_noderef(&msg, "virtual:node", sentinel,
+			(int64_t)child);
+	kmsg_add_string(&msg, "name", to_name);
+	kmsg_add_string(&msg, "from name", from_name);
+	queue_notification(&msg, port, token);
+}
+
 static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 	const void *data, int data_type, struct inode *dir,
 	const struct qstr *file_name, uint32_t cookie,
@@ -987,6 +1075,10 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 		 * its listeners; see the FS_DELETE branch below. */
 		int32_t del_child_vref_id = -1;
 		bool del_child_taken = false;
+		/* Vref of an unwatched move destination, one per mark. */
+		int32_t mv_dest_vref_id = -1;
+		bool mv_dest_tried = false;
+		struct nm_new_name *mv_new = NULL;
 
 		fs_mark = iter_info->marks[type];
 		if (!fs_mark)
@@ -1171,6 +1263,30 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 				 * references it by id). */
 				move_child_vref = nm_mark_get_or_mint_child_vref(
 					mark, ev_dentry, ev_mnt, inode, name);
+
+				if (!mv_dest_tried) {
+					mv_dest_tried = true;
+					mv_new = kmalloc(sizeof(*mv_new),
+						GFP_KERNEL);
+					if (mv_new) {
+						mv_dest_vref_id =
+							nm_move_unwatched_dest(
+								mark, ev_dentry,
+								ev_mnt, inode,
+								mv_new);
+						if (mv_dest_vref_id < 0) {
+							kfree(mv_new);
+							mv_new = NULL;
+						}
+					}
+				}
+				if (mv_dest_vref_id >= 0) {
+					nm_queue_move_out(device, old_dir_vref,
+						name, mv_dest_vref_id,
+						mv_new->name, move_child_vref,
+						port, token);
+					continue;
+				}
 
 				spin_lock_irqsave(&move_lock, mflags);
 				cleanup_expired_moves();
@@ -1411,6 +1527,9 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 		 * queue_notification() by now, so the cache's can go. */
 		if (del_child_taken && del_child_vref_id >= 0)
 			nexus_vref_drop_kernel_ref(del_child_vref_id);
+		if (mv_dest_vref_id >= 0)
+			nexus_vref_drop_kernel_ref(mv_dest_vref_id);
+		kfree(mv_new);
 
 		kfree(snap);
 		snap = NULL;
