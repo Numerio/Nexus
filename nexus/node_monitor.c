@@ -2039,6 +2039,41 @@ static int nexus_start_watching(struct nexus_watch_fd __user *exchange)
 				| FS_CREATE);
 			if (!IS_ERR(pmark)) {
 				struct nexus_listener *existing = NULL, *l;
+
+				/* A mark made only for the tag-along has no
+				 * identity of its own: without a vref and a
+				 * mount its events carry no directory or node. */
+				if (!pmark->mnt) {
+					struct vfsmount *pmnt =
+						mntget(file->f_path.mnt);
+
+					spin_lock_irqsave(&pmark->lock, flags);
+					if (!pmark->mnt) {
+						pmark->mnt = pmnt;
+						pmnt = NULL;
+					}
+					spin_unlock_irqrestore(&pmark->lock,
+						flags);
+					if (pmnt)
+						mntput(pmnt);
+				}
+				if (pmark->vref_id < 0) {
+					struct path pp = {
+						.mnt = file->f_path.mnt,
+						.dentry = pdent };
+					int32_t pv = nexus_vref_create_from_path(
+						&pp, NM_CHILD_VREF_MODE);
+
+					spin_lock_irqsave(&pmark->lock, flags);
+					if (pmark->vref_id < 0 && pv >= 0) {
+						pmark->vref_id = pv;
+						pv = -1;
+					}
+					spin_unlock_irqrestore(&pmark->lock,
+						flags);
+					if (pv >= 0)
+						nexus_vref_drop_kernel_ref(pv);
+				}
 				struct nexus_listener *tagalong = NULL;
 				unsigned long pflags;
 
