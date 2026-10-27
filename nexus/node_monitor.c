@@ -1266,6 +1266,10 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 	int32_t move_to_dir_vref_id = -1;
 	int32_t move_child_vref_id = -1;
 	char move_old_name[NAME_MAX + 1] = "";
+	/* {port, token} pairs already given the move by a destination mark;
+	 * the source fan-out skips them. */
+	struct { port_id port; uint32_t token; } moved_served[32];
+	int moved_served_n = 0;
 	if (mask & FS_MOVED_TO) {
 		struct pending_move *pm;
 		unsigned long mflags;
@@ -1661,6 +1665,11 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 					move_to_dir_vref_id = to_dir_vref_id;
 				if (move_child_vref_id < 0)
 					move_child_vref_id = child_vref_id;
+				if (moved_served_n < ARRAY_SIZE(moved_served)) {
+					moved_served[moved_served_n].port = port;
+					moved_served[moved_served_n].token = token;
+					moved_served_n++;
+				}
 
 				kmsg_init(&msg, buf, sizeof(buf), B_NODE_MONITOR);
 				kmsg_add_int32(&msg, "opcode", B_ENTRY_MOVED);
@@ -2071,7 +2080,7 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 	}
 	if (move_old_mark) {
 		struct listener_snapshot *ssnap = NULL;
-		int scount = 0, si;
+		int scount = 0, si, k;
 		struct nexus_listener *l;
 		unsigned long sflags;
 
@@ -2108,6 +2117,13 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 						| B_WATCH_CHILDREN))) {
 				continue;
 			}
+
+			for (k = 0; k < moved_served_n; k++)
+				if (moved_served[k].port == ssnap[si].port
+				    && moved_served[k].token == ssnap[si].token)
+					break;
+			if (k < moved_served_n)
+				continue;
 
 			kmsg_init(&msg, buf, sizeof(buf), B_NODE_MONITOR);
 			kmsg_add_int32(&msg, "opcode", B_ENTRY_MOVED);
