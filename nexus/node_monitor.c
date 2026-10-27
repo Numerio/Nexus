@@ -1277,7 +1277,10 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 			 * filter on FS_CLOSE_WRITE + the parent-walk dispatch
 			 * removal + the FS_MODIFY INTERIM gate; FS_ATTRIB alone
 			 * doesn't loop because handlers re-stat (no event). */
-			if ((mask & FS_ATTRIB) && (lflags & B_WATCH_STAT)) {
+			/* Unlink's nlink drop raises FS_ATTRIB too; the entry is
+			 * going away, so it is no stat change. */
+			if ((mask & FS_ATTRIB) && (lflags & B_WATCH_STAT)
+			    && inode->i_nlink != 0) {
 				char buf[KMSG_BUFFER_SIZE];
 				struct kmsg_builder msg;
 				int32_t target_vref =
