@@ -955,6 +955,7 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 		return 0;
 
 	bool parent_in_iter = false;
+	bool old_mark_in_iter = false;
 
 	struct nexus_mark *move_old_mark = NULL;
 	int32_t move_from_dir_vref_id = -1;
@@ -1001,6 +1002,8 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 
 		if (mark_is_dir)
 			parent_in_iter = true;
+		if (move_old_mark && fs_mark == &move_old_mark->fs_mark)
+			old_mark_in_iter = true;
 
 		nm_dbg_lock("nexus_handle_event: acquiring mark->lock\n");
 
@@ -1620,6 +1623,11 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 	 * same full from+to B_ENTRY_MOVED out to the SOURCE mark's listeners.
 	 * The source mark isn't in iter_info on this call (fsnotify_move
 	 * splits the event), so we use the refcount we took in MOVED_FROM. */
+	if (move_old_mark && old_mark_in_iter) {
+		/* Its listeners already got the move in the loop above. */
+		fsnotify_put_mark(&move_old_mark->fs_mark);
+		move_old_mark = NULL;
+	}
 	if (move_old_mark) {
 		struct listener_snapshot *ssnap = NULL;
 		int scount = 0, si;
