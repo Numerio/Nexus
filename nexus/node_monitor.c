@@ -238,6 +238,7 @@ struct nm_stat_snap {
 	kuid_t           uid;
 	kgid_t           gid;
 	loff_t           size;
+	unsigned int     nlink;
 	struct timespec64 atime, mtime, ctime;
 };
 
@@ -288,6 +289,7 @@ static void nm_stat_read(struct inode *inode, struct nm_stat_snap *m)
 	m->uid = inode->i_uid;
 	m->gid = inode->i_gid;
 	m->size = i_size_read(inode);
+	m->nlink = inode->i_nlink;
 	m->atime = inode_get_atime(inode);
 	m->mtime = inode_get_mtime(inode);
 	m->ctime = inode_get_ctime(inode);
@@ -1406,9 +1408,12 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 					if (!timespec64_equal(&cur.mtime,
 							&mark->snap.mtime))
 						f |= B_STAT_MODIFICATION_TIME;
-					/* ctime alone is a link-count or xattr
-					 * change, no stat change. */
-					if (f)
+					/* Only a link-count change (unlink, hard
+					 * link) is no stat change. Any other
+					 * FS_ATTRIB is a setattr or xattr write,
+					 * reported even when coarse timestamps
+					 * left nothing visibly different. */
+					if (f || cur.nlink == mark->snap.nlink)
 						f |= B_STAT_CHANGE_TIME;
 					stat_fields = f;
 					stat_send = f != 0;
