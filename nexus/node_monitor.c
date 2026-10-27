@@ -244,6 +244,9 @@ struct nexus_mark {
 	struct hlist_node hash_node;    // protected by marks_hash_lock
 
 	int32_t          vref_id;       // -1 if unminted
+	/* A tag-along already reported this file's unlink; FS_DELETE_SELF
+	 * stays for removals the parent never sees, like a rename over it. */
+	bool             unlink_reported;
 	/* Full path of the watched node, captured at start_watching. Fallback
 	 * source for child paths (node_path + "/" + name) when an fsnotify
 	 * event carries no dentry. NULL if unavailable. */
@@ -900,6 +903,20 @@ static int32_t nm_inode_mark_vref(dev_t device, ino_t ino)
 	return id;
 }
 
+static void nm_mark_unlink_reported(dev_t device, ino_t ino)
+{
+	struct nexus_mark *m;
+	unsigned long flags;
+
+	spin_lock_irqsave(&marks_hash_lock, flags);
+	hlist_for_each_entry(m, &marks_hash[hash_dev_ino(device, ino)],
+			hash_node) {
+		if (m->device == device && m->inode == ino)
+			WRITE_ONCE(m->unlink_reported, true);
+	}
+	spin_unlock_irqrestore(&marks_hash_lock, flags);
+}
+
 /* Take the cached child vref; for an entry that predates the watch nothing
  * was cached, so mint an uncached one from the live event path. Either way
  * the caller owns one kernel reference. */
@@ -1271,6 +1288,10 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 				if (name && name[0])
 					kmsg_add_string(&msg, "name", name);
 				queue_notification(&msg, port, token);
+				if (snap[i].is_tagalong)
+					nm_mark_unlink_reported(
+						snap[i].tagalong_dev,
+						snap[i].tagalong_ino);
 			}
 
 			/* The moved entry's own mark sees the move too, with
@@ -1527,9 +1548,9 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 			// when the file disappears; previously only
 			// B_WATCH_DIRECTORY parent watchers got DELETE
 			// notifications about their children.
-			// Files are reported through FS_DELETE on the parent.
 			if ((mask & FS_DELETE_SELF) && (lflags & B_WATCH_NAME)
-			    && S_ISDIR(inode->i_mode)) {
+			    && (S_ISDIR(inode->i_mode)
+				|| !READ_ONCE(mark->unlink_reported))) {
 				char buf[KMSG_BUFFER_SIZE];
 				struct kmsg_builder msg;
 				int32_t target_vref =
