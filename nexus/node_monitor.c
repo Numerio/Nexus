@@ -232,6 +232,15 @@ struct nm_child_vref {
 	int32_t          vref_id;
 };
 
+struct nm_stat_snap {
+	bool             valid;
+	umode_t          mode;
+	kuid_t           uid;
+	kgid_t           gid;
+	loff_t           size;
+	struct timespec64 atime, mtime, ctime;
+};
+
 struct nexus_mark {
 	struct fsnotify_mark fs_mark;
 	dev_t device;
@@ -267,7 +276,22 @@ struct nexus_mark {
 	 * opens (e.g. BNode O_RDWR for attr access with no data write).
 	 * Guarded by mark->lock. */
 	bool             write_dirty;
+
+	/* Last-seen stat of the watched inode, diffed on FS_ATTRIB to build
+	 * the legacy B_STAT_CHANGED field mask. Guarded by mark->lock. */
+	struct nm_stat_snap snap;
 };
+
+static void nm_stat_read(struct inode *inode, struct nm_stat_snap *m)
+{
+	m->mode = inode->i_mode;
+	m->uid = inode->i_uid;
+	m->gid = inode->i_gid;
+	m->size = i_size_read(inode);
+	m->atime = inode_get_atime(inode);
+	m->mtime = inode_get_mtime(inode);
+	m->ctime = inode_get_ctime(inode);
+}
 
 struct pending_move {
 	struct list_head list;
@@ -1339,6 +1363,58 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 		spin_unlock_irqrestore(&mark->lock, flags);
 		snap_count = i;
 
+		/* FS_ATTRIB on the watched inode: diff its stat against the
+		 * mark snapshot. The inode lock is taken before mark->lock,
+		 * never under it; without it the fixed mask stays. */
+		bool stat_send = inode->i_nlink != 0;
+		uint32_t stat_fields = B_STAT_MODE | B_STAT_UID | B_STAT_GID |
+			B_STAT_CHANGE_TIME;
+		if ((mask & FS_ATTRIB) && mark->inode == ino &&
+		    mark->device == device) {
+			struct nm_stat_snap cur;
+			bool have = false, unlock = false;
+
+			if (inode_is_locked(inode)) {
+				have = true;
+			} else if (inode_trylock_shared(inode)) {
+				have = unlock = true;
+			}
+			if (have) {
+				nm_stat_read(inode, &cur);
+				if (unlock)
+					inode_unlock_shared(inode);
+
+				spin_lock_irqsave(&mark->lock, flags);
+				if (mark->snap.valid) {
+					uint32_t f = 0;
+
+					if (cur.mode != mark->snap.mode)
+						f |= B_STAT_MODE;
+					if (!uid_eq(cur.uid, mark->snap.uid))
+						f |= B_STAT_UID;
+					if (!gid_eq(cur.gid, mark->snap.gid))
+						f |= B_STAT_GID;
+					if (cur.size != mark->snap.size)
+						f |= B_STAT_SIZE;
+					if (!timespec64_equal(&cur.atime,
+							&mark->snap.atime))
+						f |= B_STAT_ACCESS_TIME;
+					if (!timespec64_equal(&cur.mtime,
+							&mark->snap.mtime))
+						f |= B_STAT_MODIFICATION_TIME;
+					/* ctime alone is a link-count or xattr
+					 * change, no stat change. */
+					if (f)
+						f |= B_STAT_CHANGE_TIME;
+					stat_fields = f;
+					stat_send = f != 0;
+				}
+				mark->snap = cur;
+				mark->snap.valid = true;
+				spin_unlock_irqrestore(&mark->lock, flags);
+			}
+		}
+
 		/* A rename over a watched file reports the replaced node
 		 * removed; its own FS_DELETE_SELF never comes while the watch
 		 * pins it. */
@@ -1650,7 +1726,7 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 			/* Unlink's nlink drop raises FS_ATTRIB too; the entry is
 			 * going away, so it is no stat change. */
 			if ((mask & FS_ATTRIB) && (lflags & B_WATCH_STAT)
-			    && inode->i_nlink != 0) {
+			    && stat_send) {
 				char buf[KMSG_BUFFER_SIZE];
 				struct kmsg_builder msg;
 				int32_t target_vref =
@@ -1663,8 +1739,7 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 					kmsg_add_noderef(&msg, "virtual:node",
 						sentinel, (int64_t)target_vref);
 				kmsg_add_int32(&msg, "fields",
-					B_STAT_MODE | B_STAT_UID | B_STAT_GID |
-					B_STAT_CHANGE_TIME);
+					(int32_t)stat_fields);
 				queue_notification(&msg, port, token);
 			}
 
@@ -2370,6 +2445,15 @@ static int nexus_start_watching(struct nexus_watch_fd __user *exchange)
 			mark->node_path ? mark->node_path : "(none)",
 			(unsigned long)inode->i_ino);
 	}
+
+	inode_lock_shared(inode);
+	spin_lock_irqsave(&mark->lock, flags);
+	if (!mark->snap.valid) {
+		nm_stat_read(inode, &mark->snap);
+		mark->snap.valid = true;
+	}
+	spin_unlock_irqrestore(&mark->lock, flags);
+	inode_unlock_shared(inode);
 
 	spin_lock_irqsave(&mark->lock, flags);
 	list_add(&listener->list, &mark->listeners);
