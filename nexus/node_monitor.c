@@ -247,6 +247,9 @@ struct nexus_mark {
 	/* A tag-along already reported this file's unlink; FS_DELETE_SELF
 	 * stays for removals the parent never sees, like a rename over it. */
 	bool             unlink_reported;
+	/* Inode whose cross-directory move FS_RENAME already reported; the
+	 * following FS_MOVED_TO for it is consumed without emitting. Under lock. */
+	ino_t            rename_ino;
 	/* Full path of the watched node, captured at start_watching. Fallback
 	 * source for child paths (node_path + "/" + name) when an fsnotify
 	 * event carries no dentry. NULL if unavailable. */
@@ -1045,6 +1048,116 @@ static noinline void nm_queue_move_out(dev_t device, int32_t from_dir,
 	queue_notification(&msg, port, token);
 }
 
+/* A move out of an unwatched directory reaches the destination mark as
+ * FS_MOVED_TO alone, which cannot name the old directory. FS_RENAME is
+ * delivered to the moved dentry's new parent too, carrying the old dir and
+ * name, so the complete B_ENTRY_MOVED is built here and the MOVED_TO that
+ * follows is suppressed (mark->rename_ino). Both dirs watched: the cookie
+ * pairing handles it and this does nothing. */
+static void nm_handle_rename(struct fsnotify_group *group,
+	struct dentry *moved, struct inode *old_dir, const char *old_name,
+	struct fsnotify_iter_info *iter_info)
+{
+	int type;
+
+	if (!moved || !old_dir || !old_name || !old_name[0])
+		return;
+
+	for (type = 0; type < FSNOTIFY_ITER_TYPE_COUNT; type++) {
+		struct fsnotify_mark *fs_mark = iter_info->marks[type];
+		struct nexus_mark *mark;
+		struct dentry *newp, *alias;
+		struct inode *minode;
+		struct listener_snapshot *snap;
+		struct nexus_listener *l;
+		char new_name[NAME_MAX + 1];
+		int32_t from_vref = -1, child_vref;
+		int count = 0, i;
+		unsigned long flags;
+		unsigned int nofs;
+		bool is_new_parent;
+
+		if (!fs_mark || fs_mark->group != group)
+			continue;
+		mark = get_nexus_mark(fs_mark);
+
+		newp = dget_parent(moved);
+		minode = d_inode(moved);
+		is_new_parent = d_inode(newp)
+			&& d_inode(newp)->i_ino == mark->inode
+			&& newp->d_sb->s_dev == mark->device;
+		dput(newp);
+
+		nm_dbg("FS_RENAME mark_ino=%lu iter_type=%d dir_ino=%lu "
+			"old_name='%s' new_parent=%d\n",
+			(unsigned long)mark->inode, type,
+			(unsigned long)old_dir->i_ino, old_name,
+			is_new_parent);
+
+		if (!is_new_parent || !minode || !mark->mnt
+		    || mark->vref_id < 0
+		    || old_dir->i_ino == mark->inode
+		    || old_dir->i_sb->s_dev != mark->device
+		    || nm_dir_has_mark(mark->device, old_dir->i_ino))
+			continue;
+
+		spin_lock(&moved->d_lock);
+		strscpy(new_name, moved->d_name.name, sizeof(new_name));
+		spin_unlock(&moved->d_lock);
+
+		/* Vref from the old dir's live path; sleeps, no locks held. */
+		alias = d_find_alias(old_dir);
+		if (!alias)
+			continue;
+		if (alias->d_sb == mark->mnt->mnt_sb) {
+			struct path p = { .mnt = mark->mnt, .dentry = alias };
+
+			nofs = memalloc_nofs_save();
+			from_vref = nexus_vref_create_from_path(&p,
+				NM_CHILD_VREF_MODE);
+			memalloc_nofs_restore(nofs);
+		}
+		dput(alias);
+		if (from_vref < 0)
+			continue;
+
+		child_vref = nm_mark_get_or_mint_child_vref(mark, moved, NULL,
+			minode, new_name);
+
+		spin_lock_irqsave(&mark->lock, flags);
+		list_for_each_entry(l, &mark->listeners, list)
+			count++;
+		snap = count ? kmalloc_array(count, sizeof(*snap),
+			GFP_ATOMIC) : NULL;
+		if (snap) {
+			i = 0;
+			list_for_each_entry(l, &mark->listeners, list)
+				listener_snap_copy(&snap[i++], l);
+			mark->rename_ino = minode->i_ino;
+		}
+		spin_unlock_irqrestore(&mark->lock, flags);
+
+		if (snap) {
+			for (i = 0; i < count; i++) {
+				if (snap[i].is_tagalong
+				    && (snap[i].tagalong_dev != minode->i_sb->s_dev
+					|| snap[i].tagalong_ino != minode->i_ino))
+					continue;
+				if (!(snap[i].flags & (B_WATCH_NAME
+						| B_WATCH_DIRECTORY
+						| B_WATCH_CHILDREN)))
+					continue;
+				nm_queue_move_out(mark->device, from_vref,
+					old_name, mark->vref_id, new_name,
+					child_vref, snap[i].port,
+					snap[i].token);
+			}
+			kfree(snap);
+		}
+		nexus_vref_drop_kernel_ref(from_vref);
+	}
+}
+
 static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 	const void *data, int data_type, struct inode *dir,
 	const struct qstr *file_name, uint32_t cookie,
@@ -1114,6 +1227,12 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 
 	if (!mask)
 		return 0;
+
+	if (mask & FS_RENAME) {
+		if (data_type == FSNOTIFY_EVENT_DENTRY)
+			nm_handle_rename(group, ev_dentry, dir, name, iter_info);
+		return 0;
+	}
 
 	bool parent_in_iter = false;
 	bool old_mark_in_iter = false;
@@ -1205,6 +1324,11 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 		 * filter, every attr access on a B_WATCH_STAT'd file
 		 * produces a self-talk STAT notification. */
 		bool close_write_emit = false;
+		bool rename_served = false;
+		if ((mask & FS_MOVED_TO) && mark->rename_ino == ino) {
+			mark->rename_ino = 0;
+			rename_served = true;
+		}
 		if (mask & FS_MODIFY)
 			mark->write_dirty = true;
 		if ((mask & FS_CLOSE_WRITE) && mark->write_dirty) {
@@ -1440,7 +1564,7 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 							+ 1);
 			}
 
-			if ((mask & FS_MOVED_TO) && mark_is_dir
+			if ((mask & FS_MOVED_TO) && mark_is_dir && !rename_served
 				&& (lflags & (B_WATCH_NAME | B_WATCH_DIRECTORY | B_WATCH_CHILDREN))) {
 				char buf[KMSG_BUFFER_SIZE];
 				struct kmsg_builder msg;
@@ -2021,7 +2145,7 @@ static struct nexus_mark *find_or_create_mark(struct inode *inode,
 	if (mark->is_dir)
 		mark->fs_mark.mask = initial_mask
 			| FS_CREATE | FS_DELETE
-			| FS_MOVED_FROM | FS_MOVED_TO
+			| FS_MOVED_FROM | FS_MOVED_TO | FS_RENAME
 			| FS_MOVE_SELF | FS_DELETE_SELF
 			| FS_MODIFY | FS_ATTRIB | FS_CLOSE_WRITE;
 	else
