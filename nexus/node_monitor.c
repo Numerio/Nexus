@@ -493,7 +493,7 @@ static struct pending_move *find_pending_move(uint32_t cookie)
 }
 
 /* Dispatch from-only B_ENTRY_MOVED when FS_MOVED_TO never arrived.
- * Caller must hold move_lock. */
+ * Caller must not hold move_lock: queue_notification may sleep. */
 static void dispatch_pending_move_from_only(struct pending_move *pm)
 {
 	struct nexus_mark *mark = pm->old_mark;
@@ -565,39 +565,45 @@ static void dispatch_pending_move_from_only(struct pending_move *pm)
 	kfree(snap);
 }
 
-/* Caller must hold move_lock. */
-static void cleanup_expired_moves(void)
+/* Caller must hold move_lock. Expired entries move to @expired, to be
+ * dispatched by flush_expired_moves() once move_lock is dropped. */
+static void cleanup_expired_moves(struct list_head *expired)
 {
 	struct pending_move *pm, *tmp;
 	unsigned long now = jiffies;
-	int count = 0;
 
 	list_for_each_entry_safe(pm, tmp, &pending_moves, list) {
 		if (time_after(now, pm->expires)) {
 			nm_dbg("cleanup_expired_moves: expiring cookie=%u\n", pm->cookie);
-			dispatch_pending_move_from_only(pm);
-			if (pm->old_mark) {
-				fsnotify_put_mark(&pm->old_mark->fs_mark);
-				pm->old_mark = NULL;
-			}
-			list_del(&pm->list);
-			kfree(pm);
-			count++;
+			list_move(&pm->list, expired);
 		}
 	}
-	if (count > 0)
-		nm_dbg("cleanup_expired_moves: cleaned %d entries\n", count);
+}
+
+static void flush_expired_moves(struct list_head *expired)
+{
+	struct pending_move *pm, *tmp;
+
+	list_for_each_entry_safe(pm, tmp, expired, list) {
+		dispatch_pending_move_from_only(pm);
+		if (pm->old_mark)
+			fsnotify_put_mark(&pm->old_mark->fs_mark);
+		list_del(&pm->list);
+		kfree(pm);
+	}
 }
 
 static void pending_move_flush_work_fn(struct work_struct *work)
 {
 	unsigned long flags;
 	bool more;
+	LIST_HEAD(expired);
 
 	spin_lock_irqsave(&move_lock, flags);
-	cleanup_expired_moves();
+	cleanup_expired_moves(&expired);
 	more = !list_empty(&pending_moves);
 	spin_unlock_irqrestore(&move_lock, flags);
+	flush_expired_moves(&expired);
 
 	/* If there are still un-expired pending_moves, re-arm so they get
 	 * flushed once their deadline passes.  Each one carries its own
@@ -1251,6 +1257,7 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 				int32_t old_dir_vref = -1;
 				int32_t move_child_vref;
 				bool armed = false;
+				LIST_HEAD(expired);
 				/* nm_dir_vref_for_event returns mark->vref_id
 				 * (not a freshly-minted ref), so we never drop
 				 * it here — the mark owns its lifetime. */
@@ -1289,7 +1296,7 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 				}
 
 				spin_lock_irqsave(&move_lock, mflags);
-				cleanup_expired_moves();
+				cleanup_expired_moves(&expired);
 
 				if (cookie && !find_pending_move(cookie)) {
 					pm = kmalloc(sizeof(*pm), GFP_ATOMIC);
@@ -1309,6 +1316,7 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 					}
 				}
 				spin_unlock_irqrestore(&move_lock, mflags);
+				flush_expired_moves(&expired);
 
 				if (armed)
 					schedule_delayed_work(
