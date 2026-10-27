@@ -908,9 +908,8 @@ static int32_t nm_mark_take_child_vref(struct nexus_mark *mark,
 	return id;
 }
 
-/* Take the cached child vref for name only if it pins a different inode than
- * the one just moved onto it (a rename replaced that node). Hands back its
- * kernel reference and the victim's identity, or -1. */
+/* Cached child vref, only if it pins a different inode than the one moved
+ * onto it (the replaced node). Returns its reference and identity, or -1. */
 static int32_t nm_mark_take_child_vref_if_other(struct nexus_mark *mark,
 	const char *name, struct inode *inode, dev_t *vdev, ino_t *vino)
 {
@@ -932,9 +931,7 @@ static int32_t nm_mark_take_child_vref_if_other(struct nexus_mark *mark,
 	return taken;
 }
 
-/* An unlinked child has only a negative dentry left, so nothing can be
- * minted from it. If the child is itself watched, hand out its own mark's
- * vref with a new kernel reference. */
+/* Unlinked child: nothing to mint; use its own mark's vref if watched. */
 static int32_t nm_inode_mark_vref(dev_t device, ino_t ino)
 {
 	struct nexus_mark *m;
@@ -970,9 +967,8 @@ static void nm_mark_unlink_reported(dev_t device, ino_t ino)
 	spin_unlock_irqrestore(&marks_hash_lock, flags);
 }
 
-/* Take the cached child vref; for an entry that predates the watch nothing
- * was cached, so mint an uncached one from the live event path. Either way
- * the caller owns one kernel reference. */
+/* Cached child vref, or one minted from the live event path if the entry
+ * predates the watch. The caller owns one reference. */
 static int32_t nm_mark_take_or_mint_child_vref(struct nexus_mark *mark,
 	struct dentry *ev_dentry, struct vfsmount *ev_mnt,
 	struct inode *inode, const char *name)
@@ -1008,10 +1004,9 @@ static bool nm_dir_has_mark(dev_t device, ino_t ino)
 	return found;
 }
 
-/* MOVED_FROM runs after the rename, so the child's dentry already sits in
- * the destination. When that directory has no mark no MOVED_TO will ever
- * reach us: return its vref and the new name so the move can be completed
- * now. Returns -1 when the destination is watched or unknown. */
+/* MOVED_FROM runs after the rename. If the destination has no mark no
+ * MOVED_TO will come: return its vref and new name to complete the move
+ * now, or -1 when it is watched or unknown. */
 static int32_t nm_move_unwatched_dest(struct nexus_mark *mark,
 	struct dentry *ev_dentry, struct vfsmount *ev_mnt,
 	struct inode *inode, struct nm_new_name *nn)
@@ -1074,12 +1069,9 @@ static noinline void nm_queue_move_out(dev_t device, int32_t from_dir,
 	queue_notification(&msg, port, token);
 }
 
-/* A move out of an unwatched directory reaches the destination mark as
- * FS_MOVED_TO alone, which cannot name the old directory. FS_RENAME is
- * delivered to the moved dentry's new parent too, carrying the old dir and
- * name, so the complete B_ENTRY_MOVED is built here and the MOVED_TO that
- * follows is suppressed (mark->rename_ino). Both dirs watched: the cookie
- * pairing handles it and this does nothing. */
+/* A move from an unwatched dir reaches the destination as FS_MOVED_TO,
+ * which cannot name the old dir. FS_RENAME carries it, so build the full
+ * B_ENTRY_MOVED here and suppress the MOVED_TO (mark->rename_ino). */
 static void nm_handle_rename(struct fsnotify_group *group,
 	struct dentry *moved, struct inode *old_dir, const char *old_name,
 	struct fsnotify_iter_info *iter_info)
@@ -1408,11 +1400,9 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 					if (!timespec64_equal(&cur.mtime,
 							&mark->snap.mtime))
 						f |= B_STAT_MODIFICATION_TIME;
-					/* Only a link-count change (unlink, hard
-					 * link) is no stat change. Any other
-					 * FS_ATTRIB is a setattr or xattr write,
-					 * reported even when coarse timestamps
-					 * left nothing visibly different. */
+					/* Only a link-count change is no stat change;
+					 * other FS_ATTRIB is reported even if the
+					 * stat looks identical (coarse timestamps). */
 					if (f || cur.nlink == mark->snap.nlink)
 						f |= B_STAT_CHANGE_TIME;
 					stat_fields = f;
@@ -1523,9 +1513,8 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 				queue_notification(&msg, port, token);
 			}
 
-			/* A tag-along watcher of the file itself learns of the
-			 * unlink here: FS_DELETE_SELF only comes at eviction,
-			 * after the last reference is gone. */
+			/* FS_DELETE_SELF only comes at eviction, so tell a
+			 * tag-along watcher of the file now. */
 			if ((mask & FS_DELETE) && (snap[i].is_tagalong
 			    || (lflags & (B_WATCH_DIRECTORY | B_WATCH_CHILDREN)))) {
 				char buf[KMSG_BUFFER_SIZE];
@@ -1571,9 +1560,7 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 						snap[i].tagalong_ino);
 			}
 
-			/* The moved entry's own mark sees the move too, with
-			 * the parent as dir: only the directory's mark has
-			 * the right from/to directory. */
+			/* Only the directory's mark has the right from/to dirs. */
 			if ((mask & FS_MOVED_FROM) && mark_is_dir
 				&& (lflags & (B_WATCH_NAME | B_WATCH_DIRECTORY | B_WATCH_CHILDREN))) {
 				struct pending_move *pm;
@@ -1737,8 +1724,7 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 			 * filter on FS_CLOSE_WRITE + the parent-walk dispatch
 			 * removal + the FS_MODIFY INTERIM gate; FS_ATTRIB alone
 			 * doesn't loop because handlers re-stat (no event). */
-			/* Unlink's nlink drop raises FS_ATTRIB too; the entry is
-			 * going away, so it is no stat change. */
+			/* Unlink's nlink drop is not a stat change. */
 			if ((mask & FS_ATTRIB) && (lflags & B_WATCH_STAT)
 			    && stat_send) {
 				char buf[KMSG_BUFFER_SIZE];
@@ -2516,9 +2502,8 @@ static int nexus_start_watching(struct nexus_watch_fd __user *exchange)
 			if (!IS_ERR(pmark)) {
 				struct nexus_listener *existing = NULL, *l;
 
-				/* A mark made only for the tag-along has no
-				 * identity of its own: without a vref and a
-				 * mount its events carry no directory or node. */
+				/* A tag-along-only mark has no identity: no vref
+				 * and mount means no dir or node in events. */
 				if (!pmark->mnt) {
 					struct vfsmount *pmnt =
 						mntget(file->f_path.mnt);
