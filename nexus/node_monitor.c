@@ -1102,7 +1102,11 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 				queue_notification(&msg, port, token);
 			}
 
-			if ((mask & FS_DELETE) && (lflags & (B_WATCH_DIRECTORY | B_WATCH_CHILDREN))) {
+			/* A tag-along watcher of the file itself learns of the
+			 * unlink here: FS_DELETE_SELF only comes at eviction,
+			 * after the last reference is gone. */
+			if ((mask & FS_DELETE) && (snap[i].is_tagalong
+			    || (lflags & (B_WATCH_DIRECTORY | B_WATCH_CHILDREN)))) {
 				char buf[KMSG_BUFFER_SIZE];
 				struct kmsg_builder msg;
 				int32_t child_vref_id;
@@ -1370,7 +1374,9 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 			// when the file disappears; previously only
 			// B_WATCH_DIRECTORY parent watchers got DELETE
 			// notifications about their children.
-			if ((mask & FS_DELETE_SELF) && (lflags & B_WATCH_NAME)) {
+			// Files are reported through FS_DELETE on the parent.
+			if ((mask & FS_DELETE_SELF) && (lflags & B_WATCH_NAME)
+			    && S_ISDIR(inode->i_mode)) {
 				char buf[KMSG_BUFFER_SIZE];
 				struct kmsg_builder msg;
 				int32_t target_vref =
