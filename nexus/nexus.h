@@ -83,6 +83,10 @@ struct nexus_vref_op {
 };
 
 
+/* requested_mode: identity-only open (O_PATH), allowed on gone nodes. */
+#define NEXUS_VREF_OPEN_PATH	0x80000000u
+
+
 struct nexus_vref_open {
 	vref_id		id;
 	vref_key	key;

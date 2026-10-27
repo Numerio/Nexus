@@ -2361,6 +2361,11 @@ static int nexus_start_watching(struct nexus_watch_fd __user *exchange)
 		return -EBADF;
 	}
 
+	if (d_unlinked(file->f_path.dentry)) {
+		fput(file);
+		return -ENOENT;
+	}
+
 	inode = file_inode(file);
 	if (!inode) {
 		nm_err("nexus_start_watching: no inode for fd=%d\n", req.fd);

@@ -377,9 +377,13 @@ nexus_vref_open(struct nexus_vref_open __user *uarg)
 	struct path path = { .mnt = NULL, .dentry = NULL };
 	fmode_t open_mode = 0;
 	bool held_kref = false;
+	bool path_only;
 
 	if (copy_from_user(&k, uarg, sizeof(k)))
 		return -EFAULT;
+
+	path_only = (k.requested_mode & NEXUS_VREF_OPEN_PATH) != 0;
+	k.requested_mode &= ~NEXUS_VREF_OPEN_PATH;
 
 	mutex_lock(&fd_map_lock);
 	entry = find_entry_locked(k.id);
@@ -395,10 +399,15 @@ nexus_vref_open(struct nexus_vref_open __user *uarg)
 		open_mode = k.requested_mode == 0
 			? slot->allowed_mode
 			: ((fmode_t)k.requested_mode & slot->allowed_mode);
-		ret = open_mode == 0 ? -EACCES : B_OK;
+		ret = (open_mode == 0 && !path_only) ? -EACCES : B_OK;
 		break;
 	}
 	mutex_unlock(&entry->slots_lock);
+
+	/* A gone node (unlinked dentry) keeps its identity but is not
+	 * readable or writable. */
+	if (ret == B_OK && !path_only && d_unlinked(entry->path.dentry))
+		ret = B_ENTRY_NOT_FOUND;
 
 	if (ret == B_OK) {
 		/* Pin the held path; kref keeps entry alive for the open, which
@@ -416,7 +425,7 @@ nexus_vref_open(struct nexus_vref_open __user *uarg)
 	/* dentry_open takes open(2) flags; passing READ|WRITE fmode bits
 	 * reads as an invalid access mode and the fd fails every I/O. */
 	file = dentry_open(&path,
-		d_is_symlink(path.dentry)
+		path_only || d_is_symlink(path.dentry)
 			|| !(open_mode & (FMODE_READ | FMODE_WRITE)) ? O_PATH | O_NOFOLLOW
 			: (open_mode & FMODE_READ) && (open_mode & FMODE_WRITE) ? O_RDWR
 			: (open_mode & FMODE_WRITE) ? O_WRONLY : O_RDONLY,
@@ -424,6 +433,12 @@ nexus_vref_open(struct nexus_vref_open __user *uarg)
 
 	if (IS_ERR(file)) {
 		ret = B_NOT_ALLOWED;
+		goto out;
+	}
+	/* Unlinked between the check and the open. */
+	if (!path_only && d_unlinked(file->f_path.dentry)) {
+		fput(file);
+		ret = B_ENTRY_NOT_FOUND;
 		goto out;
 	}
 	fd = get_unused_fd_flags(O_CLOEXEC);
