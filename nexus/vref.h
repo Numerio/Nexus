@@ -20,6 +20,7 @@ void     nexus_vref_drop_kernel_ref(int32_t id);
 /* Bump kref on id; true if found. Use to extend lifetime past the original
  * holder (e.g., a queued notification's embedded id until delivery). */
 bool     nexus_vref_acquire_kernel_ref(int32_t id);
+int      nexus_vref_pinned_inode(int32_t id, dev_t *dev, ino_t *ino);
 
 struct nexus_vref;
 struct nexus_vref *nexus_vref_kref_acquire(int32_t id);

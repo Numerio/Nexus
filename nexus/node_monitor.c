@@ -879,6 +879,30 @@ static int32_t nm_mark_take_child_vref(struct nexus_mark *mark,
 	return id;
 }
 
+/* Take the cached child vref for name only if it pins a different inode than
+ * the one just moved onto it (a rename replaced that node). Hands back its
+ * kernel reference and the victim's identity, or -1. */
+static int32_t nm_mark_take_child_vref_if_other(struct nexus_mark *mark,
+	const char *name, struct inode *inode, dev_t *vdev, ino_t *vino)
+{
+	int32_t id, taken;
+
+	id = nm_mark_lookup_child_vref(mark, name);
+	if (id < 0 || !inode)
+		return -1;
+	if (!nexus_vref_pinned_inode(id, vdev, vino))
+		return -1;
+	if (*vdev == inode->i_sb->s_dev && *vino == inode->i_ino)
+		return -1;
+	taken = nm_mark_take_child_vref(mark, name);
+	if (taken != id) {
+		if (taken >= 0)
+			nexus_vref_drop_kernel_ref(taken);
+		return -1;
+	}
+	return taken;
+}
+
 /* An unlinked child has only a negative dentry left, so nothing can be
  * minted from it. If the child is itself watched, hand out its own mark's
  * vref with a new kernel reference. */
@@ -1190,6 +1214,50 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 
 		spin_unlock_irqrestore(&mark->lock, flags);
 		snap_count = i;
+
+		/* A rename over a watched file reports the replaced node
+		 * removed; its own FS_DELETE_SELF never comes while the watch
+		 * pins it. */
+		if ((mask & FS_MOVED_TO) && mark_is_dir && name && name[0]) {
+			dev_t vdev = 0;
+			ino_t vino = 0;
+			int32_t victim = nm_mark_take_child_vref_if_other(mark,
+				name, inode, &vdev, &vino);
+
+			if (victim >= 0) {
+				if (!dir_vref_tried && dir) {
+					dir_vref_id = nm_dir_vref_for_event(mark, dir);
+					dir_vref_tried = true;
+				}
+				for (i = 0; i < snap_count; i++) {
+					char buf[KMSG_BUFFER_SIZE];
+					struct kmsg_builder msg;
+
+					if (snap[i].is_tagalong) {
+						if (snap[i].tagalong_dev != vdev
+						    || snap[i].tagalong_ino != vino)
+							continue;
+					} else if (!(snap[i].flags & (B_WATCH_DIRECTORY
+							| B_WATCH_CHILDREN)))
+						continue;
+
+					kmsg_init(&msg, buf, sizeof(buf), B_NODE_MONITOR);
+					kmsg_add_int32(&msg, "opcode", B_ENTRY_REMOVED);
+					kmsg_add_uint64(&msg, "device", (uint64_t)device);
+					if (dir_vref_id >= 0)
+						kmsg_add_entryref(&msg, "virtual:directory",
+							sentinel, (int64_t)dir_vref_id, name);
+					kmsg_add_noderef(&msg, "virtual:node",
+						sentinel, (int64_t)victim);
+					kmsg_add_string(&msg, "name", name);
+					queue_notification(&msg, snap[i].port,
+						snap[i].token);
+					if (snap[i].is_tagalong)
+						nm_mark_unlink_reported(vdev, vino);
+				}
+				nexus_vref_drop_kernel_ref(victim);
+			}
+		}
 
 		for (i = 0; i < snap_count; i++) {
 			port_id port = snap[i].port;
@@ -2293,6 +2361,20 @@ static int nexus_start_watching(struct nexus_watch_fd __user *exchange)
 						&pmark->listeners);
 					spin_unlock_irqrestore(&pmark->lock,
 						pflags);
+
+					/* Seed the child cache so a rename
+					 * over this file finds its vref. */
+					{
+						char cname[NAME_MAX + 1];
+
+						spin_lock(&fdent->d_lock);
+						strscpy(cname, fdent->d_name.name,
+							sizeof(cname));
+						spin_unlock(&fdent->d_lock);
+						nm_mark_get_or_mint_child_vref(pmark,
+							fdent, file->f_path.mnt,
+							inode, cname);
+					}
 
 					/* Suppress the degraded FS_MOVE_SELF
 					 * emit on the file's own mark for

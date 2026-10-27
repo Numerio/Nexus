@@ -565,6 +565,27 @@ nexus_vref_drop_kernel_ref(int32_t id)
 }
 
 
+/* Pinned inode of a vref: 0 when unknown, 1 with dev and ino filled. */
+int
+nexus_vref_pinned_inode(int32_t id, dev_t *dev, ino_t *ino)
+{
+	struct nexus_vref *entry;
+	int ret = 0;
+
+	mutex_lock(&fd_map_lock);
+	entry = find_entry_locked(id);
+	if (entry != NULL && entry->path.dentry
+			&& d_inode(entry->path.dentry)) {
+		*dev = d_inode(entry->path.dentry)->i_sb->s_dev;
+		*ino = d_inode(entry->path.dentry)->i_ino;
+		ret = 1;
+	}
+	mutex_unlock(&fd_map_lock);
+	return ret;
+}
+EXPORT_SYMBOL(nexus_vref_pinned_inode);
+
+
 bool
 nexus_vref_acquire_kernel_ref(int32_t id)
 {
