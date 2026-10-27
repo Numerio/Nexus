@@ -876,6 +876,30 @@ static int32_t nm_mark_take_child_vref(struct nexus_mark *mark,
 	return id;
 }
 
+/* An unlinked child has only a negative dentry left, so nothing can be
+ * minted from it. If the child is itself watched, hand out its own mark's
+ * vref with a new kernel reference. */
+static int32_t nm_inode_mark_vref(dev_t device, ino_t ino)
+{
+	struct nexus_mark *m;
+	int32_t id = -1;
+	unsigned long flags;
+
+	spin_lock_irqsave(&marks_hash_lock, flags);
+	hlist_for_each_entry(m, &marks_hash[hash_dev_ino(device, ino)],
+			hash_node) {
+		if (m->device == device && m->inode == ino) {
+			id = m->vref_id;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&marks_hash_lock, flags);
+
+	if (id >= 0 && !nexus_vref_acquire_kernel_ref(id))
+		id = -1;
+	return id;
+}
+
 /* Take the cached child vref; for an entry that predates the watch nothing
  * was cached, so mint an uncached one from the live event path. Either way
  * the caller owns one kernel reference. */
@@ -887,6 +911,8 @@ static int32_t nm_mark_take_or_mint_child_vref(struct nexus_mark *mark,
 
 	if (id < 0)
 		id = nm_child_vref_mint(mark, ev_dentry, ev_mnt, inode, name);
+	if (id < 0 && inode)
+		id = nm_inode_mark_vref(inode->i_sb->s_dev, inode->i_ino);
 	return id;
 }
 
