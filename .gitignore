@@ -6,3 +6,12 @@ debian/*.debhelper
 debian/*.substvars
 debian/nexus-dkms/
 obj-*/
+nexus/*.o
+nexus/*.ko
+nexus/*.mod
+nexus/*.mod.c
+nexus/*.cmd
+nexus/.*.cmd
+nexus/Module.symvers
+nexus/modules.order
+nexus/build/
