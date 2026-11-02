@@ -96,8 +96,7 @@ struct nexus_event {
 
 	uint64_t	device;
 	uint64_t	inode;
-	// TODO: rename parent_dir_inode
-	uint64_t 	dir_inode;
+	uint64_t	parent_dir_inode;
 
 	// Correlate move_from/move_to
 	uint64_t	cookie;

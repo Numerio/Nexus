@@ -49,12 +49,50 @@ enum {
 #define B_CLONEABLE_AREA	0x100
 
 
+/*
+ * Locking
+ *
+ * Order, outermost first. A lock may only be taken while holding locks
+ * listed above it, never the reverse:
+ *
+ *   1. nexus_main_lock   team lifecycle only: open/release, first-contact
+ *                        thread resolution, pre-created child teams, exit
+ *                        hash teardown. Protects team->open_count.
+ *   2. team->lock        the team's thread and port rb-trees, every
+ *                        thread record in them, team->main_thread and
+ *                        team->dead. When two are needed they are taken in
+ *                        ascending team id (nexus_lock_two_teams()).
+ *   3. port->lock        queue, counts, is_open, deleted, and the port's
+ *                        team membership. Membership changes also need the
+ *                        owning team lock(s).
+ *   4. table spinlocks   leaves, never nested and never held across
+ *                        anything else: port id table, team table, thread
+ *                        index. The exit hash lock is a raw_spinlock_t
+ *                        taken from the sched_process_exit probe and from
+ *                        nothing that sleeps.
+ *
+ * Nothing sleeps under a spinlock. Every wait drops its object lock,
+ * sleeps on a kref-held object, then retakes the lock and revalidates the
+ * object (deleted, closed, exited, retired) before touching it.
+ * The exit probe takes only the raw exit hash lock.
+ */
+
 struct nexus_thread;
 
 struct nexus_team {
 	struct hlist_node		node;
 	team_id					id;
+	/* open_count: /dev/nexus fds, guarded by nexus_main_lock.
+	 * ref_count: lifetime ref, table lookups and thread records; the
+	 * object is freed when it hits zero. */
 	int						open_count;
+	struct kref				ref_count;
+
+	/* See the lock order above. Never taken in atomic context; waits
+	 * drop it before sleeping. */
+	struct mutex			lock;
+	/* Set under lock once teardown started: nothing new may be linked. */
+	bool					dead;
 
 	struct rb_root			threads;
 	struct rb_root			ports;
@@ -68,6 +106,10 @@ struct nexus_thread {
 	struct callback_head	exit_work;
 
 	thread_id				id;
+
+	/* Fixed at creation, valid until the record is freed: the record
+	 * holds a ref on it. Lock this team to touch the record. */
+	struct nexus_team*		home;
 
 	/* Incarnation stamp: bumped from a global counter at every record
 	 * creation, so two records that ever shared one tid carry different
@@ -86,8 +128,8 @@ struct nexus_thread {
 	bool					has_return_code;
 
 	bool					exit_hook_installed;
-	/* Pending-exit table link and the pid it waits on; see
-	 * nexus_thread_arm_exit_hook(). */
+	/* Pending-exit table link (guarded by the raw exit hash lock) and the
+	 * pid it waits on; see nexus_thread_arm_exit_hook(). */
 	struct hlist_node		exit_node;
 	pid_t					exit_pid;
 
@@ -111,6 +153,8 @@ struct nexus_thread {
 	int32_t					exit_status;
 
 
+	/* Membership: the team whose tree holds the record, NULL once
+	 * retired. Changes under home->lock. */
 	struct nexus_team*		team;
 };
 
@@ -146,6 +190,8 @@ struct nexus_port {
 	uint32_t				capacity;
 
 	bool					is_open;
+	/* Unpublished by PORT_DELETE: waiters must give up. */
+	bool					deleted;
 
 	struct list_head		queue;
 	wait_queue_head_t		buffer_read;
@@ -154,9 +200,14 @@ struct nexus_port {
 	int32_t					read_count;
 	int32_t					total_count;
 
-	rwlock_t				rw_lock;
+	/* Guards queue, counts, is_open, deleted and team membership.
+	 * Dropped around every wait. */
+	struct mutex			lock;
 
 	struct nexus_team*		team;
+	/* Owner team id mirrored for atomic readers, -1 when unlinked.
+	 * Written under team->lock and lock, read with READ_ONCE. */
+	pid_t					team_id;
 };
 
 struct nexus_sem_waiter {
@@ -254,13 +305,16 @@ void					nexus_sem_team_exit(pid_t team);
 long					nexus_sem_ioctl(unsigned int cmd, unsigned long arg);
 
 
-struct nexus_team*		nexus_team_init(void);
-void					nexus_team_destroy(struct nexus_team *team);
+/* Returns a referenced team; pair with nexus_team_put(). */
 struct nexus_team*		nexus_find_team(int32_t id);
+void					nexus_team_put(struct nexus_team *team);
+void					nexus_lock_two_teams(struct nexus_team *a, struct nexus_team *b);
+void					nexus_unlock_two_teams(struct nexus_team *a, struct nexus_team *b);
 
-struct nexus_thread*	nexus_thread_init(struct nexus_team *team, pid_t thread, const char *name);
-void 					nexus_thread_destroy(struct kref* ref);
-
+/* Returns a referenced port; pair with nexus_port_put(). */
+struct nexus_port*		nexus_port_lookup(port_id id);
+void					nexus_port_put(struct nexus_port *port);
+void					nexus_port_team_teardown(struct nexus_team *team);
 long					nexus_port_find(unsigned long arg);
 long					nexus_port_create(struct nexus_team* team, unsigned long arg);
 long					nexus_get_next_port_for_team(unsigned long arg);
@@ -289,9 +343,13 @@ long					nexus_port_io_message_info(struct nexus_team *team, unsigned long arg);
 long					nexus_port_io_set_owner(struct nexus_team *team, unsigned long arg);
 long					nexus_port_io_write_caps(struct nexus_team *team, unsigned long arg);
 long					nexus_port_io_read_caps(struct nexus_team *team, unsigned long arg);
+long					nexus_port_dispatch(struct nexus_team *team, unsigned int cmd,
+							unsigned long arg);
 pid_t					nexus_port_team_of(uint32_t id);
 pid_t					nexus_port_team_of_locked(uint32_t id);
 uint64_t				nexus_core_dev(void);
+int						nexus_port_proc_init(void);
+void					nexus_port_proc_exit(void);
 
 void					nexus_sem_delete(struct kref* ref);
 

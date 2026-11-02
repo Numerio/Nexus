@@ -97,6 +97,7 @@ static long nexus_area_create(struct nexus_area_create __user *arg)
 	struct nexus_area_create create;
 	struct nexus_area *area;
 	struct file *file;
+	int id;
 
 	if (copy_from_user(&create, arg, sizeof(create)))
 		return -EFAULT;
@@ -112,15 +113,15 @@ static long nexus_area_create(struct nexus_area_create __user *arg)
 		goto out_copy;
 	}
 
-	int id = nexus_area_id_alloc();
+	/* Allocate the object and id before taking area_lock so the lock is
+	 * not held across sleeping helpers. */
+	id = nexus_area_id_alloc();
 	if (id < 0) {
 		fput(file);
 		kfree(area);
 		create.ret = B_NO_MEMORY;
 		goto out_copy;
 	}
-
-	mutex_lock(&area_lock);
 
 	kref_init(&area->ref_count);
 	area->id = id;
@@ -131,8 +132,8 @@ static long nexus_area_create(struct nexus_area_create __user *arg)
 	area->protection = create.protection;
 	area->team = current->tgid;
 
+	mutex_lock(&area_lock);
 	hash_add(area_hashmap, &area->node, area->id);
-
 	mutex_unlock(&area_lock);
 
 	pr_debug("nexus_area: created area %d '%s' size=%llu\n",
@@ -152,11 +153,18 @@ static long nexus_area_clone(struct nexus_area_clone __user *arg)
 {
 	struct nexus_area_clone clone;
 	struct nexus_area *source, *area;
+	struct file *source_file;
+	size_t source_size;
+	int32_t source_lock;
 	int fd;
+	int id;
+	int source_id;
 
 	if (copy_from_user(&clone, arg, sizeof(clone)))
 		return -EFAULT;
 
+	/* Hold area_lock only long enough to pin the source file and copy
+	 * its fields. */
 	mutex_lock(&area_lock);
 
 	source = find_area_by_id(clone.source);
@@ -173,9 +181,15 @@ static long nexus_area_clone(struct nexus_area_clone __user *arg)
 		goto out_copy;
 	}
 
+	source_file = get_file(source->file);
+	source_size = source->size;
+	source_lock = source->lock;
+	source_id = source->id;
+	mutex_unlock(&area_lock);
+
 	area = kzalloc(sizeof(*area), GFP_KERNEL);
 	if (!area) {
-		mutex_unlock(&area_lock);
+		fput(source_file);
 		clone.ret = B_NO_MEMORY;
 		goto out_copy;
 	}
@@ -183,32 +197,28 @@ static long nexus_area_clone(struct nexus_area_clone __user *arg)
 	fd = get_unused_fd_flags(O_RDWR | O_CLOEXEC);
 	if (fd < 0) {
 		kfree(area);
-		mutex_unlock(&area_lock);
+		fput(source_file);
 		clone.ret = B_NO_MEMORY;
 		goto out_copy;
 	}
 
-	int id = nexus_area_id_alloc();
+	id = nexus_area_id_alloc();
 	if (id < 0) {
 		put_unused_fd(fd);
 		kfree(area);
-		mutex_unlock(&area_lock);
+		fput(source_file);
 		clone.ret = B_NO_MEMORY;
 		goto out_copy;
 	}
+
 	kref_init(&area->ref_count);
 	area->id = id;
 	strscpy(area->name, clone.name, B_OS_NAME_LENGTH);
-	area->file = get_file(source->file);
-	area->size = source->size;
-	area->lock = source->lock;
+	area->file = source_file;
+	area->size = source_size;
+	area->lock = source_lock;
 	area->protection = clone.protection;
 	area->team = current->tgid;
-
-	int source_id = source->id;
-	size_t source_size = source->size;
-
-	mutex_unlock(&area_lock);
 
 	pr_debug("nexus_area: cloned area %d from %d\n", area->id, source_id);
 
@@ -219,7 +229,7 @@ static long nexus_area_clone(struct nexus_area_clone __user *arg)
 
 	if (copy_to_user(arg, &clone, sizeof(clone))) {
 		put_unused_fd(fd);
-		fput(area->file);
+		/* Drops the file reference taken for the area. */
 		kref_put(&area->ref_count, nexus_area_destroy);
 		return -EFAULT;
 	}
@@ -228,7 +238,7 @@ static long nexus_area_clone(struct nexus_area_clone __user *arg)
 	hash_add(area_hashmap, &area->node, area->id);
 	mutex_unlock(&area_lock);
 
-	fd_install(fd, get_file(source->file));
+	fd_install(fd, get_file(source_file));
 	return 0;
 
 out_copy:

@@ -302,6 +302,10 @@ struct pending_move {
 	int32_t child_vref_id;     // child's vref, minted at MOVED_FROM; mark owns it
 	struct nexus_mark *old_mark; // refcount-held; used to dispatch to source listeners
 	dev_t old_device;
+	/* Child identity captured at MOVED_FROM so tag-along listeners on
+	 * the source mark can be filtered on timed-out moves. */
+	dev_t child_device;
+	ino_t child_ino;
 	unsigned long expires;
 	char old_name[NAME_MAX + 1];
 };
@@ -464,9 +468,9 @@ listener_snap_copy(struct listener_snapshot *s,
 }
 
 /* Synchronous send used by the attr path
- * (nexus_nm_notify_xattr -> notify_attr_changed).  The in_atomic() guard in
- * nexus_nm_notify_xattr keeps us out of contexts where a blocking port write
- * would be illegal. */
+ * (nexus_nm_notify_xattr -> notify_attr_changed).  Atomic callers of
+ * nexus_nm_notify_xattr are deferred to the dispatch workqueue, so a
+ * blocking port write is never issued from atomic context. */
 static void send_to_listener(struct nexus_listener *listener,
 	struct kmsg_builder *msg)
 {
@@ -561,17 +565,14 @@ static void dispatch_pending_move_from_only(struct pending_move *pm)
 		char buf[KMSG_BUFFER_SIZE];
 		struct kmsg_builder msg;
 
-		/* TODO: tag-along listeners on this source mark may receive
-		 * an unrelated B_ENTRY_MOVED here (timed-out MOVED_FROM with
-		 * no matching MOVED_TO — file moved out of any watched
-		 * scope). pending_move doesn't carry the child's (dev, ino),
-		 * so we can't filter against tagalong_ino. Cheap fix later:
-		 * store child dev+ino on pending_move at MOVED_FROM time. */
+		/* Tag-along listeners on this source mark only apply when the
+		 * timed-out move was for their child; pending_move carries the
+		 * child's (dev, ino). */
 		if (snap[i].is_tagalong) {
-			/* Skip tagalongs for now (better to under-deliver
-			 * than mislabel a B_ENTRY_MOVED for a different
-			 * child). */
-			continue;
+			if (pm->child_ino == 0
+			    || snap[i].tagalong_dev != pm->child_device
+			    || snap[i].tagalong_ino != pm->child_ino)
+				continue;
 		}
 		if (!(lflags & (B_WATCH_NAME | B_WATCH_DIRECTORY
 				| B_WATCH_CHILDREN)))
@@ -1617,6 +1618,10 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 						pm->child_vref_id = move_child_vref;
 						pm->old_mark = mark;
 						pm->old_device = device;
+						pm->child_device = inode
+							? inode->i_sb->s_dev : 0;
+						pm->child_ino = inode
+							? inode->i_ino : 0;
 						refcount_inc(&mark->fs_mark.refcnt);
 						pm->expires = jiffies +
 							msecs_to_jiffies(MOVE_TIMEOUT_MS);
@@ -2950,6 +2955,22 @@ uint64_t nexus_node_monitor_dev(void)
  * produces exactly one B_ATTR_CHANGED.
  * ===================================================================== */
 
+struct deferred_xattr {
+	struct work_struct work;
+	struct inode *inode;
+	char name[XATTR_NAME_MAX];
+	int cause;
+};
+
+static void deferred_xattr_work_fn(struct work_struct *w)
+{
+	struct deferred_xattr *dx = container_of(w, struct deferred_xattr, work);
+
+	nexus_nm_notify_xattr(dx->inode, dx->name, dx->cause);
+	iput(dx->inode);
+	kfree(dx);
+}
+
 void nexus_nm_notify_xattr(struct inode *inode, const char *name, int cause)
 {
 	struct fsnotify_mark *fs_mark;
@@ -2957,19 +2978,8 @@ void nexus_nm_notify_xattr(struct inode *inode, const char *name, int cause)
 	struct nexus_listener *listener;
 	unsigned long flags;
 
-	// TODO we can't notify if we are in an atomic context, we need
-	// to queue this elsewhere so that we can execute the operation
-	// atomically. Until then, count drops so the loss is observable.
-	if (in_atomic() || irqs_disabled()) {
-		atomic_inc(&stat_attr_dropped_atomic);
-		return;
-	}
-
 	if (!inode)
 		return;
-
-	nm_dbg("nexus_nm_notify_xattr: ino=%lu name='%s' cause=%d\n",
-		(unsigned long)inode->i_ino, name ? name : "(null)", cause);
 
 	// Only user.beos.* xattrs are visible
 	if (!name)
@@ -2977,7 +2987,37 @@ void nexus_nm_notify_xattr(struct inode *inode, const char *name, int cause)
 	static const char kBeosPrefix[] = "user.beos.";
 	if (strncmp(name, kBeosPrefix, sizeof(kBeosPrefix) - 1) != 0)
 		return;
+
+	/* Atomic context cannot take the mutexes below; defer to the
+	 * dispatch workqueue instead of dropping the event. */
+	if (in_atomic() || irqs_disabled()) {
+		struct deferred_xattr *dx = kzalloc(sizeof(*dx), GFP_ATOMIC);
+
+		if (dx == NULL) {
+			atomic_inc(&stat_attr_dropped_atomic);
+			return;
+		}
+		if (!igrab(inode)) {
+			kfree(dx);
+			atomic_inc(&stat_attr_dropped_atomic);
+			return;
+		}
+		dx->inode = inode;
+		strscpy(dx->name, name, sizeof(dx->name));
+		dx->cause = cause;
+		INIT_WORK(&dx->work, deferred_xattr_work_fn);
+		if (!nm_dispatch_wq || !queue_work(nm_dispatch_wq, &dx->work)) {
+			iput(inode);
+			kfree(dx);
+			atomic_inc(&stat_attr_dropped_atomic);
+		}
+		return;
+	}
+
 	const char *stripped_name = name + sizeof(kBeosPrefix) - 1;
+
+	nm_dbg("nexus_nm_notify_xattr: ino=%lu name='%s' cause=%d\n",
+		(unsigned long)inode->i_ino, name ? name : "(null)", cause);
 
 	struct nexus_mark *found;
 	uint32_t h = hash_dev_ino(inode->i_sb->s_dev, inode->i_ino);
@@ -3069,9 +3109,8 @@ static void node_monitor_team_exit(pid_t team)
 		&nexus_fsn_group->marks_list, g_list) {
 		mark = get_nexus_mark(fs_mark);
 
-		// Caller holds nexus_main_lock (nexus_release → team_destroy
-		// → team_exit_callbacks). Use the _locked variant; the public
-		// nexus_port_team_of would re-acquire and self-deadlock on RT.
+		// Called from team teardown with mark->lock (a spinlock) held:
+		// the port owner lookup takes only the port id table spinlock.
 		spin_lock_irqsave(&mark->lock, flags);
 		list_for_each_entry_safe(listener, tmp, &mark->listeners, list) {
 			pid_t owner = nexus_port_team_of_locked(
