@@ -621,13 +621,16 @@ static long nexus_port_wait_writable(struct nexus_port *port, uint32_t flags,
 	if (!port->is_open || port->deleted)
 		return B_BAD_PORT_ID;
 
-	port->write_count--;
-	if (port->write_count >= 0)
+	// A slot is taken only when free, so every freed slot can wake a
+	// blocked writer however many are waiting.
+	if (port->write_count > 0) {
+		port->write_count--;
 		return 0;
+	}
 
 	nexus_port_deadline_init(&dl, flags, timeout);
 
-	while (port->write_count < 0) {
+	while (port->write_count <= 0) {
 		if (!(flags & B_ABSOLUTE_TIMEOUT)
 				&& (flags & B_RELATIVE_TIMEOUT) && timeout <= 0) {
 			err = B_WOULD_BLOCK;
@@ -646,12 +649,12 @@ static long nexus_port_wait_writable(struct nexus_port *port, uint32_t flags,
 		mutex_unlock(&port->lock);
 		if (dl.timed)
 			ret = wait_event_interruptible_hrtimeout(port->buffer_write,
-				READ_ONCE(port->write_count) >= 0
+				READ_ONCE(port->write_count) > 0
 					|| !READ_ONCE(port->is_open),
 				ns_to_ktime(left));
 		else
 			ret = wait_event_interruptible(port->buffer_write,
-				READ_ONCE(port->write_count) >= 0
+				READ_ONCE(port->write_count) > 0
 					|| !READ_ONCE(port->is_open));
 		mutex_lock(&port->lock);
 
@@ -664,7 +667,7 @@ static long nexus_port_wait_writable(struct nexus_port *port, uint32_t flags,
 			err = B_BAD_PORT_ID;
 			goto fail;
 		}
-		if (port->write_count >= 0)
+		if (port->write_count > 0)
 			break;
 		if (ret == -ETIME) {
 			err = B_TIMED_OUT;
@@ -672,10 +675,10 @@ static long nexus_port_wait_writable(struct nexus_port *port, uint32_t flags,
 		}
 	}
 
+	port->write_count--;
 	return 0;
 
 fail:
-	port->write_count++;
 	return err;
 }
 
