@@ -663,7 +663,7 @@ static struct nexus_thread* find_thread(struct nexus_team *team, const char *nam
 
 	if (*p == NULL) {
 		if (name != NULL) {
-			pid_t pid = pid_nr(get_task_pid(current, PIDTYPE_PID));
+			pid_t pid = task_pid_nr(current);
 			thread = nexus_thread_init(team, pid, name);
 			if (thread == NULL)
 				return NULL;
