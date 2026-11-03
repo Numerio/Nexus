@@ -93,13 +93,12 @@ static int nexus_port_publish(struct nexus_port *port)
 struct nexus_port *nexus_port_lookup(port_id id)
 {
 	struct nexus_port *port;
-	unsigned long flags;
 
-	spin_lock_irqsave(&nexus_port_idr_lock, flags);
+	rcu_read_lock();
 	port = idr_find(&nexus_port_idr, id);
 	if (port != NULL && !kref_get_unless_zero(&port->ref_count))
 		port = NULL;
-	spin_unlock_irqrestore(&nexus_port_idr_lock, flags);
+	rcu_read_unlock();
 	return port;
 }
 
@@ -413,7 +412,7 @@ void nexus_port_destroy(struct kref* ref)
 		nexus_buffer_free(buf);
 	}
 
-	kfree(port);
+	kfree_rcu(port, rcu);
 }
 
 /* Team teardown: take every port out of the tree and drop the tree's
@@ -682,33 +681,6 @@ fail:
 	return err;
 }
 
-/* Give a reservation back after a failed write. */
-static void nexus_port_unreserve(struct nexus_port *port)
-{
-	mutex_lock(&port->lock);
-	port->write_count++;
-	mutex_unlock(&port->lock);
-}
-
-/* Queue a finished message against the held reservation. */
-static long nexus_port_enqueue(struct nexus_port *port,
-	struct nexus_buffer *buf)
-{
-	mutex_lock(&port->lock);
-	if (!port->is_open || port->deleted) {
-		port->write_count++;
-		mutex_unlock(&port->lock);
-		nexus_buffer_free(buf);
-		return B_BAD_PORT_ID;
-	}
-	list_add_tail(&buf->node, &port->queue);
-	port->read_count++;
-	mutex_unlock(&port->lock);
-
-	wake_up_interruptible(&port->buffer_read);
-	return B_OK;
-}
-
 long nexus_port_read(struct nexus_port* port, int32_t* code, void* buffer,
 	size_t* size, uint32_t flags, int64_t timeout)
 {
@@ -781,7 +753,7 @@ static long _nexus_port_write(struct nexus_port* port, int32_t* msg_code,
 	const void* buffer, size_t size, uint32_t flags, int64_t timeout,
 	bool from_user)
 {
-	struct nexus_buffer* buf = NULL;
+	struct nexus_buffer* buf;
 	long err;
 
 	if ((buffer == NULL && size != 0) || size > PORT_MAX_MESSAGE_SIZE
@@ -791,17 +763,9 @@ static long _nexus_port_write(struct nexus_port* port, int32_t* msg_code,
 
 	flags &= B_RELATIVE_TIMEOUT | B_ABSOLUTE_TIMEOUT;
 
-	mutex_lock(&port->lock);
-	err = nexus_port_wait_writable(port, flags, timeout);
-	mutex_unlock(&port->lock);
-	if (err != 0)
-		return err;
-
 	buf = kzalloc(sizeof(struct nexus_buffer), GFP_KERNEL);
-	if (buf == NULL) {
-		nexus_port_unreserve(port);
+	if (buf == NULL)
 		return B_NO_MEMORY;
-	}
 
 	if (from_user) {
 		buf->sender = from_kuid_munged(current_user_ns(), current_uid());
@@ -810,18 +774,15 @@ static long _nexus_port_write(struct nexus_port* port, int32_t* msg_code,
 	}
 
 	if (buffer != NULL) {
-		buf->buffer = kzalloc(size, GFP_KERNEL);
+		buf->buffer = kmalloc(size, GFP_KERNEL);
 		if (buf->buffer == NULL) {
 			kfree(buf);
-			nexus_port_unreserve(port);
 			return B_NO_MEMORY;
 		}
 		if (from_user) {
 			if (copy_from_user(buf->buffer, buffer, size)) {
-				kfree(buf->buffer);
-				kfree(buf);
-				nexus_port_unreserve(port);
-				return B_BAD_VALUE;
+				err = B_BAD_VALUE;
+				goto fail;
 			}
 		} else {
 			memcpy(buf->buffer, buffer, size);
@@ -832,16 +793,30 @@ static long _nexus_port_write(struct nexus_port* port, int32_t* msg_code,
 
 	if (from_user) {
 		if (copy_from_user(&buf->code, msg_code, sizeof(*msg_code))) {
-			kfree(buf->buffer);
-			kfree(buf);
-			nexus_port_unreserve(port);
-			return B_BAD_VALUE;
+			err = B_BAD_VALUE;
+			goto fail;
 		}
 	} else {
 		buf->code = *msg_code;
 	}
 
-	return nexus_port_enqueue(port, buf);
+	mutex_lock(&port->lock);
+	err = nexus_port_wait_writable(port, flags, timeout);
+	if (err == 0) {
+		list_add_tail(&buf->node, &port->queue);
+		port->read_count++;
+	}
+	mutex_unlock(&port->lock);
+
+	if (err != 0)
+		goto fail;
+
+	wake_up_interruptible(&port->buffer_read);
+	return B_OK;
+
+fail:
+	nexus_buffer_free(buf);
+	return err;
 }
 
 long nexus_port_write(struct nexus_port* port, int32_t* msg_code,
@@ -880,14 +855,13 @@ EXPORT_SYMBOL(nexus_write_port);
 pid_t nexus_port_team_of(uint32_t id)
 {
 	struct nexus_port *port;
-	unsigned long flags;
 	pid_t team = -1;
 
-	spin_lock_irqsave(&nexus_port_idr_lock, flags);
+	rcu_read_lock();
 	port = idr_find(&nexus_port_idr, id);
 	if (port != NULL)
 		team = READ_ONCE(port->team_id);
-	spin_unlock_irqrestore(&nexus_port_idr_lock, flags);
+	rcu_read_unlock();
 	return team;
 }
 EXPORT_SYMBOL(nexus_port_team_of);
@@ -908,7 +882,6 @@ static long _nexus_port_write_with_caps(struct nexus_port* port,
 	struct nexus_buffer* buf = NULL;
 	struct nexus_port_cap_kref* caps_arr = NULL;
 	struct nexus_port_cap_in* caps_tmp = NULL;
-	long err;
 	long ret = 0;
 	size_t i = 0;
 
@@ -925,17 +898,9 @@ static long _nexus_port_write_with_caps(struct nexus_port* port,
 
 	flags &= B_RELATIVE_TIMEOUT | B_ABSOLUTE_TIMEOUT;
 
-	mutex_lock(&port->lock);
-	err = nexus_port_wait_writable(port, flags, timeout);
-	mutex_unlock(&port->lock);
-	if (err != 0)
-		return err;
-
 	buf = kzalloc(sizeof(struct nexus_buffer), GFP_KERNEL);
-	if (buf == NULL) {
-		ret = B_NO_MEMORY;
-		goto err_count;
-	}
+	if (buf == NULL)
+		return B_NO_MEMORY;
 
 	if (from_user) {
 		buf->sender = from_kuid_munged(current_user_ns(), current_uid());
@@ -1010,7 +975,21 @@ static long _nexus_port_write_with_caps(struct nexus_port* port,
 		buf->cap_count = cap_count;
 	}
 
-	return nexus_port_enqueue(port, buf);
+	mutex_lock(&port->lock);
+	ret = nexus_port_wait_writable(port, flags, timeout);
+	if (ret == 0) {
+		list_add_tail(&buf->node, &port->queue);
+		port->read_count++;
+	}
+	mutex_unlock(&port->lock);
+
+	if (ret != 0) {
+		nexus_buffer_free(buf);
+		return ret;
+	}
+
+	wake_up_interruptible(&port->buffer_read);
+	return B_OK;
 
 err_caps_acquired:
 	while (i-- > 0)
@@ -1022,8 +1001,6 @@ err_caps:
 err_buf:
 	kfree(buf->buffer);
 	kfree(buf);
-err_count:
-	nexus_port_unreserve(port);
 	return ret;
 }
 

@@ -103,6 +103,7 @@ struct nexus_team {
 struct nexus_thread {
 	struct rb_node			node;
 	struct kref				ref_count;
+	struct rcu_head			rcu;
 	struct callback_head	exit_work;
 
 	thread_id				id;
@@ -184,6 +185,7 @@ struct nexus_buffer {
 struct nexus_port {
 	struct rb_node			node;
 	struct kref				ref_count;
+	struct rcu_head			rcu;
 
 	port_id					id;
 	char					name[B_OS_NAME_LENGTH];

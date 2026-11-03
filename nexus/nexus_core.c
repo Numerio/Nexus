@@ -102,6 +102,18 @@ static struct nexus_thread* nexus_thread_lookup(int32_t tid)
 	return t;
 }
 
+static struct nexus_thread* nexus_thread_lookup_rcu(int32_t tid)
+{
+	struct nexus_thread *t;
+
+	rcu_read_lock();
+	t = idr_find(&nexus_threads_idr, tid);
+	if (t != NULL && !kref_get_unless_zero(&t->ref_count))
+		t = NULL;
+	rcu_read_unlock();
+	return t;
+}
+
 /* The index entry holds a reference: nexus_thread_retire() drops it along
  * with the tree's. Without it, retire over-put and freed a record whose exit
  * hook was still pending (refcount underflow in nexus_thread_exit_work). */
@@ -639,7 +651,7 @@ static void nexus_thread_destroy(struct kref* ref)
 	}
 	thread->team = NULL;
 	kfree(thread->buffer);
-	kfree(thread);
+	kfree_rcu(thread, rcu);
 	nexus_team_put(home);
 }
 
@@ -946,6 +958,7 @@ static long nexus_thread_do_write(unsigned long arg)
 	struct nexus_team *dteam;
 	struct pid *pid_ref;
 	struct task_struct *task;
+	void *kbuf;
 	int sem_ret;
 	int32_t status;
 
@@ -963,6 +976,23 @@ static long nexus_thread_do_write(unsigned long arg)
 		if (dest == NULL) { status = B_BAD_THREAD_ID; break; }
 
 		dteam = dest->home;
+
+		if (user_data.size > PORT_MAX_MESSAGE_SIZE)
+			kbuf = NULL;
+		else
+			kbuf = kmalloc(user_data.size, GFP_KERNEL);
+		if (kbuf == NULL) {
+			status = B_NO_MEMORY;
+			kref_put(&dest->ref_count, nexus_thread_destroy);
+			break;
+		}
+		if (copy_from_user(kbuf, user_data.buffer, user_data.size)) {
+			kfree(kbuf);
+			status = B_BAD_VALUE;
+			kref_put(&dest->ref_count, nexus_thread_destroy);
+			break;
+		}
+
 		sem_ret = down_interruptible(&dest->sem_write);
 
 		mutex_lock(&dteam->lock);
@@ -970,35 +1000,26 @@ static long nexus_thread_do_write(unsigned long arg)
 			/* Retired while we slept. */
 			if (!sem_ret)
 				up(&dest->sem_write);
+			kfree(kbuf);
 			status = B_BAD_THREAD_ID;
 		} else if (sem_ret) {
+			kfree(kbuf);
 			status = B_INTERRUPTED;
 		} else if (dest->has_thread_exited) {
 			/* Dead target: exit's up() let us in, but nobody will
 			 * read, and a pending slot must not be overwritten. */
 			up(&dest->sem_write);
+			kfree(kbuf);
 			status = B_BAD_THREAD_ID;
 		} else {
-			dest->buffer = kzalloc(user_data.size, GFP_KERNEL);
-			if (dest->buffer == NULL) {
-				/* Error after down() must give sem_write back. */
-				up(&dest->sem_write);
-				status = B_NO_MEMORY;
-			} else if (copy_from_user(dest->buffer, user_data.buffer,
-					user_data.size)) {
-				kfree(dest->buffer);
-				dest->buffer = NULL;
-				up(&dest->sem_write);
-				status = B_BAD_VALUE;
-			} else {
-				dest->sender = current->pid;
-				dest->buffer_size = user_data.size;
-				dest->buffer_ready = 1;
-				dest->unblock_code = user_data.return_code;
-				wake_up_interruptible(&dest->buffer_read);
-				up(&dest->sem_read);
-				status = B_OK;
-			}
+			dest->buffer = kbuf;
+			dest->sender = current->pid;
+			dest->buffer_size = user_data.size;
+			dest->buffer_ready = 1;
+			dest->unblock_code = user_data.return_code;
+			wake_up_interruptible(&dest->buffer_read);
+			up(&dest->sem_read);
+			status = B_OK;
 		}
 		mutex_unlock(&dteam->lock);
 		kref_put(&dest->ref_count, nexus_thread_destroy);
@@ -1239,6 +1260,47 @@ static long nexus_thread_do_register(struct nexus_team *team,
 	return child_tid;
 }
 
+static bool nexus_is_port_cmd(unsigned int cmd)
+{
+	switch (cmd) {
+	case NEXUS_PORT_CREATE:
+	case NEXUS_PORT_CLOSE:
+	case NEXUS_PORT_DELETE:
+	case NEXUS_PORT_READ:
+	case NEXUS_PORT_WRITE:
+	case NEXUS_PORT_INFO:
+	case NEXUS_PORT_MESSAGE_INFO:
+	case NEXUS_SET_PORT_OWNER:
+	case NEXUS_PORT_WRITE_CAPS:
+	case NEXUS_PORT_READ_CAPS:
+	case NEXUS_PORT_FIND:
+	case NEXUS_GET_NEXT_PORT_FOR_TEAM:
+		return true;
+	default:
+		return false;
+	}
+}
+
+
+static bool nexus_caller_known_in_team(struct nexus_team *team)
+{
+	struct nexus_thread *t;
+	bool known;
+
+	if (team->id == current->pid)
+		return true;
+
+	t = nexus_thread_lookup_rcu(current->pid);
+	if (t == NULL)
+		return false;
+
+	known = READ_ONCE(t->team) == team && t->id == current->pid
+		&& !READ_ONCE(t->has_thread_exited);
+	kref_put(&t->ref_count, nexus_thread_destroy);
+	return known;
+}
+
+
 static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	struct nexus_team *team = filp->private_data;
@@ -1260,6 +1322,9 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	default:
 		break;
 	}
+
+	if (nexus_is_port_cmd(cmd) && nexus_caller_known_in_team(team))
+		return nexus_port_dispatch(team, cmd, arg);
 
 	/* Everything below first resolves the caller's own record, under the
 	 * team lock; this is where a thread nexus has not met yet registers
@@ -1536,33 +1601,32 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				status = B_BAD_VALUE;
 				break;
 			}
-			if (copy_to_user(user_data.buffer, self->buffer,
-					min(user_data.size, self->buffer_size))) {
-				/* Drop the slot; holding either count after a
-				 * failed copy wedges later traffic. */
-				kfree(self->buffer);
+			{
+				void *kbuf = self->buffer;
+				size_t kbuf_size = self->buffer_size;
+
+				user_data.sender = self->sender;
+				user_data.return_code = self->unblock_code;
 				self->buffer = NULL;
 				self->buffer_size = 0;
 				self->buffer_ready = 0;
 				self->sender = -1;
 				self->unblock_code = -1;
 				up(&self->sem_write);
-				/* sem_read stays with the reader slot: the next
-				 * writer's up(sem_read) hands it to the next reader. */
-				status = B_BAD_VALUE;
-				break;
+				mutex_unlock(&team->lock);
+
+				user_data.size = min_t(size_t, user_data.size, kbuf_size);
+				if (copy_to_user(user_data.buffer, kbuf, user_data.size))
+					user_data.ret = B_BAD_VALUE;
+				else
+					user_data.ret = B_OK;
+				kfree(kbuf);
+
+				if (copy_to_user((struct __user nexus_thread_rw*)arg,
+						&user_data, sizeof(user_data)))
+					return -EFAULT;
+				return 0;
 			}
-			user_data.sender = self->sender;
-			user_data.return_code = self->unblock_code;
-			user_data.size = min(user_data.size, self->buffer_size);
-			kfree(self->buffer);
-			self->buffer = NULL;
-			self->buffer_size = 0;
-			self->buffer_ready = 0;
-			self->sender = -1;
-			self->unblock_code = -1;
-			up(&self->sem_write);
-			status = B_OK;
 		} while (0);
 		user_data.ret = status;
 		if (copy_to_user((struct __user nexus_thread_rw*)arg, &user_data,
