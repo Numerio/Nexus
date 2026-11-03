@@ -18,7 +18,6 @@
 #define B_INFINITE_TIMEOUT	(9223372036854775807LL)
 // NOTE: not sure if we want that stuff to be configurable
 // just in case better to leave a note here.
-#define MAX_SEMS 65536
 
 enum {
 	B_TIMEOUT						= 0x8,
@@ -212,41 +211,6 @@ struct nexus_port {
 	pid_t					team_id;
 };
 
-struct nexus_sem_waiter {
-	struct list_head    	list;
-
-	struct task_struct  	*task;
-	int32_t             	count;
-	status_t            	status;
-	bool                	woken;
-};
-
-struct nexus_sem {
-	sem_id              	id;
-
-	char                	name[B_OS_NAME_LENGTH];
-	int32_t             	count;
-	int32_t             	waiting_count;
-	thread_id           	latest_holder;
-	bool                	deleted;
-
-	spinlock_t          	lock;
-	struct list_head    	waiters;
-	atomic_t            	ref_count;
-
-	team_id             	owner;
-	struct hlist_node   	team_node;
-};
-
-struct team_sem_list {
-	team_id             	team;
-
-	struct hlist_head   	sems;
-	spinlock_t          	lock;
-
-	struct hlist_node		hash_node;
-};
-
 struct nexus_area {
 	area_id					id;
 
@@ -301,11 +265,6 @@ struct nexus_vref {
 
 /* Team-exit notification callbacks */
 
-int  					nexus_sem_init(void);
-void					nexus_sem_exit(void);
-void					nexus_sem_team_exit(pid_t team);
-long					nexus_sem_ioctl(unsigned int cmd, unsigned long arg);
-
 
 /* Returns a referenced team; pair with nexus_team_put(). */
 struct nexus_team*		nexus_find_team(int32_t id);
@@ -352,7 +311,5 @@ pid_t					nexus_port_team_of_locked(uint32_t id);
 uint64_t				nexus_core_dev(void);
 int						nexus_port_proc_init(void);
 void					nexus_port_proc_exit(void);
-
-void					nexus_sem_delete(struct kref* ref);
 
 #endif

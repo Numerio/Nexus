@@ -60,13 +60,6 @@ typedef int64_t bigtime_t;
 #define NEXUS_PORT_FIND          _IOWR(NEXUS_MAGIC, 12, struct nexus_port_find_req)
 #define NEXUS_GET_NEXT_PORT_FOR_TEAM	_IOWR(NEXUS_MAGIC, 13, struct nexus_get_next_port)
 
-#define NEXUS_SEM_CREATE   _IOWR(NEXUS_MAGIC, 40, struct nexus_sem_create)
-#define NEXUS_SEM_ACQUIRE  _IOWR(NEXUS_MAGIC, 41, struct nexus_sem_op)
-#define NEXUS_SEM_RELEASE  _IOWR(NEXUS_MAGIC, 42, struct nexus_sem_op)
-#define NEXUS_SEM_DELETE   _IOWR(NEXUS_MAGIC, 43, struct nexus_sem_delete_req)
-#define NEXUS_SEM_COUNT    _IOWR(NEXUS_MAGIC, 44, struct nexus_sem_count_req)
-#define NEXUS_SEM_INFO     _IOWR(NEXUS_MAGIC, 45, struct nexus_sem_info_req)
-#define NEXUS_SEM_NEXT_INFO _IOWR(NEXUS_MAGIC, 46, struct nexus_sem_next_info)
 
 #define NEXUS_VREF_MAGIC	'V'
 
@@ -301,65 +294,6 @@ struct nexus_get_next_port {
 	/* out */
 	struct nexus_port_info	info;
 	int32_t					ret;
-};
-
-
-/* Sem */
-
-
-struct nexus_sem_create {
-	const char*	name;
-	int32_t		count;
-	/* out */
-	sem_id		id;
-	int32_t		ret;
-};
-
-struct nexus_sem_op {
-	sem_id		id;
-	int32_t		count;
-	uint32_t	flags;
-	bigtime_t	timeout;
-	/* out */
-	int32_t		ret;
-};
-
-struct nexus_sem_delete_req {
-	sem_id		id;
-	/* out */
-	int32_t		ret;
-};
-
-struct nexus_sem_count_req {
-	sem_id		id;
-	/* out */
-	int32_t		count;
-	int32_t		ret;
-};
-
-struct nexus_sem_info {
-	sem_id    	sem;
-	//
-	team_id   	team;
-	char      	name[B_OS_NAME_LENGTH];
-	int32_t   	count;
-	thread_id 	latest_holder;
-};
-
-struct nexus_sem_info_req {
-	sem_id		id;
-	team_id		team;
-	/* out */
-	struct nexus_sem_info info;
-	int32_t		ret;
-};
-
-struct nexus_sem_next_info {
-	team_id   	team;
-	int32_t   	cookie;
-	/* out */
-	struct nexus_sem_info info;
-	int32_t		ret;
 };
 
 

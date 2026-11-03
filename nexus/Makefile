@@ -1,4 +1,4 @@
-nexus-objs := nexus_core.o port.o sem.o vref.o
+nexus-objs := nexus_core.o port.o vref.o
 nexus_node_monitor-objs := node_monitor.o query.o attribute.o index.o volume.o
 obj-m := nexus.o area.o nexus_node_monitor.o
 

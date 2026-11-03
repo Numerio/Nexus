@@ -525,8 +525,6 @@ static void nexus_team_destroy(struct nexus_team *team)
 	team->dead = true;
 	mutex_unlock(&team->lock);
 
-	nexus_sem_team_exit(team->id);
-
 	int _i;
 	unsigned long _flags;
 	spin_lock_irqsave(&team_exit_cb_lock, _flags);
@@ -1310,19 +1308,6 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	if (team->id != current->tgid)
 		return -EPERM;
 
-	switch (cmd) {
-	case NEXUS_SEM_CREATE:
-	case NEXUS_SEM_ACQUIRE:
-	case NEXUS_SEM_RELEASE:
-	case NEXUS_SEM_DELETE:
-	case NEXUS_SEM_COUNT:
-	case NEXUS_SEM_INFO:
-	case NEXUS_SEM_NEXT_INFO:
-		return nexus_sem_ioctl(cmd, arg);
-	default:
-		break;
-	}
-
 	if (nexus_is_port_cmd(cmd) && nexus_caller_known_in_team(team))
 		return nexus_port_dispatch(team, cmd, arg);
 
@@ -1767,16 +1752,9 @@ static int nexus_init(void)
 	if (cdev_add(&nexus_cdev, major, 1) == -1)
 		goto error;
 
-	int ret = nexus_sem_init();
-	if (ret < 0) {
-		pr_err("nexus: failed to init sem: %d\n", ret);
-		goto error;
-	}
-
-	ret = nexus_port_proc_init();
+	int ret = nexus_port_proc_init();
 	if (ret < 0) {
 		pr_err("nexus: failed to init /proc/nexus: %d\n", ret);
-		nexus_sem_exit();
 		goto error;
 	}
 
@@ -1784,7 +1762,6 @@ static int nexus_init(void)
 	if (ret < 0) {
 		pr_err("nexus: failed to init vref: %d\n", ret);
 		nexus_port_proc_exit();
-		nexus_sem_exit();
 		goto error;
 	}
 
@@ -1796,7 +1773,6 @@ static int nexus_init(void)
 		pr_err("nexus: cannot hook sched_process_exit: %d\n", ret);
 		nexus_vref_exit();
 		nexus_port_proc_exit();
-		nexus_sem_exit();
 		goto error;
 	}
 
@@ -1827,7 +1803,6 @@ static void nexus_exit(void)
 
 	nexus_vref_exit();
 	nexus_port_proc_exit();
-	nexus_sem_exit();
 	nexus_cleanup_dev(1);
 	printk(KERN_INFO "nexus: unloaded\n");
 }
