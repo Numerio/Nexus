@@ -321,6 +321,7 @@ long nexus_port_create(struct nexus_team* team, unsigned long arg)
 	port->capacity = in_data.capacity;
 	port->read_count = 0;
 	port->team_id = -1;
+	port->creator = team->id;
 
 	if (strncpy_from_user(port->name, in_data.name, B_OS_NAME_LENGTH) < 0) {
 		kfree(port);
@@ -500,7 +501,8 @@ static long nexus_port_move(struct nexus_port *port, pid_t caller,
 			ret = caller >= 0 ? B_NOT_ALLOWED : B_ERROR;
 			break;
 		}
-		if (caller >= 0 && src->id != caller) {
+		if (caller >= 0 && src->id != caller
+				&& !(target_team == caller && port->creator == caller)) {
 			nexus_team_put(src);
 			ret = B_NOT_ALLOWED;
 			break;

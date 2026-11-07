@@ -209,6 +209,8 @@ struct nexus_port {
 	/* Owner team id mirrored for atomic readers, -1 when unlinked.
 	 * Written under team->lock and lock, read with READ_ONCE. */
 	pid_t					team_id;
+	/* May take the port back after lending it out. */
+	pid_t					creator;
 };
 
 struct nexus_area {
