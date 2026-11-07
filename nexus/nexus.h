@@ -57,6 +57,7 @@ typedef int64_t bigtime_t;
 #define NEXUS_SET_PORT_OWNER     _IOWR(NEXUS_MAGIC, 35, struct nexus_port_set_owner)
 #define NEXUS_PORT_WRITE_CAPS    _IOWR(NEXUS_MAGIC, 36, struct nexus_port_write_caps)
 #define NEXUS_PORT_READ_CAPS     _IOWR(NEXUS_MAGIC, 37, struct nexus_port_read_caps)
+#define NEXUS_PORT_TO_FD         _IOWR(NEXUS_MAGIC, 38, struct nexus_port_to_fd)
 #define NEXUS_PORT_FIND          _IOWR(NEXUS_MAGIC, 12, struct nexus_port_find_req)
 #define NEXUS_GET_NEXT_PORT_FOR_TEAM	_IOWR(NEXUS_MAGIC, 13, struct nexus_get_next_port)
 
@@ -260,6 +261,13 @@ struct nexus_port_set_owner {
 	int32_t			id;
 	int32_t			team;
 	/* out */
+	int32_t			ret;
+};
+
+struct nexus_port_to_fd {
+	int32_t			id;
+	/* out */
+	int32_t			fd;
 	int32_t			ret;
 };
 

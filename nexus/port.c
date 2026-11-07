@@ -5,6 +5,7 @@
 
 #include "nexus.h"
 
+#include <linux/anon_inodes.h>
 #include <linux/cred.h>
 #include <linux/fs.h>
 #include <linux/idr.h>
@@ -16,6 +17,7 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/overflow.h>
+#include <linux/poll.h>
 #include <linux/rbtree.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
@@ -1466,6 +1468,88 @@ long nexus_port_io_set_owner(struct nexus_team *team, unsigned long arg)
 	return 0;
 }
 
+/* Pollable view of a port: readable while a message is queued. Holds a
+ * port reference for the life of the file. */
+static __poll_t nexus_port_fd_poll(struct file *file, poll_table *wait)
+{
+	struct nexus_port *port = file->private_data;
+	__poll_t mask = 0;
+
+	poll_wait(file, &port->buffer_read, wait);
+
+	if (READ_ONCE(port->read_count) > 0)
+		mask |= EPOLLIN | EPOLLRDNORM;
+	if (READ_ONCE(port->deleted) || !READ_ONCE(port->is_open))
+		mask |= EPOLLHUP;
+
+	return mask;
+}
+
+static int nexus_port_fd_release(struct inode *inode, struct file *file)
+{
+	nexus_port_put(file->private_data);
+	return 0;
+}
+
+static const struct file_operations nexus_port_fd_fops = {
+	.owner		= THIS_MODULE,
+	.poll		= nexus_port_fd_poll,
+	.release	= nexus_port_fd_release,
+};
+
+long nexus_port_io_to_fd(struct nexus_team *team, unsigned long arg)
+{
+	struct nexus_port_to_fd data;
+	struct nexus_port *port;
+
+	if (copy_from_user(&data, (struct __user nexus_port_to_fd*)arg, sizeof(data)))
+		return -EFAULT;
+
+	data.fd = -1;
+	port = nexus_port_lookup(data.id);
+	if (port == NULL) {
+		data.ret = B_BAD_PORT_ID;
+	} else if (READ_ONCE(port->team_id) != current->tgid) {
+		data.ret = B_NOT_ALLOWED;
+		nexus_port_put(port);
+	} else {
+		/* The file takes over the lookup reference; the fd is
+		 * installed only once the result reached user space. */
+		struct file *file;
+		int fd = get_unused_fd_flags(O_CLOEXEC);
+
+		if (fd < 0) {
+			data.ret = B_ERROR;
+			nexus_port_put(port);
+		} else {
+			file = anon_inode_getfile("[nexus-port]",
+				&nexus_port_fd_fops, port, O_RDONLY);
+			if (IS_ERR(file)) {
+				put_unused_fd(fd);
+				data.ret = B_ERROR;
+				nexus_port_put(port);
+			} else {
+				data.fd = fd;
+				data.ret = B_OK;
+				if (copy_to_user((struct __user nexus_port_to_fd*)arg,
+						&data, sizeof(data))) {
+					/* release drops the port reference */
+					fput(file);
+					put_unused_fd(fd);
+					return -EFAULT;
+				}
+				fd_install(fd, file);
+				return 0;
+			}
+		}
+	}
+
+	if (copy_to_user((struct __user nexus_port_to_fd*)arg, &data, sizeof(data)))
+		return -EFAULT;
+
+	return 0;
+}
+
 long nexus_port_dispatch(struct nexus_team *team, unsigned int cmd,
 	unsigned long arg)
 {
@@ -1490,6 +1574,8 @@ long nexus_port_dispatch(struct nexus_team *team, unsigned int cmd,
 		return nexus_port_io_write_caps(team, arg);
 	case NEXUS_PORT_READ_CAPS:
 		return nexus_port_io_read_caps(team, arg);
+	case NEXUS_PORT_TO_FD:
+		return nexus_port_io_to_fd(team, arg);
 	case NEXUS_PORT_FIND:
 		return nexus_port_find(arg);
 	case NEXUS_GET_NEXT_PORT_FOR_TEAM:

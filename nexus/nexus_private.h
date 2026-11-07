@@ -304,6 +304,7 @@ long					nexus_port_io_message_info(struct nexus_team *team, unsigned long arg);
 long					nexus_port_io_set_owner(struct nexus_team *team, unsigned long arg);
 long					nexus_port_io_write_caps(struct nexus_team *team, unsigned long arg);
 long					nexus_port_io_read_caps(struct nexus_team *team, unsigned long arg);
+long					nexus_port_io_to_fd(struct nexus_team *team, unsigned long arg);
 long					nexus_port_dispatch(struct nexus_team *team, unsigned int cmd,
 							unsigned long arg);
 pid_t					nexus_port_team_of(uint32_t id);

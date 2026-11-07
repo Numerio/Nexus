@@ -1271,6 +1271,7 @@ static bool nexus_is_port_cmd(unsigned int cmd)
 	case NEXUS_SET_PORT_OWNER:
 	case NEXUS_PORT_WRITE_CAPS:
 	case NEXUS_PORT_READ_CAPS:
+	case NEXUS_PORT_TO_FD:
 	case NEXUS_PORT_FIND:
 	case NEXUS_GET_NEXT_PORT_FOR_TEAM:
 		return true;
@@ -1421,6 +1422,7 @@ static long nexus_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	case NEXUS_SET_PORT_OWNER:
 	case NEXUS_PORT_WRITE_CAPS:
 	case NEXUS_PORT_READ_CAPS:
+	case NEXUS_PORT_TO_FD:
 	case NEXUS_PORT_FIND:
 	case NEXUS_GET_NEXT_PORT_FOR_TEAM:
 		mutex_unlock(&team->lock);
