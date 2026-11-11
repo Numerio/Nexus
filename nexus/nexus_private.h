@@ -222,6 +222,7 @@ struct nexus_area {
 	int32_t					lock;
 	int32_t		            protection;
 	pid_t					team;
+	uint32_t				kind;
 
 	struct kref				ref_count;
 	struct hlist_node		node;

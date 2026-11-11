@@ -308,12 +308,16 @@ struct nexus_get_next_port {
 /* Areas */
 
 
+#define NEXUS_AREA_DEFAULT	0
+#define NEXUS_AREA_GBM		1
+
 struct nexus_area_create {
 	int         fd;
 	char        name[B_OS_NAME_LENGTH];
 	uint64_t    size;
 	uint32_t    lock;
 	uint32_t    protection;
+	uint32_t    kind;
 	/* out */
 	area_id     area;
 	int32_t     ret;

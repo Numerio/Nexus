@@ -6,13 +6,22 @@
 #include <linux/cdev.h>
 #include <linux/file.h>
 #include <linux/hashtable.h>
+#include <linux/dma-buf.h>
 #include <linux/idr.h>
+#include <linux/shmem_fs.h>
+#include <linux/version.h>
 
 #include "errors.h"
 #include "nexus.h"
 #include "nexus_private.h"
 
 #define DEV_NAME "nexus_area"
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
+MODULE_IMPORT_NS("DMA_BUF");
+#else
+MODULE_IMPORT_NS(DMA_BUF);
+#endif
 
 static int major = -1;
 static struct cdev nexus_cdev;
@@ -92,6 +101,27 @@ static struct nexus_area *find_area_by_name(const char *name)
 }
 
 
+static bool nexus_area_file_valid(struct file *file, int fd, uint32_t kind,
+	uint64_t size)
+{
+	struct dma_buf *buf;
+	bool ok;
+
+	switch (kind) {
+	case NEXUS_AREA_DEFAULT:
+		return shmem_file(file)
+			&& (uint64_t)i_size_read(file_inode(file)) >= size;
+	case NEXUS_AREA_GBM:
+		buf = dma_buf_get(fd);
+		if (IS_ERR(buf))
+			return false;
+		ok = buf->size >= size;
+		dma_buf_put(buf);
+		return ok;
+	}
+	return false;
+}
+
 static long nexus_area_create(struct nexus_area_create __user *arg)
 {
 	struct nexus_area_create create;
@@ -105,6 +135,12 @@ static long nexus_area_create(struct nexus_area_create __user *arg)
 	file = fget(create.fd);
 	if (!file)
 		return -EBADF;
+
+	if (!nexus_area_file_valid(file, create.fd, create.kind, create.size)) {
+		fput(file);
+		create.ret = B_BAD_VALUE;
+		goto out_copy;
+	}
 
 	area = kzalloc(sizeof(*area), GFP_KERNEL);
 	if (!area) {
@@ -130,6 +166,7 @@ static long nexus_area_create(struct nexus_area_create __user *arg)
 	area->size = create.size;
 	area->lock = create.lock;
 	area->protection = create.protection;
+	area->kind = create.kind;
 	area->team = current->tgid;
 
 	mutex_lock(&area_lock);
@@ -156,6 +193,7 @@ static long nexus_area_clone(struct nexus_area_clone __user *arg)
 	struct file *source_file;
 	size_t source_size;
 	int32_t source_lock;
+	uint32_t source_kind;
 	int fd;
 	int id;
 	int source_id;
@@ -184,6 +222,7 @@ static long nexus_area_clone(struct nexus_area_clone __user *arg)
 	source_file = get_file(source->file);
 	source_size = source->size;
 	source_lock = source->lock;
+	source_kind = source->kind;
 	source_id = source->id;
 	mutex_unlock(&area_lock);
 
@@ -217,6 +256,7 @@ static long nexus_area_clone(struct nexus_area_clone __user *arg)
 	area->file = source_file;
 	area->size = source_size;
 	area->lock = source_lock;
+	area->kind = source_kind;
 	area->protection = clone.protection;
 	area->team = current->tgid;
 
@@ -397,6 +437,7 @@ static long nexus_area_transfer(struct nexus_area_transfer __user *arg)
 	target_area->file = file;
 	target_area->size = source->size;
 	target_area->lock = source->lock;
+	target_area->kind = source->kind;
 	target_area->protection = source->protection;
 	target_area->team = tr.target;
 
