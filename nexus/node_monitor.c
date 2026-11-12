@@ -1205,21 +1205,13 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 	atomic_inc(&stat_events);
 #endif
 
-	if (data_type == FSNOTIFY_EVENT_INODE) {
-		inode = (struct inode *)data;
-	} else if (data_type == FSNOTIFY_EVENT_PATH) {
-		const struct path *path = data;
-		if (path && path->dentry) {
-			inode = d_inode(path->dentry);
-			ev_dentry = path->dentry;
+	if (data) {
+		const struct path *path = fsnotify_data_path(data, data_type);
+
+		inode = fsnotify_data_inode(data, data_type);
+		ev_dentry = fsnotify_data_dentry(data, data_type);
+		if (path)
 			ev_mnt = path->mnt;
-		}
-	} else if (data_type == FSNOTIFY_EVENT_DENTRY) {
-		struct dentry *dentry = (struct dentry *)data;
-		if (dentry) {
-			inode = d_inode(dentry);
-			ev_dentry = dentry;
-		}
 	}
 
 	if (!inode) {
@@ -1248,7 +1240,7 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 		return 0;
 
 	if (mask & FS_RENAME) {
-		if (data_type == FSNOTIFY_EVENT_DENTRY)
+		if (ev_dentry)
 			nm_handle_rename(group, ev_dentry, dir, name, iter_info);
 		return 0;
 	}
