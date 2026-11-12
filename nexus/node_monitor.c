@@ -932,6 +932,16 @@ static int32_t nm_mark_take_child_vref_if_other(struct nexus_mark *mark,
 	return taken;
 }
 
+/* Inode replaced by the rename. */
+static struct inode *nm_rename_target(const void *data, int data_type)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0)
+	return fsnotify_data_rename_target(data, data_type);
+#else
+	return NULL;
+#endif
+}
+
 /* Unlinked child: nothing to mint; use its own mark's vref if watched. */
 static int32_t nm_inode_mark_vref(dev_t device, ino_t ino)
 {
@@ -1415,6 +1425,22 @@ static int nexus_handle_event(struct fsnotify_group *group, uint32_t mask,
 			ino_t vino = 0;
 			int32_t victim = nm_mark_take_child_vref_if_other(mark,
 				name, inode, &vdev, &vino);
+			struct inode *target = nm_rename_target(data, data_type);
+
+			/* Unknown to the mark, pin its unhashed dentry. */
+			if (victim < 0 && target && target != inode) {
+				struct dentry *alias = d_find_any_alias(target);
+
+				if (alias) {
+					victim = nm_child_vref_mint(mark, alias,
+						NULL, target, name);
+					dput(alias);
+				}
+				if (victim >= 0) {
+					vdev = target->i_sb->s_dev;
+					vino = target->i_ino;
+				}
+			}
 
 			if (victim >= 0) {
 				if (!dir_vref_tried && dir) {
