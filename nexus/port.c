@@ -371,8 +371,8 @@ long nexus_port_close(struct nexus_port* port)
 	mutex_lock(&port->lock);
 	port->is_open = false;
 	mutex_unlock(&port->lock);
-	wake_up_interruptible(&port->buffer_write);
-	wake_up_interruptible(&port->buffer_read);
+	wake_up_interruptible_all(&port->buffer_write);
+	wake_up_interruptible_all(&port->buffer_read);
 
 	return B_OK;
 }
@@ -588,7 +588,7 @@ static long nexus_port_wait_readable(struct nexus_port *port, uint32_t flags,
 					|| !READ_ONCE(port->is_open),
 				ns_to_ktime(left));
 		else
-			ret = wait_event_interruptible(port->buffer_read,
+			ret = wait_event_interruptible_exclusive(port->buffer_read,
 				READ_ONCE(port->read_count) > 0
 					|| !READ_ONCE(port->is_open));
 		mutex_lock(&port->lock);
@@ -656,7 +656,7 @@ static long nexus_port_wait_writable(struct nexus_port *port, uint32_t flags,
 					|| !READ_ONCE(port->is_open),
 				ns_to_ktime(left));
 		else
-			ret = wait_event_interruptible(port->buffer_write,
+			ret = wait_event_interruptible_exclusive(port->buffer_write,
 				READ_ONCE(port->write_count) > 0
 					|| !READ_ONCE(port->is_open));
 		mutex_lock(&port->lock);
@@ -682,6 +682,9 @@ static long nexus_port_wait_writable(struct nexus_port *port, uint32_t flags,
 	return 0;
 
 fail:
+	/* An exclusive wakeup we did not consume goes to the next writer. */
+	if (port->write_count > 0)
+		wake_up_interruptible(&port->buffer_write);
 	return err;
 }
 
@@ -815,7 +818,7 @@ static long _nexus_port_write(struct nexus_port* port, int32_t* msg_code,
 	if (err != 0)
 		goto fail;
 
-	wake_up_interruptible(&port->buffer_read);
+	wake_up_interruptible_sync(&port->buffer_read);
 	return B_OK;
 
 fail:
@@ -992,7 +995,7 @@ static long _nexus_port_write_with_caps(struct nexus_port* port,
 		return ret;
 	}
 
-	wake_up_interruptible(&port->buffer_read);
+	wake_up_interruptible_sync(&port->buffer_read);
 	return B_OK;
 
 err_caps_acquired:
